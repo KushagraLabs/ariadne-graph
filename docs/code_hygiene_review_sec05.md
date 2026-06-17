@@ -1,0 +1,103 @@
+## 5. Refined Architecture and Implementation Priority
+
+The preceding chapters identified five critical gaps — MCP tool surface area, semantic search, incremental synchronization, storage backend flexibility, and temporal tracking — and evaluated each against demonstrated competitive benchmarks. This chapter translates those findings into a concrete refined architecture and a sequenced implementation roadmap. Every recommendation specifies what to build, in what order, and the quantitative basis for that priority.
+
+### 5.1 Recommended Architecture Changes
+
+#### 5.1.1 Updated MCP Tool Set
+
+The planned five MCP tools cover basic graph CRUD and dependency tracing but omit entire functional categories that competing systems expose. Codebase-Memory's 14 typed tools, organized across indexing, query, analysis, and code categories, demonstrated 83% answer quality at 10x fewer tokens than file-based exploration [^53^]. Code-graph-rag-mcp extends this to 26 methods with semantic search, clone detection, and hotspot analysis [^34^]. The refined architecture expands the tool surface to 14 tools, distributed across the same four categories. This represents the minimum set required to close the functional gap without incurring the interface complexity of a 26-method surface.
+
+Table 1 inventories the complete recommended tool set, specifying each tool's name, functional category, input/output contract, and the competitive precedent validating its inclusion.
+
+| # | Tool Name | Category | Input | Output | Competitive Precedent |
+|:---|:---|:---|:---|:---|:---|
+| 1 | `code_graph_index` | Indexing | `repo_path`, `force_rebuild` | `status`, `files_indexed` | Codebase-Memory [^14^], code-graph-rag-mcp [^34^] |
+| 2 | `code_graph_index_status` | Indexing | `repo_path` | `last_indexed`, `file_count`, `dirty_files` | Codebase-Memory [^14^] |
+| 3 | `code_graph_list_projects` | Indexing | — | `project_ids[]`, `repo_paths[]` | Codebase-Memory [^14^] |
+| 4 | `code_graph_delete_project` | Indexing | `project_id` | `deleted` | Codebase-Memory [^14^] |
+| 5 | `code_graph_retrieve` | Query | `node_id` or `symbol_name` | Node + edges + snippet | Planned (retained) |
+| 6 | `code_graph_search_semantic` | Query | `query_text`, `limit`, `types[]` | Ranked entity list | code-graph-rag-mcp [^34^], Graphiti [^13^] |
+| 7 | `code_graph_search_code` | Query | `pattern`, `language`, `limit` | Matching code snippets | Codebase-Memory [^14^] |
+| 8 | `code_graph_trace_dependencies` | Query | `symbol`, `direction`, `max_depth` | Path list with edge types | Planned (retained) |
+| 9 | `code_graph_impact_analysis` | Analysis | `symbol` or `file_path` | Transitive closure ranked by coupling | code-graph-rag-mcp [^34^] |
+| 10 | `code_graph_detect_changes` | Analysis | `since_ref` (git ref or timestamp) | Added, modified, deleted entities | Codebase-Memory [^14^] |
+| 11 | `code_graph_find_hotspots` | Analysis | `top_n`, `metric` (complexity/coupling) | Ranked hotspot list with scores | code-graph-rag-mcp [^34^] |
+| 12 | `code_graph_get_architecture` | Analysis | — | Community summary: modules, sizes, coupling | Codebase-Memory [^14^] |
+| 13 | `code_graph_list_communities` | Analysis | `community_id` (optional) | Community members + internal structure | Codebase-Memory [^14^] |
+| 14 | `code_graph_inspect_file` | Code | `file_path` | Full graph subgraph for file | Planned (retained) |
+
+The indexing category expands from one tool to four, adding project lifecycle management that competing systems treat as essential for multi-repository workflows. The query category gains `code_graph_search_semantic` and `code_graph_search_code`, addressing the most significant functional gap identified in Chapter 2 — the absence of any non-deterministic retrieval mechanism. The analysis category is entirely new: six tools that expose structural intelligence (impact analysis, change detection, hotspot identification, architecture summarization, and community enumeration) that agents require for non-trivial code maintenance tasks. The code category retains the existing file inspection tool without change. Each tool maps to a specific query pattern validated in competitor benchmarks, ensuring that the expansion is need-driven rather than speculative.
+
+#### 5.1.2 Hybrid Search Layer
+
+The refined architecture adds a hybrid search layer that combines three retrieval modalities: vector embeddings for semantic similarity, BM25 keyword indexing for exact and partial text matches, and graph traversal for relationship-aware context. This three-mode design follows Graphiti's proven architecture, which achieves P95 query latency of 300 ms and 94.7% accuracy on the LOCOMO benchmark by operating all three modes in parallel and merging results through a weighted ranking function [^13^][^57^].
+
+The vector embedding component uses a provider-based architecture supporting local models (via Ollama or HuggingFace transformers), API-based models (OpenAI, Azure, Gemini), and a memory-based fallback for offline operation. This provider pattern, demonstrated in code-graph-rag-mcp's embedding architecture [^34^], decouples embedding generation from storage and enables deployment-specific model selection without code changes. For code-specific retrieval, models fine-tuned on code corpora (such as CodeBERT-derived sentence transformers) should be preferred over general-purpose embedding models, as they capture programming-language semantics more accurately.
+
+The storage backend determines the vector index implementation. For SQLite deployments, sqlite-vec provides brute-force k-nearest neighbor search with int8 quantization (4x storage reduction) and binary quantization (32x reduction), achieving query times of 17 ms for 100,000 vectors on M1-class hardware and 3.97 ms with preloading [^44^][^47^]. For Neo4j deployments, native HNSW vector indexes (available from version 5.13) provide approximate nearest neighbor search with sub-10 ms latency and support for up to 4,096-dimensional vectors [^78^][^80^]. Both implementations share the same embedding provider interface; only the index storage and query execution differ.
+
+The BM25 keyword index serves as a fallback for queries where exact terminology matters — searching for a specific function name, API endpoint, or error message that may not align with the semantic vector of the query. Graph traversal provides relationship context: when a semantic search identifies a relevant function, graph traversal expands the result to include its callers, callees, and type dependencies. The merged result set presents the agent with both the directly matched entity and its structural neighborhood, reducing the need for follow-up queries.
+
+#### 5.1.3 Incremental Sync Module
+
+The refined architecture elevates incremental synchronization from an unspecified future capability to a core module with defined contracts and implementation requirements. The design follows Codebase-Memory's validated approach: XXH3 content hashing for change detection, adaptive polling for file system monitoring, and file-level re-parsing with delta application for graph updates [^14^].
+
+The incremental sync module extends the `GraphStore` adapter protocol with two operations: `get_stored_hash(file_path) -> str | None` and `update_hash(file_path, hash) -> None`. The watcher loop runs as a background asyncio task, polling the repository at a configurable interval (default 2 seconds). When a file's XXH3 hash differs from the stored value, the module invokes the language adapter's `extract_file` method for that file only, deletes nodes and edges previously associated with that file from the graph store, and inserts the new delta within a single transaction. XXH3 achieves approximately 30 GB/s throughput, making the hashing overhead negligible even for large codebases [^14^].
+
+The adaptive polling strategy adjusts the interval dynamically: increasing it when no changes are detected for a period (reducing CPU usage during idle editing) and decreasing it when changes are frequent (improving responsiveness during active development). This approach avoids the portability issues of OS-specific file system event APIs — FSEvents on macOS, inotify on Linux, ReadDirectoryChanges on Windows — while delivering equivalent responsiveness [^14^]. A manual re-index trigger is also exposed through the `code_graph_index` tool for CI/CD integration and deterministic rebuilds.
+
+The incremental sync module is classified as a core requirement rather than a future enhancement because an out-of-date graph produces incorrect dependency traces, stale architecture views, and misleading impact analysis results. Without incremental synchronization, the system forces a choice between graph freshness (continuous re-indexing, excessive CPU and I/O) and accuracy (infrequent re-indexing, stale data). Neither outcome is acceptable for a tool operating as a persistent structural analysis backend in live coding workflows.
+
+#### 5.1.4 Community Detection Module
+
+The refined architecture adds a community detection module that applies the Louvain algorithm to the code graph to identify module clusters. Louvain maximizes modularity — the density of edges within communities relative to edges between communities — through a greedy optimization that scales to millions of nodes in $O(n \cdot \log n)$ time [^45^][^46^]. For code graphs, detected communities typically correspond to functional modules: files with dense internal dependencies (many imports, calls, and inheritance relationships within the group) and sparse external dependencies.
+
+Two MCP tools expose community detection results: `code_graph_get_architecture` returns a high-level summary of communities, their entity counts, and inter-community coupling densities; `code_graph_list_communities` returns detailed membership and internal structure for a specified community. Codebase-Memory's evaluation demonstrated that answering architecture overview questions from community-annotated graphs consumed approximately 1,500 tokens versus 100,000 tokens via file-by-file search — a 67x reduction [^53^].
+
+For Neo4j backends, the module leverages the Neo4j Graph Data Science (GDS) library's built-in `gds.louvain` procedure, executing community detection directly within the database on in-memory graph projections [^92^]. For SQLite backends, the `python-louvain` or `igraph` libraries provide equivalent functionality operating on graph data extracted from the database. The incremental sync module triggers selective re-computation of community assignments for regions affected by changed files, rather than re-running the full algorithm on every edit — matching Codebase-Memory's incremental Louvain approach [^14^].
+
+### 5.2 Updated Milestone Sequence
+
+#### 5.2.1 Prioritize MCP Tool Expansion and Semantic Search Before TypeScript Adapter
+
+The original milestone sequence positioned the TypeScript adapter (Milestone 6) before retrieval and MCP parity (Milestone 4). The refined sequence inverts this priority: MCP tool expansion and semantic search are elevated to Milestone 3, while the TypeScript adapter is deferred to Milestone 5. This reordering reflects the finding that the functional gap — 5 tools versus 14–26 in competing systems, and zero semantic search capability — has a larger impact on agent effectiveness than language coverage breadth.
+
+Codebase-Memory's evaluation across 31 repositories demonstrated that 14 graph-native tools achieved 83% answer quality for Python repositories alone [^32^]. The TypeScript adapter expands language coverage but does not address the structural limitation that constrains agent capability regardless of language. Semantic search, in particular, is a cross-cutting capability: once implemented, it serves all language adapters without per-language modification. The embedding provider architecture is language-agnostic by design, and vector indexes operate on code text irrespective of source language [^34^]. Prioritizing semantic search before the TypeScript adapter thus maximizes impact per engineering hour.
+
+#### 5.2.2 Add SQLite Backend Milestone Before Neo4j Production Hardening
+
+The refined sequence introduces a new milestone — SQLite backend with vector search — positioned before Neo4j production hardening. This insertion reflects the dual-backend strategy validated in Chapter 3: SQLite serves as the default backend for development and testing, while Neo4j remains the production-grade option for team-shared deployments [^73^][^84^].
+
+The rationale for this sequencing is developer adoption velocity. SQLite requires zero configuration: a single file, no separate service, no network port allocation, no authentication setup [^47^]. Code-graph-rag-mcp and Codebase-Memory both demonstrate that SQLite-backed code graphs deliver sub-100 ms query latency with memory footprints of approximately 65 MB — performance profiles that are more than adequate for individual developer workflows [^34^][^53^]. Building the SQLiteGraphStore implementation first provides immediate value to the primary user demographic (individual developers running the MCP server locally) while the Neo4j hardening milestone addresses enterprise requirements. The existing `GraphStore` adapter protocol already supports this insertion without structural changes; the SQLite implementation is a new adapter, not a protocol modification.
+
+#### 5.2.3 Incremental Sync as Core Requirement
+
+The refined sequence positions incremental synchronization as a dependency of the indexing milestone rather than a post-production enhancement. The incremental sync module must be operational before the system is deployed in interactive development workflows because graph freshness is not a performance optimization but a correctness requirement. Impact analysis, architecture views, and dependency traces are all invalid if the underlying graph does not reflect the current file system state.
+
+The implementation sequence within the incremental sync milestone proceeds as follows: (1) extend the `GraphStore` protocol with hash storage operations, (2) implement the XXH3-based change detector, (3) build the adaptive polling watcher loop, (4) wire file-level re-parsing into the delta application pipeline, and (5) integrate incremental community re-computation. Each step has a defined completion criterion: step 1 is complete when all graph store adapters (memory, JSON, SQLite, Neo4j) pass hash read/write tests; step 5 is complete when community assignments update within 5 seconds of a file change in a 1,000-file repository.
+
+### 5.3 Implementation Priority Matrix
+
+Table 2 ranks all architectural recommendations by a composite score derived from two dimensions: user impact (the quantitative improvement in agent capability or developer experience) and implementation effort (engineering weeks estimated from competitive precedent and architectural complexity). The resulting four quadrants map to MoSCoW prioritization: Must-Have, Should-Have, Could-Have, and Won't-Have.
+
+| Priority | Recommendation | Impact | Effort | Weeks | Key Metric |
+|:---|:---|:---|:---|:---|:---|
+| **Must-Have** | MCP tool expansion (5 → 14 tools) | High: closes 2–5x tool gap vs competitors [^34^][^14^] | Medium: tool handlers reuse existing query logic | 3–4 | 14 tools across 4 categories |
+| **Must-Have** | Hybrid semantic search (vector + BM25 + graph) | High: 120x token reduction vs file search [^53^]; P95 300 ms latency [^13^] | Medium: provider-based embeddings; backend-specific indexes | 3–4 | <500 ms query latency |
+| **Must-Have** | Incremental sync (XXH3 + adaptive polling) | High: correctness requirement for live workflows; 30 GB/s hash throughput [^14^] | Medium: protocol extensions + watcher loop | 2–3 | <5 s sync latency at 1K files |
+| **Should-Have** | Tree-sitter for TypeScript (replace ts-morph) | High: eliminates Node dependency; error-tolerant parsing [^52^]; path to 100+ languages | Medium: grammar + query files; parity re-validation | 3–4 | TypeScript adapter passes 95% parity |
+| **Should-Have** | Community detection (Louvain algorithm) | Medium: 67x token reduction for architecture queries [^53^]; module clustering | Low: GDS builtin (Neo4j); python-louvain (SQLite) | 1–2 | Community assignments in <2 s |
+| **Could-Have** | Lightweight temporal tracking (`first_seen_at`, `last_modified_at`, `source_commit`) | Medium: enables code age queries; commit attribution [^64^] | Low: schema property additions + git blame integration | 1–2 | 3 properties on all nodes/edges |
+| **Could-Have** | SQLite backend with sqlite-vec (elevated to first-class) | High for adoption: zero-config deployment [^47^]; 65 MB footprint [^34^] | Medium: adjacency-list schema + vec0 virtual table | 2–3 | <100 ms query latency |
+| **Won't-Have** | Full bi-temporal model (Graphiti-style edge invalidation) | Low for hygiene: git provides equivalent commit-level history | Very high: LLM-based contradiction detection; episode management [^37^] | 8–12 | Not targeted |
+
+The Must-Have tier contains the three recommendations whose absence would prevent the system from achieving functional parity with state-of-the-art code intelligence tools. The MCP tool expansion closes the 2–5x surface gap that constrains agent workflows to basic CRUD operations. Hybrid semantic search addresses the most significant retrieval limitation — the inability to answer natural language queries without exact symbol names — with demonstrated 120x token efficiency gains [^53^]. Incremental synchronization is a correctness prerequisite: without it, the graph is either stale or continuously rebuilt, and neither state is acceptable for live coding workflows. Together, these three items represent 8–11 engineering weeks and should be sequenced first.
+
+The Should-Have tier contains two recommendations with high impact but lower urgency. Tree-sitter for TypeScript eliminates the Node.js helper process dependency, enables error-tolerant parsing of incomplete code during live editing, and creates a structural precedent for adding Go, Rust, Java, and other languages through grammar files rather than custom adapters [^52^][^59^]. Community detection adds architecture summarization capabilities that reduce token consumption for macro-level codebase queries by 67x [^53^], with low implementation complexity due to production-ready Louvain implementations in both Neo4j GDS [^92^] and Python libraries [^45^]. These items represent 4–6 additional weeks and should follow the Must-Have tier.
+
+The Could-Have tier contains two recommendations that provide meaningful value but can be deferred without blocking core functionality. The SQLite backend with sqlite-vec significantly accelerates developer adoption through zero-configuration deployment; its inclusion here rather than in Must-Have reflects the fact that the existing plan already contemplates SQLite as a secondary option, and the work elevates it to first-class status rather than introducing it from scratch [^47^]. Lightweight temporal tracking adds `first_seen_at`, `last_modified_at`, and `source_commit` properties to nodes and edges, enabling code age and commit attribution queries without the computational overhead of full bi-temporal invalidation [^64^]. These items represent 3–5 weeks.
+
+The Won't-Have tier contains a single recommendation: the full bi-temporal model with Graphiti-style edge invalidation. While conceptually elegant for code evolution tracking, the implementation cost — LLM-based contradiction detection, episode management infrastructure, and temporal extraction pipelines — is disproportionate to the benefit for a hygiene-checking tool [^37^]. Git already provides authoritative temporal data at commit granularity, and the lightweight timestamp properties in the Could-Have tier address the most common temporal queries without replicating Graphiti's full ingestion pipeline. This item is explicitly deferred to a future major version, contingent on post-deployment usage demonstrating demand for point-in-time graph state reconstruction.
+
+The total estimated effort for all tiers except Won't-Have is 15–22 engineering weeks. Sequenced as two development phases — Must-Have first (8–11 weeks), followed by Should-Have and Could-Have in parallel (7–11 weeks) — the refined architecture can be delivered in a single quarter of focused engineering. The sequencing within each tier matters as much as the tier assignment: semantic search should follow MCP tool expansion (the tools consume the search layer), and incremental sync should precede both (freshness is a prerequisite for correct retrieval and analysis results).

@@ -1,0 +1,81 @@
+[project]
+name = "ariadne-graph"
+version = "0.1.0"
+description = "Standalone MCP server for code graph analysis with hybrid search"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Ariadne Graph contributors"}
+]
+keywords = ["mcp", "code-graph", "static-analysis", "code-intelligence"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "pydantic>=2.0",
+    "xxhash>=3.0",
+    "aiofiles>=23.0",
+    "aiosqlite>=0.20",
+    "networkx>=3.0",
+    "python-louvain>=0.16",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+semantic = ["sentence-transformers>=2.0", "torch>=2.0"]
+neo4j = ["neo4j>=5.0"]
+vector = ["sqlite-vec>=0.1"]
+typescript = ["tree-sitter>=0.23", "tree-sitter-typescript>=0.23", "protobuf>=6.30"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "ruff>=0.1.0", "mypy>=1.0"]
+all = [
+    "sentence-transformers>=2.0",
+    "torch>=2.0",
+    "neo4j>=5.0",
+    "sqlite-vec>=0.1",
+    "tree-sitter>=0.23",
+    "tree-sitter-typescript>=0.23",
+    "protobuf>=6.30",
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+ariadne = "ariadne_graph.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["src/ariadne_graph/languages/typescript/_scip_pb2.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+exclude = ["src/ariadne_graph/languages/typescript/_scip_pb2.py"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

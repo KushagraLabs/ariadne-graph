@@ -1,0 +1,7 @@
+{
+  "name": "scip-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tiny TypeScript fixture used to generate a committed SCIP index for deterministic parser unit tests.",
+  "devDependencies": {}
+}
