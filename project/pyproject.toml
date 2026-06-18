@@ -25,6 +25,7 @@ dependencies = [
     "xxhash>=3.0",
     "aiofiles>=23.0",
     "aiosqlite>=0.20",
+    "anyio>=4.0",
     "networkx>=3.0",
     "python-louvain>=0.16",
     "numpy>=1.24",
@@ -35,7 +36,7 @@ semantic = ["sentence-transformers>=2.0", "torch>=2.0"]
 neo4j = ["neo4j>=5.0"]
 vector = ["sqlite-vec>=0.1"]
 typescript = ["tree-sitter>=0.23", "tree-sitter-typescript>=0.23", "protobuf>=6.30"]
-dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "ruff>=0.1.0", "mypy>=1.0"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "pytest-cov>=4.0", "ruff>=0.1.0", "mypy>=1.0"]
 all = [
     "sentence-transformers>=2.0",
     "torch>=2.0",
@@ -46,6 +47,7 @@ all = [
     "protobuf>=6.30",
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
     "ruff>=0.1.0",
     "mypy>=1.0",
 ]
@@ -79,3 +81,17 @@ exclude = ["src/ariadne_graph/languages/typescript/_scip_pb2.py"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "--cov=ariadne_graph --cov-report=term-missing --cov-report=html"
+
+[tool.coverage.run]
+branch = true
+source = ["src/ariadne_graph"]
+omit = [
+    "*/__init__.py",
+    "src/ariadne_graph/languages/typescript/_scip_pb2.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 70

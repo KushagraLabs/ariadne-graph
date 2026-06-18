@@ -265,6 +265,7 @@ class ToolRegistry:
 
     async def close(self) -> None:
         """Close the underlying graph store and release resources."""
+        await self.stop_auto_sync()
         await self.graph_store.close()
 
     # ==================================================================

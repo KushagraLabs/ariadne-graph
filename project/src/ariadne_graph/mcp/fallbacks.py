@@ -42,8 +42,8 @@ class GraphStoreFallbacks:
                 node_data = row.get("n", row)
                 if node_data.get("id") == query:
                     results.append({"type": "node", "data": node_data})
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Fallback retrieve: nodes query failed for %s: %s", graph_id, exc)
 
         try:
             neighbors = await graph_store.query(
@@ -55,8 +55,10 @@ class GraphStoreFallbacks:
                     r.get("data", {}).get("id") == node_data.get("id") for r in results
                 ):
                     results.append({"type": "neighbor", "data": node_data})
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Fallback retrieve: neighbors query failed for %s: %s", query, exc
+            )
 
         try:
             edges = await graph_store.query(graph_id, "edges")
@@ -64,8 +66,8 @@ class GraphStoreFallbacks:
                 edge_data = row.get("r", row)
                 if edge_data.get("source") == query or edge_data.get("target") == query:
                     results.append({"type": "edge", "data": edge_data})
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Fallback retrieve: edges query failed for %s: %s", query, exc)
 
         return RetrieveOutput(results=results)
 
@@ -80,7 +82,8 @@ class GraphStoreFallbacks:
         """BFS trace of call/import dependencies from a symbol."""
         try:
             edges = await graph_store.query(graph_id, "edges")
-        except Exception:
+        except Exception as exc:
+            logger.warning("Fallback trace: edges query failed for %s: %s", graph_id, exc)
             return TraceDependenciesOutput(paths=[])
 
         outgoing: dict[str, list[str]] = {}

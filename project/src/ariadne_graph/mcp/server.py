@@ -1,18 +1,18 @@
 """MCP server using FastMCP for the Ariadne Graph.
 
-Registers all 14 tools with the mcp.server.fastmcp.FastMCP framework.
+Registers all canonical tools with the mcp.server.fastmcp.FastMCP framework.
 Each tool validates input with Pydantic schemas and delegates to ToolRegistry.
 """
 
 from __future__ import annotations
 
-import asyncio
-import atexit
 import contextlib
 import logging
 import sys
 from pathlib import Path
 from typing import Any, Literal
+
+import anyio
 
 # FastMCP imports
 from mcp.server.fastmcp import FastMCP
@@ -537,30 +537,51 @@ def initialise_registry(
     return _registry
 
 
-def main(transport: Literal["stdio", "sse", "streamable-http"] = "stdio") -> None:
-    """Main entry point: initialise and run the MCP server."""
-    _setup_logging()
-    logger.info("Starting Ariadne Graph server")
+async def _run_server_async(
+    transport: Literal["stdio", "sse", "streamable-http"],
+    mount_path: str | None,
+) -> None:
+    """Async server runner: starts auto-sync, runs MCP transport, cleans up.
 
-    registry = initialise_registry()
+    Runs inside the event loop created by ``anyio.run`` so that auto-sync and
+    the server share the same loop and are shut down gracefully.
+    """
+    registry = _get_registry()
     logger.info("ToolRegistry initialised with %d adapters", len(registry.adapters))
 
     if registry.config.auto_sync:
         try:
-            asyncio.run(registry.start_auto_sync())
+            await registry.start_auto_sync()
+            logger.info("Auto-sync started")
         except Exception as exc:
             logger.warning("Failed to start auto-sync: %s", exc)
 
-    def _stop_auto_sync() -> None:
-        if registry.auto_sync_manager is None:
-            return
+    try:
+        match transport:
+            case "stdio":
+                await mcp.run_stdio_async()
+            case "sse":
+                await mcp.run_sse_async(mount_path)
+            case "streamable-http":
+                await mcp.run_streamable_http_async()
+    finally:
+        logger.info("Shutting down Ariadne Graph server")
         with contextlib.suppress(Exception):
-            asyncio.run(registry.stop_auto_sync())
+            await registry.close()
 
-    atexit.register(_stop_auto_sync)
 
-    # Run with the requested transport (default stdio for MCP)
-    mcp.run(transport=transport)
+def main(
+    transport: Literal["stdio", "sse", "streamable-http"] = "stdio",
+    mount_path: str | None = None,
+) -> None:
+    """Main entry point: initialise and run the MCP server."""
+    _setup_logging()
+    logger.info("Starting Ariadne Graph server")
+    initialise_registry()
+
+    # anyio.run creates the event loop; _run_server_async starts auto-sync in
+    # that same loop so the background task stays alive while the server runs.
+    anyio.run(_run_server_async, transport, mount_path)
 
 
 # ---------------------------------------------------------------------------

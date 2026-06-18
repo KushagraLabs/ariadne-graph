@@ -11,6 +11,7 @@ import ast
 from pathlib import Path
 from typing import Any, cast
 
+from ariadne_graph.core.diagnostics import DiagnosticsCollector
 from ariadne_graph.core.models import CodeEdge, CodeGraphDelta, CodeNode
 from ariadne_graph.languages.base import UniqueIdMixin
 
@@ -118,6 +119,9 @@ class PythonFactExtractor(UniqueIdMixin, ast.NodeVisitor):
         self.nodes: list[CodeNode] = []
         self.edges: list[CodeEdge] = []
 
+        # Diagnostics collected during extraction
+        self._diagnostics = DiagnosticsCollector()
+
         # State tracking — class stack for nested classes
         self._class_stack: list[str] = []
         self._class_id_stack: list[str] = []
@@ -160,7 +164,7 @@ class PythonFactExtractor(UniqueIdMixin, ast.NodeVisitor):
         self.visit(tree)
 
         # Post-processing diagnostics
-        self._detect_unused_imports()
+        self._emit_diagnostics()
 
         return CodeGraphDelta(
             graph_id=self.graph_id,
@@ -605,6 +609,9 @@ class PythonFactExtractor(UniqueIdMixin, ast.NodeVisitor):
         # Create the function/method node
         self._add_node(node_id, node_labels, props)
 
+        # Collect code-quality diagnostics for this function/method.
+        self._collect_function_diagnostics(node_id, func_name, node)
+
         # Parent relationships
         class_id = self._current_class_id()
         if is_method and class_id is not None:
@@ -775,22 +782,80 @@ class PythonFactExtractor(UniqueIdMixin, ast.NodeVisitor):
     # Diagnostics
     # ------------------------------------------------------------------
 
-    def _detect_unused_imports(self) -> None:
-        """Create CodeDiagnostic nodes for unused imports."""
+    def _collect_function_diagnostics(
+        self,
+        node_id: str,
+        func_name: str,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
+        """Run code-quality rules against a function/method."""
+        # Aggregate missing type annotations into a single diagnostic per function.
+        positional_and_kwonly = node.args.args + node.args.kwonlyargs
+        missing_params = [
+            arg.arg
+            for arg in positional_and_kwonly
+            if arg.annotation is None and arg.arg not in ("self", "cls")
+        ]
+        total_params = len(positional_and_kwonly)
+        if node.returns is None or missing_params:
+            self._diagnostics.add_missing_type_annotation(
+                node_id,
+                func_name,
+                missing_return=node.returns is None,
+                missing_parameters=missing_params,
+                total_parameters=total_params,
+            )
+
+        # Long parameter list
+        param_count = (
+            len(node.args.args)
+            + len(node.args.kwonlyargs)
+            + (1 if node.args.vararg else 0)
+            + (1 if node.args.kwarg else 0)
+        )
+        if param_count > DiagnosticsCollector.LONG_PARAMETER_LIST_COUNT:
+            self._diagnostics.add_long_parameter_list(
+                node_id,
+                func_name,
+                param_count,
+                parameters=[a.arg for a in node.args.args + node.args.kwonlyargs],
+            )
+
+        # Complex function (by line count)
+        line_start = getattr(node, "lineno", None)
+        line_end = getattr(node, "end_lineno", None)
+        if isinstance(line_start, int) and isinstance(line_end, int):
+            line_count = line_end - line_start + 1
+            if line_count > DiagnosticsCollector.COMPLEX_FUNCTION_LINES:
+                self._diagnostics.add_complex_function(node_id, func_name, line_count)
+
+    def _emit_diagnostics(self) -> None:
+        """Emit collected diagnostics as CodeDiagnostic nodes and edges."""
+        # Unused imports are tracked separately; add them to the collector first.
         for imp in self._imports:
             if not imp["used"]:
-                diag_id = f"{imp['node_id']}:diagnostic:unused"
-                self._add_node(
-                    diag_id,
-                    ["CodeDiagnostic"],
-                    {
-                        "level": "warning",
-                        "rule": "unused_import",
-                        "message": f"Import '{imp['name']}' is unused",
-                        "name": imp["name"],
-                    },
-                )
-                self._add_edge(imp["node_id"], diag_id, "HAS_DIAGNOSTIC")
+                self._diagnostics.add_unused_import(imp["node_id"], imp["name"])
+
+        for diag in self._diagnostics.get_diagnostics():
+            diag_id = f"{diag.node_id}:diagnostic:{diag.rule}"
+            # Make IDs unique when multiple diagnostics share a node/rule.
+            counter = 0
+            base_diag_id = diag_id
+            while diag_id in self._used_node_ids:
+                counter += 1
+                diag_id = f"{base_diag_id}:{counter}"
+
+            self._add_node(
+                diag_id,
+                ["CodeDiagnostic"],
+                {
+                    "level": diag.level,
+                    "rule": diag.rule,
+                    "message": diag.message,
+                    **diag.properties,
+                },
+            )
+            self._add_edge(diag.node_id, diag_id, "HAS_DIAGNOSTIC")
 
     # ------------------------------------------------------------------
     # Override detection

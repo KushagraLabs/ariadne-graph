@@ -6,10 +6,10 @@ without requiring an MCP client.
 Usage:
     ariadne index <repo_path> [--force]
     ariadne status <repo_path>
-    ariadne search <repo_path> <query> [--semantic|--keyword]
+    ariadne search <repo_path> <query> [--semantic] [--types ...] [--language ...] [--limit N]
     ariadne retrieve <repo_path> <symbol>
     ariadne architecture <repo_path>
-    ariadne mcp [--transport stdio]
+    ariadne mcp [--transport {stdio,sse,streamable-http}]
 """
 
 from __future__ import annotations
@@ -178,11 +178,21 @@ async def _handle_search(args: argparse.Namespace) -> int:
     """Handle the 'search' command."""
     async with _registry_scope(args.repo_path) as registry:
         if args.semantic:
-            semantic_input = SearchSemanticInput(query_text=args.query, repo_path=args.repo_path)
+            semantic_input = SearchSemanticInput(
+                query_text=args.query,
+                repo_path=args.repo_path,
+                limit=args.limit,
+                types=list(args.types) if args.types else [],
+            )
             semantic_result = await registry.handle_search_semantic(semantic_input)
             _print_json(semantic_result.model_dump())
         else:
-            code_input = SearchCodeInput(pattern=args.query, repo_path=args.repo_path)
+            code_input = SearchCodeInput(
+                pattern=args.query,
+                repo_path=args.repo_path,
+                language=args.language,
+                limit=args.limit,
+            )
             code_result = await registry.handle_search_code(code_input)
             _print_json(code_result.model_dump())
 
@@ -317,12 +327,21 @@ async def _handle_list_projects(args: argparse.Namespace) -> int:
         return 0
 
 
-async def _handle_mcp(args: argparse.Namespace) -> int:
-    """Handle the 'mcp' command — start the MCP server."""
+def _handle_mcp(args: argparse.Namespace) -> int:
+    """Handle the 'mcp' command — start the MCP server.
+
+    This handler is synchronous because the MCP server runs its own event
+    loop; calling it from an async context would conflict with asyncio.run.
+    """
     from ariadne_graph.mcp.server import main as server_main
 
     server_main(transport=args.transport)
     return 0
+
+
+async def _handle_mcp_async(args: argparse.Namespace) -> int:
+    """Async wrapper for ``_handle_mcp`` kept for handler-registry parity."""
+    return _handle_mcp(args)
 
 
 async def _handle_watch(args: argparse.Namespace) -> int:
@@ -342,9 +361,10 @@ async def _handle_watch(args: argparse.Namespace) -> int:
             registry.config.incremental_sync_interval,
         )
 
+        interval = registry.config.incremental_sync_interval
         try:
             while True:
-                await asyncio.sleep(3600)
+                await asyncio.sleep(interval)
         except KeyboardInterrupt:
             print("\nStopping watch...", file=sys.stderr)
         finally:
@@ -411,7 +431,18 @@ examples:
         "--semantic", action="store_true", help="Use semantic (vector) search"
     )
     search_parser.add_argument(
-        "--keyword", action="store_true", help="Use keyword/code search (default)"
+        "--types",
+        action="extend",
+        nargs="+",
+        help="Node type labels to filter semantic search (e.g. CodeFunction CodeClass)",
+    )
+    search_parser.add_argument(
+        "--language",
+        default=None,
+        help="Language filter for keyword/code search (e.g. 'python')",
+    )
+    search_parser.add_argument(
+        "--limit", type=int, default=10, help="Maximum number of results (default: 10)"
     )
 
     # --- retrieve ---
@@ -517,7 +548,7 @@ examples:
     mcp_parser.add_argument(
         "--transport",
         default="stdio",
-        choices=["stdio", "sse"],
+        choices=["stdio", "sse", "streamable-http"],
         help="Transport protocol (default: stdio)",
     )
 
@@ -555,7 +586,7 @@ _COMMAND_HANDLERS: dict[str, Callable[[argparse.Namespace], Awaitable[int]]] = {
     "inspect": _handle_inspect,
     "diagnostics": _handle_diagnostics,
     "delete": _handle_delete,
-    "mcp": _handle_mcp,
+    "mcp": _handle_mcp_async,
     "watch": _handle_watch,
     "list": _handle_list_projects,
 }
@@ -576,6 +607,10 @@ async def _async_main(args: Sequence[str] | None = None) -> int:
     if parsed.command is None:
         parser.print_help()
         return 0
+
+    # The MCP server runs its own event loop and must be invoked synchronously.
+    if parsed.command == "mcp":
+        return _handle_mcp(parsed)
 
     handler = _COMMAND_HANDLERS.get(parsed.command)
     if handler is None:

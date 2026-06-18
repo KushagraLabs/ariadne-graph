@@ -5,7 +5,7 @@
 Name:
 
 ```text
-Reusable Code Hygiene MCP
+Ariadne Graph
 ```
 
 Suggested team:
@@ -28,7 +28,7 @@ Lumen
 
 ## Initial Issues
 
-1. Scaffold standalone `code_hygiene_mcp` repository
+1. Scaffold standalone `ariadne_graph` repository
 2. Define core graph schema and adapter contracts
 3. Port Python AST fact extractor behind language adapter
 4. Add fixture-based parity tests against current Lumen behavior

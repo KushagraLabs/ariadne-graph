@@ -478,6 +478,19 @@ class SQLiteGraphStore:
                     (graph_id, *chunk, *chunk),
                 )
 
+            # Delete vec_items if sqlite-vec is active.  Must happen before
+            # the rows in ``nodes`` are removed because the vec table is keyed
+            # by node id, not by file_path.
+            if self._has_sqlite_vec:
+                for chunk, placeholders in self._chunked(node_ids):
+                    await db.execute(
+                        f"""
+                        DELETE FROM {VEC_TABLE}
+                        WHERE graph_id = ? AND node_id IN ({placeholders})
+                        """,
+                        (graph_id, *chunk),
+                    )
+
             # Delete snippets, embeddings, communities, and nodes.
             for chunk, placeholders in self._chunked(node_ids):
                 await db.execute(
@@ -536,19 +549,6 @@ class SQLiteGraphStore:
                     WHERE graph_id = ? AND node_id IN ({placeholders})
                     """,
                     (graph_id, *chunk),
-                )
-
-            # Delete vec_items if sqlite-vec is active
-            if self._has_sqlite_vec:
-                await db.execute(
-                    f"""
-                    DELETE FROM {VEC_TABLE}
-                    WHERE graph_id = ? AND node_id IN (
-                        SELECT id FROM nodes
-                        WHERE graph_id = ? AND file_path = ?
-                    )
-                    """,
-                    (graph_id, graph_id, file_path),
                 )
 
             await db.commit()
@@ -682,16 +682,18 @@ class SQLiteGraphStore:
 
         db = await self._connect()
         try:
-            for edge in edges:
-                props_json = json.dumps(edge.properties)
-                await db.execute(
-                    """
-                    INSERT OR IGNORE INTO edges
-                    (source, target, graph_id, rel_type, properties)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (edge.source, edge.target, graph_id, edge.rel_type, props_json),
-                )
+            params = [
+                (edge.source, edge.target, graph_id, edge.rel_type, json.dumps(edge.properties))
+                for edge in edges
+            ]
+            await db.executemany(
+                """
+                INSERT OR IGNORE INTO edges
+                (source, target, graph_id, rel_type, properties)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                params,
+            )
             await db.commit()
         finally:
             await db.close()
@@ -1083,7 +1085,7 @@ class SQLiteGraphStore:
             if query == "count_files":
                 cursor = await db.execute(
                     """
-                    SELECT COUNT(DISTINCT json_extract(properties, '$.file_path')) AS count
+                    SELECT COUNT(DISTINCT file_path) AS count
                     FROM nodes WHERE graph_id = ?
                     """,
                     (graph_id,),

@@ -1,14 +1,14 @@
 # SCIP-TypeScript Integration Plan
 
 > **Status:** design + plan effort — not yet implemented.  
-> **Owner:** code-hygiene-mcp maintainers  
+> **Owner:** ariadne-graph maintainers  
 > **Target validation repo:** `/Users/amitkumarsingh/Documents/cosmic_lens`
 
 ## 1. Goal
 
 Upgrade the TypeScript/TSX language substrate so that **call, import, and type edges are compiler-accurate from the first index of `cosmic_lens`**. The current Tree-sitter extractor is fast and Python-native, but it is syntactic: it misses renamed imports, barrel-file re-exports, dynamic dispatch, and cross-file symbol resolution. [`scip-typescript`](https://github.com/sourcegraph/scip-typescript) (Sourcegraph's TypeScript SCIP indexer) uses the real TypeScript compiler, so it resolves symbols exactly as `tsc` does.
 
-This document describes how to wire `scip-typescript` into `code-hygiene-mcp` as an optional, fallible, project-level refinement layer while keeping the existing Tree-sitter pass for structural enrichment.
+This document describes how to wire `scip-typescript` into `ariadne-graph` as an optional, fallible, project-level refinement layer while keeping the existing Tree-sitter pass for structural enrichment.
 
 ## 2. Scope
 
@@ -31,7 +31,7 @@ This document describes how to wire `scip-typescript` into `code-hygiene-mcp` as
 The current TypeScript adapter lives in:
 
 ```
-project/src/code_hygiene_mcp/languages/typescript/
+project/src/ariadne_graph/languages/typescript/
   adapter.py    # TypeScriptLanguageAdapter
   extractor.py  # TypeScriptFactExtractor (Tree-sitter)
   tsconfig.py   # TsConfigResolver
@@ -220,7 +220,7 @@ Responsibilities:
   - `tsconfig.json` exists → `scip-typescript index`
   - only `package.json` → `scip-typescript index --infer-tsconfig`
 - Compute a project fingerprint (sorted file paths + current XXH3 hashes of all TS/TSX files) and compare with the last stored fingerprint in graph metadata (`set_index_metadata` / `index_metadata`).
-- If fingerprint changed (or cold start), run the indexer in `repo_root` with a controlled output path (e.g., `.code_hygiene/scip/index.scip`).
+- If fingerprint changed (or cold start), run the indexer in `repo_root` with a controlled output path (e.g., `.ariadne/scip/index.scip`).
 - Capture stdout/stderr; on non-zero exit emit a `CodeDiagnostic` and fall back to Tree-sitter.
 - Expose the path to `index.scip` and the command-line arguments used.
 
@@ -237,7 +237,7 @@ class ScipTypeScriptIndexer:
 Parse `index.scip` into plain Python dataclasses. We will vendor generated protobuf bindings (`_scip_pb2.py`) from the upstream `scip.proto` (Apache-2.0) and add `protobuf>=4.25` as an optional dependency.
 
 ```python
-from code_hygiene_mcp.languages.typescript._scip_pb2 import Index
+from ariadne_graph.languages.typescript._scip_pb2 import Index
 
 class ScipIndexParser:
     def parse(self, index_path: Path) -> ScipIndex:
@@ -408,10 +408,10 @@ scip_typescript_infer_tsconfig: bool | None = Field(
 ```
 
 Environment-variable overrides:
-- `CODE_HYGIENE_SCIP_TYPESCRIPT_ENABLED`
-- `CODE_HYGIENE_SCIP_TYPESCRIPT_PATH`
-- `CODE_HYGIENE_SCIP_TYPESCRIPT_ARGS`
-- `CODE_HYGIENE_SCIP_TYPESCRIPT_INFER_TSCONFIG`
+- `ARIADNE_SCIP_TYPESCRIPT_ENABLED`
+- `ARIADNE_SCIP_TYPESCRIPT_PATH`
+- `ARIADNE_SCIP_TYPESCRIPT_ARGS`
+- `ARIADNE_SCIP_TYPESCRIPT_INFER_TSCONFIG`
 
 Default behavior:
 - If `scip_typescript_enabled=False`, never use SCIP.
@@ -516,7 +516,7 @@ SCIP-ID↔legacy-ID; without it, both files are Tree-sitter (legacy↔legacy) an
 the same assertions must still hold — proving graceful degradation.
 
 ### cosmic_lens acceptance
-- Manual run: `code-hygiene index /Users/amitkumarsingh/Documents/cosmic_lens`.
+- Manual run: `ariadne index /Users/amitkumarsingh/Documents/cosmic_lens`.
 - Validate queries:
   - `code_graph_trace_dependencies` for a key service.
   - `code_graph_impact_analysis` for a shared hook.
@@ -570,7 +570,7 @@ All SCIP-specific tests must be skipped when `scip-typescript` is not installed 
 1. Should SCIP be a separate `[scip]` extra or bundled into `[typescript]`? **Recommendation:** bundle into `[typescript]` because it is part of the enhanced TS adapter; users who want only syntactic TS can still install `[typescript]` and skip installing `@sourcegraph/scip-typescript`.
 2. Should we map SCIP symbols to our legacy module-based IDs instead of using SCIP symbol strings? **Recommendation:** use SCIP strings to avoid a complex descriptor parser; revisit only if retrieval UX suffers.
 3. How should we handle `scip-typescript` workspace flags (`--yarn-workspaces`, `--pnpm-workspaces`) for monorepos? **Recommendation:** expose via `scip_typescript_args` initially; auto-detect later if needed.
-4. Should we keep a separate `index.scip` artifact in `.code_hygiene/` for debugging? **Recommendation:** yes, write to `.code_hygiene/scip/<graph_id>/index.scip` and include the `scip-typescript` version in metadata.
+4. Should we keep a separate `index.scip` artifact in `.ariadne/` for debugging? **Recommendation:** yes, write to `.ariadne/scip/<graph_id>/index.scip` and include the `scip-typescript` version in metadata.
 
 ## 16. Appendix: example SCIP symbols
 

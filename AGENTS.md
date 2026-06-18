@@ -1,4 +1,4 @@
-# AGENTS.md — Code Hygiene MCP
+# AGENTS.md — Ariadne Graph
 
 > This file is written for AI coding agents. It summarises the actual project
 > layout, build/test commands, code conventions, and current implementation
@@ -8,11 +8,11 @@
 
 ## 1. Project overview
 
-`code-hygiene-mcp` is a standalone Python MCP (Model Context Protocol) server
+`ariadne-graph` is a standalone Python MCP (Model Context Protocol) server
 for repository-level code intelligence. It parses source files into a code
-knowledge graph and exposes 15 MCP tools for indexing, querying, dependency
-tracing, impact analysis, architecture summarisation, code inspection, and
-code-quality diagnostics.
+knowledge graph and exposes 16 canonical MCP tools (plus a Lumen compatibility
+alias) for indexing, querying, dependency tracing, impact analysis,
+architecture summarisation, code inspection, and code-quality diagnostics.
 
 Key goals from `README.md`:
 
@@ -42,9 +42,9 @@ lives under `project/`.
 └── project/                     # Runnable Python package
     ├── pyproject.toml
     ├── README.md
-    ├── src/code_hygiene_mcp/
+    ├── src/ariadne_graph/
     │   ├── __init__.py
-    │   ├── cli.py                 # `code-hygiene` CLI
+    │   ├── cli.py                 # `ariadne` CLI
     │   ├── core/                  # Models, config, retrieval, search, sync, …
     │   ├── languages/             # Language adapters
     │   ├── graphstores/           # Storage backends
@@ -76,10 +76,10 @@ lives under `project/`.
 | `graphstores/sqlite.py` | `SQLiteGraphStore` — SQLite with FTS5 and optional sqlite-vec |
 | `graphstores/neo4j.py` | `Neo4jGraphStore` — Neo4j 5.x with vector/full-text fallbacks |
 | `graphstores/lumen.py` | `LumenGraphStore` — optional Lumen KG compatibility wrapper |
-| `mcp/schemas.py` | Pydantic input/output schemas for all 15 canonical MCP tools plus Lumen alias |
-| `mcp/tools.py` | `ToolRegistry` — handlers for all 15 tools |
+| `mcp/schemas.py` | Pydantic input/output schemas for all 16 canonical MCP tools plus Lumen alias |
+| `mcp/tools.py` | `ToolRegistry` — handlers for all 16 tools |
 | `mcp/fallbacks.py` | `GraphStoreFallbacks` — scan-based handler fallbacks for non-searchable backends |
-| `mcp/server.py` | FastMCP server exposing the tools (stdio/sse) |
+| `mcp/server.py` | FastMCP server exposing the tools (stdio/sse/streamable-http) |
 
 ### Graph schema
 
@@ -138,22 +138,28 @@ pip install -e ".[all]"        # everything above + dev tools
 pytest tests/ -v
 ```
 
-Current status: 214 tests pass, 13 skipped (Neo4j backend tests when Neo4j is not
-configured): 46 Python extractor tests, 32 TypeScript/TSX extractor tests,
+Current status: 274 tests pass, 14 skipped (Neo4j backend tests when Neo4j is not
+configured): 46 Python extractor tests, 15 Python diagnostics tests in
+`tests/test_python/test_diagnostics.py`, 32 TypeScript/TSX extractor tests,
 10 deterministic SCIP parser/translator/indexer tests in
 `tests/test_typescript/test_scip_bridge.py` and `tests/test_typescript/test_scip_indexer.py`,
 12 wired handler/SQLite tests in `tests/test_mcp/test_wired_handlers.py`,
+2 MCP server smoke tests in `tests/test_mcp/test_server.py`,
 5 change-detection tests in `tests/test_core/test_incremental_sync.py`,
 4 auto-sync tests in `tests/test_core/test_auto_sync.py`,
+6 config tests in `tests/test_core/test_config.py`,
+6 search tests in `tests/test_core/test_search.py`,
+5 community-analysis tests in `tests/test_core/test_communities.py`,
 39 graph-store unit tests in `tests/test_graphstores/` (including the Lumen
-adapter tests, the legacy-FTS migration test, and the sqlite-vec fallback deadlock test),
+adapter tests, the legacy-FTS migration test, the sqlite-vec fallback deadlock test,
+and factory backend-selection tests),
 3 capability-report tests in `tests/test_core/test_capabilities.py`,
 4 dependency-fallback acceptance tests in `tests/test_acceptance/test_dependency_fallbacks.py`,
 9 discovery tests in `tests/test_core/test_discovery.py`,
 14 freshness tests in `tests/test_core/test_freshness.py`,
 12 retrieval tests in `tests/test_core/test_retrieval.py`, and
-16 CLI tests in `tests/test_cli.py`. Neo4j graph-store tests are skipped unless
-`CODE_HYGIENE_NEO4J_URI` is set.
+18 CLI tests in `tests/test_cli.py`. Neo4j graph-store tests are skipped unless
+`ARIADNE_NEO4J_URI` is set.
 
 ### Run linting and type checking
 
@@ -163,7 +169,7 @@ mypy src/
 ```
 
 Current status: both `ruff check src/ tests/` and `mypy src/` pass. The generated
-SCIP protobuf bindings (`src/code_hygiene_mcp/languages/typescript/_scip_pb2.py`)
+SCIP protobuf bindings (`src/ariadne_graph/languages/typescript/_scip_pb2.py`)
 are excluded from both tools. Missing-stub warnings for optional dependencies
 (`neo4j`, `sentence_transformers`) and untyped core dependencies (`aiofiles`,
 `networkx`, `community`) are suppressed with targeted `# type: ignore` comments
@@ -173,28 +179,34 @@ so that `warn_unused_ignores = true` remains enabled.
 
 ```bash
 # Index a repository
-code-hygiene index /path/to/repo
+ariadne index /path/to/repo
 
 # Check status
-code-hygiene status /path/to/repo
+ariadne status /path/to/repo
 
 # Keyword search (default)
-code-hygiene search /path/to/repo "def parse"
+ariadne search /path/to/repo "def parse"
+
+# Semantic search filtered to functions
+ariadne search /path/to/repo "authentication logic" --semantic --types CodeFunction
+
+# Keyword search filtered by language
+ariadne search /path/to/repo "helper" --language python
 
 # Architecture summary
-code-hygiene architecture /path/to/repo
+ariadne architecture /path/to/repo
 
 # Watch a repository and re-index on a schedule
-code-hygiene watch /path/to/repo
+ariadne watch /path/to/repo
 
 # Start MCP server over stdio
-code-hygiene mcp --transport stdio
+ariadne mcp --transport stdio
 ```
 
 ### Run the MCP server directly
 
 ```bash
-python -m code_hygiene_mcp.mcp.server
+python -m ariadne_graph.mcp.server
 ```
 
 ## 5. Testing instructions
@@ -269,8 +281,8 @@ rather than weakening global mypy settings.
 - The CLI and the MCP server both create a `ToolRegistry` and call the same
   handlers in `mcp/tools.py`.
 - By default both use `graphstores.factory.create_graph_store()`, which
-  selects SQLite when `aiosqlite` is available (`.code_hygiene/graph.db` by
-  default), Neo4j when `CODE_HYGIENE_NEO4J_URI` is set, and falls back to
+  selects SQLite when `aiosqlite` is available (`.ariadne/graph.db` by
+  default), Neo4j when `ARIADNE_NEO4J_URI` is set, and falls back to
   `MemoryGraphStore` only when the preferred backends cannot be initialised.
   The registry accepts any `GraphStore`/`SearchableGraphStore` implementation.
 - Language adapters are loaded dynamically with try/except; missing adapters
@@ -284,10 +296,11 @@ rather than weakening global mypy settings.
   (`IncrementalSync`, `GraphRetriever`, `HybridSearcher`, `CommunityAnalyzer`)
   are now invoked by the MCP/CLI tool handlers when the active backend is a
   `SearchableGraphStore`. `SnippetExtractor` is used by retriever/search for
-  context. `DiagnosticsCollector` collects unused-import diagnostics during
-  extraction, but there is no dedicated MCP tool to query diagnostics.
-  Several handlers still keep simple in-memory fallbacks for non-searchable
-  backends.
+  context. `DiagnosticsCollector` is wired into the Python extractor and emits
+  `CodeDiagnostic` nodes for unused imports, missing type annotations, complex
+  functions, and long parameter lists. `code_graph_list_diagnostics` queries
+  these nodes. Several handlers still keep simple in-memory fallbacks for
+  non-searchable backends.
 
 ## 8. Configuration
 
@@ -313,15 +326,15 @@ server startup via `graphstores.factory.create_graph_store()`:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CODE_HYGIENE_DB` | `.code_hygiene/graph.db` | SQLite database path |
-| `CODE_HYGIENE_NEO4J_URI` | `bolt://localhost:7687` | Neo4j URI |
-| `CODE_HYGIENE_NEO4J_USER` | `neo4j` | Neo4j username |
-| `CODE_HYGIENE_NEO4J_PASSWORD` | `password` | Neo4j password |
-| `CODE_HYGIENE_EMBEDDING_PROVIDER` | `local` | Embedding provider |
-| `CODE_HYGIENE_SCIP_TYPESCRIPT_ENABLED` | unset | `true`/`false` to force SCIP indexing on/off |
-| `CODE_HYGIENE_SCIP_TYPESCRIPT_PATH` | unset | Path to `scip-typescript` binary or `npx` |
-| `CODE_HYGIENE_SCIP_TYPESCRIPT_ARGS` | unset | Comma-separated extra args for `scip-typescript index` |
-| `CODE_HYGIENE_SCIP_TYPESCRIPT_INFER_TSCONFIG` | unset | `true`/`false` to force `--infer-tsconfig` |
+| `ARIADNE_DB` | `.ariadne/graph.db` | SQLite database path |
+| `ARIADNE_NEO4J_URI` | `bolt://localhost:7687` | Neo4j URI |
+| `ARIADNE_NEO4J_USER` | `neo4j` | Neo4j username |
+| `ARIADNE_NEO4J_PASSWORD` | `password` | Neo4j password |
+| `ARIADNE_EMBEDDING_PROVIDER` | `local` | Embedding provider |
+| `ARIADNE_SCIP_TYPESCRIPT_ENABLED` | unset | `true`/`false` to force SCIP indexing on/off |
+| `ARIADNE_SCIP_TYPESCRIPT_PATH` | unset | Path to `scip-typescript` binary or `npx` |
+| `ARIADNE_SCIP_TYPESCRIPT_ARGS` | unset | Comma-separated extra args for `scip-typescript index` |
+| `ARIADNE_SCIP_TYPESCRIPT_INFER_TSCONFIG` | unset | `true`/`false` to force `--infer-tsconfig` |
 | `LUMEN_CODE_GRAPH_PROVIDER` | unset | Set to `standalone` to enable the Lumen compatibility adapter |
 | `LUMEN_WORKSPACE_ID` | unset | Lumen workspace identifier stored in project metadata |
 
@@ -331,7 +344,7 @@ server startup via `graphstores.factory.create_graph_store()`:
 |---------|-------|-------------|--------|-------|
 | Memory | `MemoryGraphStore` | No | No | Fallback for tests and smoke checks |
 | SQLite | `SQLiteGraphStore` | Yes | FTS5 + optional sqlite-vec | Default local backend selected by the factory |
-| Neo4j | `Neo4jGraphStore` | Yes | Native vector + full-text | Requires `neo4j` package and running server; selected when `CODE_HYGIENE_NEO4J_URI` is set |
+| Neo4j | `Neo4jGraphStore` | Yes | Native vector + full-text | Requires `neo4j` package and running server; selected when `ARIADNE_NEO4J_URI` is set |
 | Lumen | `LumenGraphStore` | Depends on delegate | Via delegate | Optional wrapper that adds Lumen KG query aliases, workspace-root restrictions, and `lumen_code_graph_retrieve`; enabled by `LUMEN_CODE_GRAPH_PROVIDER=standalone` |
 
 `GraphStore.query()` accepts named queries. The common names implemented by
@@ -355,7 +368,8 @@ server startup via `graphstores.factory.create_graph_store()`:
   library `ast` module. Extracts modules, classes, functions, methods,
   imports, variables, attributes, type annotations, decorators, inheritance,
   overrides, call edges, FastAPI routes, dataclass/enum/Pydantic flags,
-  snippets, complexity, and unused-import diagnostics.
+  snippets, complexity, and code-quality diagnostics (unused imports, missing
+  type annotations, complex functions, and long parameter lists).
 - **TypeScript (`languages/typescript/`):** Implemented using Tree-sitter with
   an optional SCIP enhancement layer. When `@sourcegraph/scip-typescript` is
   installed, `TypeScriptLanguageAdapter.prepare_project` runs
@@ -422,11 +436,16 @@ sub-package under `languages/` and load it in `mcp/server.py` and `cli.py`.
 
 As of the latest changes:
 
-- **Tests:** 196 tests pass, 13 skipped (Neo4j backend tests when Neo4j is not
-  configured): 46 Python extractor tests, 32 TypeScript/TSX extractor tests,
+- **Tests:** 274 tests pass, 14 skipped (Neo4j backend tests when Neo4j is not
+  configured): 46 Python extractor tests, 15 Python diagnostics tests in
+`tests/test_python/test_diagnostics.py`, 32 TypeScript/TSX extractor tests,
   12 wired handler/SQLite tests in `tests/test_mcp/test_wired_handlers.py`,
+  2 MCP server smoke tests in `tests/test_mcp/test_server.py`,
   5 change-detection tests in `tests/test_core/test_incremental_sync.py`,
   4 auto-sync tests in `tests/test_core/test_auto_sync.py`,
+  6 config tests in `tests/test_core/test_config.py`,
+  6 search tests in `tests/test_core/test_search.py`,
+  5 community-analysis tests in `tests/test_core/test_communities.py`,
   39 graph-store unit tests in `tests/test_graphstores/`,
   3 capability-report tests in `tests/test_core/test_capabilities.py`,
   4 dependency-fallback acceptance tests in
@@ -434,25 +453,25 @@ As of the latest changes:
   9 discovery tests in `tests/test_core/test_discovery.py`,
   14 freshness tests in `tests/test_core/test_freshness.py`,
   12 retrieval tests in `tests/test_core/test_retrieval.py`, and
-  16 CLI tests in `tests/test_cli.py`. Neo4j graph-store tests are skipped unless
-  `CODE_HYGIENE_NEO4J_URI` is set.
+  18 CLI tests in `tests/test_cli.py`. Neo4j graph-store tests are skipped unless
+  `ARIADNE_NEO4J_URI` is set.
 - **Lint/type:** both `ruff check src/ tests/` and `mypy src/` pass.
   Missing-stub warnings for optional dependencies (`neo4j`,
   `sentence_transformers`) and untyped core dependencies (`aiofiles`,
   `networkx`, `community`) are suppressed with targeted `# type: ignore`
   comments so that `warn_unused_ignores = true` remains enabled.
 - **Optional-dependency degradation:** `code_graph_capabilities` and the
-  `code-hygiene capabilities` CLI command report runtime availability of the
+  `ariadne capabilities` CLI command report runtime availability of the
   `typescript`, `semantic`, `vector`, and `neo4j` extras. `code_graph_index_status`
   includes the same capability report. When tree-sitter is missing, TypeScript
   files are indexed as stub `CodeFile` nodes with a `CodeDiagnostic` warning
   (`rule="missing_dependency"`). CI runs the test suite against both the base
   (`[dev]`) and full (`[all]`) installs so fallback paths are exercised.
 - **Default backend:** CLI and server use `graphstores.factory` to select
-  `SQLiteGraphStore` by default (`.code_hygiene/graph.db`),
-  `Neo4jGraphStore` when `CODE_HYGIENE_NEO4J_URI` is set, and
+  `SQLiteGraphStore` by default (`.ariadne/graph.db`),
+  `Neo4jGraphStore` when `ARIADNE_NEO4J_URI` is set, and
   `MemoryGraphStore` only as a fallback. The environment variables
-  `CODE_HYGIENE_DB` / `CODE_HYGIENE_NEO4J_*` are wired through
+  `ARIADNE_DB` / `ARIADNE_NEO4J_*` are wired through
   `AnalyzerConfig`.
 - **Semantic/keyword search:** `handle_search_semantic` and
   `handle_search_code` are wired to `HybridSearcher` when a searchable backend
@@ -463,8 +482,9 @@ As of the latest changes:
 - **Diagnostics query:** `code_graph_list_diagnostics` is exposed as an MCP
   tool and as the CLI `diagnostics` subcommand. It queries `CodeDiagnostic`
   nodes and supports filters by `level`, `rule`, and `file_path`. The Python
-  and TypeScript extractors emit diagnostics with `level`/`rule` properties
-  aligned with `DiagnosticsCollector`.
+  extractor emits diagnostics with `level`/`rule` properties aligned with
+  `DiagnosticsCollector`; the TypeScript adapter emits `missing_dependency`
+  and SCIP-related diagnostics.
 - **SQLite vector dimensions:** `SQLiteGraphStore` now accepts
   `embedding_dimensions` from `AnalyzerConfig` and uses it when creating the
   sqlite-vec `vec0` virtual table. A dimension mismatch with an existing table
@@ -547,7 +567,7 @@ As of the latest changes:
   that polls registered projects and re-indexes them. The CLI exposes a
   `watch` command that indexes once and then polls for changes.
 - **Deployment:** A `project/Dockerfile` (installing the `[all]` extras and
-  defaulting to `code-hygiene mcp`), a `.github/workflows/ci.yml` GitHub
+  defaulting to `ariadne mcp`), a `.github/workflows/ci.yml` GitHub
   Actions workflow (running pytest, ruff, and mypy on Python 3.11 and 3.12),
   pinned `requirements.txt`/`requirements-all.txt` files, and a `uv.lock`
   file are now included. Distribution remains via `pip install -e ".[all]"`

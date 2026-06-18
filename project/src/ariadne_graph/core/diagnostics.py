@@ -80,20 +80,51 @@ class DiagnosticsCollector:
         self,
         node_id: str,
         function_name: str,
-        parameter: str | None = None,
+        *,
+        missing_return: bool = False,
+        missing_parameters: list[str] | None = None,
+        total_parameters: int | None = None,
     ) -> CodeDiagnostic:
-        """Report a missing type annotation on a function or parameter."""
-        if parameter:
-            msg = f"Parameter '{parameter}' in '{function_name}' lacks type annotation"
+        """Report missing type annotations on a function in a single finding.
+
+        Args:
+            node_id: The code node ID this diagnostic applies to.
+            function_name: Name of the function being diagnosed.
+            missing_return: Whether the function's return annotation is missing.
+            missing_parameters: List of parameter names that lack type annotations.
+            total_parameters: Total number of parameters in the function signature.
+        """
+        missing_parameters = missing_parameters or []
+        parts: list[str] = []
+        properties: dict[str, Any] = {"function_name": function_name}
+
+        if missing_return:
+            parts.append("return value")
+            properties["missing_return"] = True
+
+        if missing_parameters:
+            count = len(missing_parameters)
+            properties["missing_parameters"] = missing_parameters
+            if total_parameters is not None:
+                properties["total_parameters"] = total_parameters
+                param_phrase = f"{count} of {total_parameters} parameters"
+            else:
+                param_phrase = f"{count} parameter(s)"
+            parts.append(param_phrase)
+
+        if not parts:
+            msg = f"Function '{function_name}' lacks type annotations"
+        elif len(parts) == 1:
+            msg = f"Function '{function_name}' {parts[0]} lacks type annotation"
         else:
-            msg = f"Function '{function_name}' lacks return type annotation"
+            msg = f"Function '{function_name}' {parts[0]} and {parts[1]} lack type annotations"
+
         return self.add_diagnostic(
             node_id=node_id,
             level="info",
             message=msg,
             rule="missing_type_annotation",
-            function_name=function_name,
-            parameter=parameter,
+            **properties,
         )
 
     def add_complex_function(

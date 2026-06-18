@@ -1,21 +1,20 @@
-# SPEC.md — Code Hygiene MCP
+# SPEC.md — Ariadne Graph
 
 ## 1. Overview
 
-A standalone MCP server for code graph analysis. Extracts graph facts from Python and TypeScript repos, persists to SQLite (local) or Neo4j (production), and exposes 14 MCP tools for indexing, querying, analysis, and code inspection.
+A standalone MCP server for code graph analysis. Extracts graph facts from Python and TypeScript repos, persists to SQLite (local) or Neo4j (production), and exposes 16 canonical MCP tools (plus a Lumen compatibility alias) for indexing, querying, analysis, code inspection, and diagnostics.
 
 ## 2. Project Structure
 
 ```
-code_hygiene_mcp/
-  src/code_hygiene_mcp/
+ariadne_graph/
+  src/ariadne_graph/
     __init__.py
     core/
       __init__.py
       models.py          # CodeNode, CodeEdge, CodeGraphDelta, etc.
       config.py          # AnalyzerConfig
       discovery.py       # File discovery and ignore rules
-      facts.py           # Language-agnostic fact processing
       retrieval.py       # Graph neighborhood retrieval
       snippets.py        # Source snippet extraction
       freshness.py       # Freshness manifest management
@@ -40,17 +39,21 @@ code_hygiene_mcp/
       memory.py          # In-memory graph store
       sqlite.py          # SQLite graph store (default local)
       neo4j.py           # Neo4j graph store (production)
+      lumen.py           # Optional Lumen KG compatibility wrapper
     mcp/
       __init__.py
       server.py          # MCP server (FastMCP)
-      tools.py           # All 14 tool handlers
+      tools.py           # All 16 canonical tool handlers + Lumen alias
       schemas.py         # Input/output schemas per tool
     cli.py               # CLI entry point
   tests/
     fixtures/
     test_core/
     test_python/
+    test_typescript/
     test_graphstores/
+    test_mcp/
+    test_acceptance/
   pyproject.toml
 ```
 
@@ -162,7 +165,7 @@ class AnalyzerConfig(BaseModel):
     auto_sync: bool = False
 ```
 
-## 7. MCP Tools (14 tools)
+## 7. MCP Tools (16 canonical tools + 1 Lumen alias)
 
 ### Indexing (4 tools)
 - `code_graph_index(repo_path, force_rebuild=False)` -> status, files_indexed
@@ -170,43 +173,64 @@ class AnalyzerConfig(BaseModel):
 - `code_graph_list_projects()` -> project_ids, repo_paths
 - `code_graph_delete_project(repo_path)` -> deleted
 
+### Capabilities (1 tool)
+- `code_graph_capabilities()` -> runtime availability report for optional extras
+
 ### Query (4 tools)
-- `code_graph_retrieve(query: str, graph_id: str)` -> node + edges + snippets
-- `code_graph_search_semantic(query_text, limit=10, types=[])` -> ranked entities
-- `code_graph_search_code(pattern, language=None, limit=10)` -> matching snippets
-- `code_graph_trace_dependencies(symbol, direction="both", max_depth=3)` -> path list
+- `code_graph_retrieve(query: str, graph_id=None)` -> node + edges + snippets
+- `code_graph_search_semantic(query_text, repo_path=None, limit=10, types=[])` -> ranked entities
+- `code_graph_search_code(pattern, repo_path=None, language=None, limit=10)` -> matching snippets
+- `code_graph_trace_dependencies(symbol, direction="both", max_depth=3, graph_id=None)` -> path list
 
 ### Analysis (5 tools)
-- `code_graph_impact_analysis(symbol)` -> transitive closure ranked by coupling
-- `code_graph_detect_changes(since_ref)` -> added, modified, deleted entities
-- `code_graph_find_hotspots(top_n=10, metric="complexity")` -> ranked hotspots
-- `code_graph_get_architecture()` -> community summary
-- `code_graph_list_communities(community_id=None)` -> community members
+- `code_graph_impact_analysis(symbol, graph_id=None)` -> transitive closure ranked by coupling
+- `code_graph_detect_changes(repo_path, since_ref=None)` -> added, modified, deleted entities
+- `code_graph_find_hotspots(repo_path, top_n=10, metric="complexity")` -> ranked hotspots
+- `code_graph_get_architecture(repo_path)` -> community summary
+- `code_graph_list_communities(repo_path, community_id=None)` -> community members
 
 ### Code (1 tool)
-- `code_graph_inspect_file(file_path)` -> graph subgraph for file
+- `code_graph_inspect_file(file_path, graph_id=None)` -> graph subgraph for file
+
+### Diagnostics (1 tool)
+- `code_graph_list_diagnostics(repo_path, level=None, rule=None, file_path=None, limit=100)` -> diagnostic entries
+
+### Lumen compatibility alias
+- `lumen_code_graph_retrieve(query, graph_id=None, repo_path=None)` -> Lumen-style retrieve response
 
 ## 8. Dependencies
 
 ```toml
 [project]
-name = "code-hygiene-mcp"
+name = "ariadne-graph"
 version = "0.1.0"
 dependencies = [
     "mcp>=1.0.0",
     "pydantic>=2.0",
     "xxhash>=3.0",
     "aiofiles>=23.0",
+    "aiosqlite>=0.20",
     "networkx>=3.0",
     "python-louvain>=0.16",
-    "sentence-transformers>=2.0",
     "numpy>=1.24",
-    "neo4j>=5.0",       # optional, for Neo4j backend
-    "sqlite-vec>=0.1",  # optional, for vector search
 ]
+
+[project.optional-dependencies]
+semantic = ["sentence-transformers>=2.0", "torch>=2.0"]
+neo4j = ["neo4j>=5.0"]
+vector = ["sqlite-vec>=0.1"]
+typescript = ["tree-sitter>=0.23", "tree-sitter-typescript>=0.23", "protobuf>=6.30"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "ruff>=0.1.0", "mypy>=1.0"]
 ```
 
-## 9. Implementation Order
+## 9. Notes
+
+- `core/facts.py` is listed in the original architecture as a language-agnostic
+  fact-processing module but is **not currently implemented**. Extraction logic
+  lives directly in the language adapters (`languages/python_ast/`,
+  `languages/typescript/`).
+
+## 10. Implementation Order
 
 1. models.py + config.py (foundation)
 2. graphstores/base.py + graphstores/memory.py

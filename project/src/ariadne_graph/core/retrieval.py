@@ -119,7 +119,8 @@ class GraphRetriever:
                     query_name,
                     params={"node_id": node_id},
                 )
-            except Exception:
+            except Exception as exc:
+                logger.debug("Edge query %s failed for %s: %s", query_name, node_id, exc)
                 continue
             if rows:
                 break
@@ -136,8 +137,8 @@ class GraphRetriever:
                     tgt = edge_data.get("target", "")
                     if direction == "outgoing" and src == node_id or direction == "incoming" and tgt == node_id or direction == "both" and (src == node_id or tgt == node_id):
                         rows.append(row)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Fallback edge scan failed for %s: %s", node_id, exc)
 
         edges: list[dict[str, Any]] = []
         for row in rows:

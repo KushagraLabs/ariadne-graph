@@ -1,8 +1,8 @@
-# Architecture Plan
+# Architecture Plan — Ariadne Graph
 
 ## Purpose
 
-Build a reusable Code Hygiene MCP that can be plugged into Python and TypeScript
+Build a reusable code-graph MCP server that can be plugged into Python and TypeScript
 repositories without requiring the Lumen platform runtime.
 
 The current Lumen implementation is valuable and should remain untouched until
@@ -26,12 +26,11 @@ retrieval, and agent-facing context generation.
 ## High-Level Shape
 
 ```text
-code_hygiene_mcp/
-  src/code_hygiene_mcp/
+ariadne_graph/
+  src/ariadne_graph/
     core/
       config.py
       discovery.py
-      facts.py
       retrieval.py
       snippets.py
       freshness.py
@@ -59,6 +58,11 @@ code_hygiene_mcp/
 ```
 
 ## Core Responsibilities
+
+> Note: `core/facts.py` is listed in early design notes as a language-agnostic
+> fact-processing module but is **not currently implemented**. Extraction logic
+> lives in the language adapters, and the core models in `core/models.py` define
+> the common node/edge schema.
 
 The core package owns:
 
@@ -162,6 +166,7 @@ back to file-by-file exploration.
 - `code_graph_index_status`
 - `code_graph_list_projects`
 - `code_graph_delete_project`
+- `code_graph_capabilities`
 - `code_graph_search_semantic`
 - `code_graph_search_code`
 - `code_graph_inspect_file`
@@ -171,9 +176,10 @@ back to file-by-file exploration.
 - `code_graph_find_hotspots`
 - `code_graph_get_architecture`
 - `code_graph_list_communities`
+- `code_graph_list_diagnostics`
 
-The Lumen-specific `lumen_code_graph_retrieve` name can be provided later as a
-compatibility alias, not as the canonical tool name.
+The Lumen-specific `lumen_code_graph_retrieve` compatibility alias is implemented
+as an optional tool exposed when Lumen compatibility is enabled.
 
 ## Search Strategy
 
