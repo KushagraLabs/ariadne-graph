@@ -332,16 +332,6 @@ class GraphRetriever:
         if rows:
             return cast(dict[str, Any], rows[0].get("n", rows[0]))
 
-        # Fallback: scan all nodes
-        try:
-            all_nodes = await self.graph_store.query(graph_id, "nodes")
-            for row in all_nodes:
-                node_data = row.get("n", row)
-                if node_data.get("id") == node_id:
-                    return cast(dict[str, Any], node_data)
-        except Exception:
-            pass
-
         return None
 
     async def _get_neighbors(
@@ -369,7 +359,9 @@ class GraphRetriever:
             for edge in outgoing:
                 target = edge.get("target", "")
                 if target:
-                    neighbors.append(await self._canonicalize_neighbor(graph_id, target))
+                    canonical = await self._canonicalize_neighbor(graph_id, target)
+                    if canonical:
+                        neighbors.append(canonical)
 
         if direction in ("up", "both"):
             # Incoming edges: others -> this node
@@ -377,7 +369,9 @@ class GraphRetriever:
             for edge in incoming:
                 source = edge.get("source", "")
                 if source:
-                    neighbors.append(await self._canonicalize_neighbor(graph_id, source))
+                    canonical = await self._canonicalize_neighbor(graph_id, source)
+                    if canonical:
+                        neighbors.append(canonical)
 
         return neighbors
 
@@ -400,19 +394,31 @@ class GraphRetriever:
         props = node.get("properties", {}) or {}
         if not props.get("is_external"):
             return neighbor_id
+        # External node with a real file_path is a node_modules / stdlib symbol;
+        # don't let BFS escape the project.
+        if props.get("file_path"):
+            return ""
         name = props.get("name")
         if not name:
             return neighbor_id
 
+        # Use the indexed name lookup instead of scanning every node.
         try:
-            rows = await self.graph_store.query(graph_id, "nodes")
+            rows = await self.graph_store.query(
+                graph_id, "node_by_name", params={"name": name}
+            )
         except Exception:
             return neighbor_id
+
         concrete: list[str] = []
         for row in rows:
             cand = row.get("n", row)
+            if not cand:
+                continue
             cprops = cand.get("properties", {}) or {}
-            if cprops.get("is_external") or cprops.get("name") != name:
+            if cprops.get("is_external"):
+                continue
+            if cprops.get("name") != name:
                 continue
             # Concrete nodes carry a file_path; stubs do not.
             if not cprops.get("file_path"):
@@ -420,7 +426,16 @@ class GraphRetriever:
             cid = cand.get("id", "")
             if cid and cid != neighbor_id:
                 concrete.append(cid)
-        return concrete[0] if len(concrete) == 1 else neighbor_id
+
+        if len(concrete) == 1:
+            return concrete[0]
+
+        # No unique concrete target: if the neighbor is an external stub
+        # without a project file_path, drop it so BFS doesn't escape into
+        # stdlib / node_modules.
+        if not props.get("file_path"):
+            return ""
+        return neighbor_id
 
     async def _bfs_reachable(
         self,

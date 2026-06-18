@@ -87,6 +87,37 @@ class TestAvailability:
         assert indexer.has_project() is True
 
 
+class TestRunIndexer:
+    async def test_command_includes_output_path(
+        self, repo: Path, config: AnalyzerConfig
+    ) -> None:
+        """``_run_indexer`` must tell scip-typescript where to write the index."""
+        config.scip_typescript_enabled = True
+        indexer = ScipTypeScriptIndexer(repo, config)
+        expected_output = repo / ".ariadne" / "scip" / "test-graph" / "index.scip"
+
+        captured_cmd: list[str] = []
+
+        async def fake_exec(
+            *cmd: str,
+            cwd: str | None = None,
+            stdout: int | None = None,
+            stderr: int | None = None,
+        ) -> mock.AsyncMock:
+            captured_cmd.extend(cmd)
+            proc = mock.AsyncMock()
+            proc.returncode = 0
+            proc.communicate.return_value = (b"", b"")
+            return proc
+
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            await indexer._run_indexer(expected_output)
+
+        assert "--output" in captured_cmd
+        assert str(expected_output) in captured_cmd
+        assert captured_cmd.index("--output") + 1 == captured_cmd.index(str(expected_output))
+
+
 class TestEnsureIndexMocked:
     async def test_failure_returns_none_and_does_not_store_fingerprint(
         self, repo: Path, config: AnalyzerConfig

@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     PRIMARY KEY (graph_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_graph ON nodes(graph_id);
+CREATE INDEX IF NOT EXISTS idx_nodes_name
+    ON nodes(graph_id, json_extract(properties, '$.name'));
 
 -- Edges
 CREATE TABLE IF NOT EXISTS edges (
@@ -335,10 +337,10 @@ class SQLiteGraphStore:
     async def _migrate_old_fts(self, db: aiosqlite.Connection) -> None:
         """Migrate legacy FTS5 table to rowid-keyed external-content schema.
 
-        The original ``node_fts`` stored ``node_id`` and ``graph_id`` as
-        indexed columns, so ``DELETE FROM node_fts WHERE node_id IN (...)``
-        degraded super-linearly.  The new schema keeps a regular content table
-        (``fts_node_content``) and an external-content FTS5 table keyed by
+        The original ``node_fts`` stored its own content in an internal shadow
+        table (``node_fts_content``), so ``DELETE FROM node_fts WHERE node_id IN
+        (...)`` degraded super-linearly.  The new schema keeps a regular content
+        table (``fts_node_content``) and an external-content FTS5 table keyed by
         ``rowid``.  Deletes by rowid are O(1) in the FTS index.
 
         Existing FTS data is preserved by copying it into the content table
@@ -346,17 +348,20 @@ class SQLiteGraphStore:
         dropped and recreated empty; callers will need to re-index to
         repopulate keyword search.
         """
-        # Detect whether node_fts exists with the legacy schema.
-        # The new schema sets the FTS5 "content" option to "fts_node_content".
+        # Detect whether node_fts exists with the legacy (internal-content)
+        # schema.  FTS5 creates a ``<table>_content`` shadow table only when it
+        # stores content internally; with external content that shadow table is
+        # absent.  The ``content`` option is not stored in ``node_fts_config``,
+        # so we must inspect sqlite_master instead.
         try:
             cursor = await db.execute(
-                "SELECT v FROM node_fts_config WHERE k = 'content'"
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node_fts_content'"
             )
             row = await cursor.fetchone()
-            if row is not None and row["v"] == "fts_node_content":
-                return  # Already on the new schema.
+            if row is None:
+                return  # Already on the new external-content schema.
         except Exception:
-            # node_fts_config may not exist if node_fts has not been created.
+            # node_fts may not exist yet.
             return
 
         logger.info("Migrating legacy FTS5 table to rowid-keyed external content")

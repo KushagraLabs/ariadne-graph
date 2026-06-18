@@ -145,6 +145,7 @@ class ScipTypeScriptIndexer:
     async def _run_indexer(self, output_path: Path) -> tuple[int, str, str]:
         """Run the indexer and return (returncode, stdout, stderr)."""
         cmd = self._build_command()
+        cmd.extend(["--output", str(output_path)])
         logger.info("Running SCIP indexer: %s", " ".join(cmd))
 
         proc = await asyncio.create_subprocess_exec(

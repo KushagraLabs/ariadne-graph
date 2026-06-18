@@ -128,10 +128,11 @@ class FakeSearchableGraphStore(SearchableGraphStore):
 
         if query == "node_by_name":
             name = params.get("name", "")
-            for row in nodes_for_graph:
-                if row["n"]["properties"].get("name") == name:
-                    return [row]
-            return []
+            results = [
+                row for row in nodes_for_graph
+                if row["n"]["properties"].get("name") == name
+            ]
+            return results
 
         if query == "node_name_fuzzy":
             name = params.get("name", "").lower()

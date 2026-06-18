@@ -8,7 +8,6 @@ import pytest
 
 from ariadne_graph.core.config import AnalyzerConfig
 from ariadne_graph.graphstores.factory import create_graph_store
-from ariadne_graph.graphstores.memory import MemoryGraphStore
 from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
 
 
@@ -31,9 +30,9 @@ class TestCreateGraphStore:
         monkeypatch.setenv("ARIADNE_NEO4J_URI", "bolt://test:7687")
         config = AnalyzerConfig(repo_root=repo)
         store = create_graph_store(config)
-        # Neo4j connection will fail without a server, so it falls back to SQLite.
-        # We just verify the factory does not crash and returns a usable store.
-        assert isinstance(store, (SQLiteGraphStore, MemoryGraphStore))
+        # The factory instantiates Neo4jGraphStore when the URI is configured and
+        # the driver is importable; it does not validate server reachability here.
+        assert type(store).__name__ == "Neo4jGraphStore"
 
     def test_explicit_db_path_used_by_sqlite(self, tmp_path: Path) -> None:
         repo = tmp_path / "repo"

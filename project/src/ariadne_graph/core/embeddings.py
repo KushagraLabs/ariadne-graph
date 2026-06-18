@@ -89,9 +89,7 @@ class LocalEmbeddingProvider:
 
             # Lazy import to avoid heavy dependency when not needed
             try:
-                from sentence_transformers import (  # type: ignore[import-not-found]
-                    SentenceTransformer,
-                )
+                from sentence_transformers import SentenceTransformer
             except ImportError as exc:
                 raise RuntimeError(
                     "sentence-transformers is required for local embeddings. "

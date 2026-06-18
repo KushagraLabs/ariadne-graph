@@ -262,9 +262,16 @@ async def _handle_impact(args: argparse.Namespace) -> int:
 async def _handle_trace(args: argparse.Namespace) -> int:
     """Handle the 'trace' command."""
     async with _registry_scope(args.repo_path) as registry:
+        direction_map = {
+            "upstream": "up",
+            "downstream": "down",
+            "both": "both",
+        }
         input_data = TraceDependenciesInput(
             symbol=args.symbol,
             graph_id=_derive_graph_id(args.repo_path),
+            direction=direction_map.get(args.direction, args.direction),
+            max_depth=args.max_depth,
         )
         result = await registry.handle_trace_dependencies(input_data)
         _print_json(result.model_dump())

@@ -155,10 +155,13 @@ class CommunityAnalyzer:
             if source and target:
                 digraph.add_edge(source, target)
 
-        # Get all node IDs that are in communities
+        # Build a fast node -> community lookup map once.
+        node_community: dict[str, int] = {}
         all_community_nodes: set[str] = set()
-        for members in community_groups.values():
+        for cid, members in community_groups.items():
             all_community_nodes.update(members)
+            for node_id in members:
+                node_community[node_id] = cid
 
         # Calculate degree metrics
         in_degrees = dict(digraph.in_degree())
@@ -173,18 +176,14 @@ class CommunityAnalyzer:
         for community_id, members in sorted(community_groups.items()):
             member_set = set(members)
 
-            # Count internal and external edges
+            # Count internal and external edges in a single pass using the
+            # pre-built node -> community map. This avoids the previous
+            # O(edges * communities) nested loop.
             internal_edges = 0
             external_edges: dict[int, int] = {}
-            for edge in digraph.edges():
-                src, tgt = edge
-                src_comm = None
-                tgt_comm = None
-                for cid, mems in community_groups.items():
-                    if src in mems:
-                        src_comm = cid
-                    if tgt in mems:
-                        tgt_comm = cid
+            for src, tgt in digraph.edges():
+                src_comm = node_community.get(src)
+                tgt_comm = node_community.get(tgt)
 
                 if src_comm == community_id and tgt_comm == community_id:
                     internal_edges += 1
@@ -237,13 +236,6 @@ class CommunityAnalyzer:
             name = props.get("name", node_id.split(".")[-1] if "." in node_id else node_id)
             file_path = props.get("file_path", "")
 
-            # Find community
-            comm_id: int | None = None
-            for cid, mems in community_groups.items():
-                if node_id in mems:
-                    comm_id = cid
-                    break
-
             hotspots.append(
                 HotspotInfo(
                     node_id=node_id,
@@ -251,7 +243,7 @@ class CommunityAnalyzer:
                     file_path=file_path,
                     metric_type="complexity",
                     score=float(degree),
-                    community_id=comm_id,
+                    community_id=node_community.get(node_id),
                 )
             )
 

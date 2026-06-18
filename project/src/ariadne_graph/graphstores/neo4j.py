@@ -31,14 +31,14 @@ logger = logging.getLogger(__name__)
 # Lazy / optional neo4j import
 # ---------------------------------------------------------------------------
 try:
-    import neo4j  # type: ignore[import-not-found]
-    import neo4j.graph  # type: ignore[import-not-found]
+    import neo4j
+    import neo4j.graph
     from neo4j import AsyncGraphDatabase
 
     _HAS_NEO4J = True
 except Exception:  # pragma: no cover
     _HAS_NEO4J = False
-    neo4j = None
+    neo4j = None  # type: ignore[assignment]
 
 # Query names shared with SQLiteGraphStore
 _SUPPORTED_QUERIES: set[str] = {
