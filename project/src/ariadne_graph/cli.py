@@ -48,6 +48,7 @@ from ariadne_graph.mcp.schemas import (
     SearchSemanticInput,
     TraceDependenciesInput,
 )
+from ariadne_graph.mcp.server import _run_server_async, initialise_registry
 from ariadne_graph.mcp.tools import ToolRegistry
 
 logger = logging.getLogger("ariadne-cli")
@@ -334,21 +335,15 @@ async def _handle_list_projects(args: argparse.Namespace) -> int:
         return 0
 
 
-def _handle_mcp(args: argparse.Namespace) -> int:
+async def _handle_mcp(args: argparse.Namespace) -> int:
     """Handle the 'mcp' command — start the MCP server.
 
-    This handler is synchronous because the MCP server runs its own event
-    loop; calling it from an async context would conflict with asyncio.run.
+    Runs inside the CLI's existing event loop, so we call the server's async
+    runner directly instead of spawning a nested event loop.
     """
-    from ariadne_graph.mcp.server import main as server_main
-
-    server_main(transport=args.transport)
+    initialise_registry()
+    await _run_server_async(transport=args.transport, mount_path=None)
     return 0
-
-
-async def _handle_mcp_async(args: argparse.Namespace) -> int:
-    """Async wrapper for ``_handle_mcp`` kept for handler-registry parity."""
-    return _handle_mcp(args)
 
 
 async def _handle_watch(args: argparse.Namespace) -> int:
@@ -593,7 +588,7 @@ _COMMAND_HANDLERS: dict[str, Callable[[argparse.Namespace], Awaitable[int]]] = {
     "inspect": _handle_inspect,
     "diagnostics": _handle_diagnostics,
     "delete": _handle_delete,
-    "mcp": _handle_mcp_async,
+    "mcp": _handle_mcp,
     "watch": _handle_watch,
     "list": _handle_list_projects,
 }
@@ -614,10 +609,6 @@ async def _async_main(args: Sequence[str] | None = None) -> int:
     if parsed.command is None:
         parser.print_help()
         return 0
-
-    # The MCP server runs its own event loop and must be invoked synchronously.
-    if parsed.command == "mcp":
-        return _handle_mcp(parsed)
 
     handler = _COMMAND_HANDLERS.get(parsed.command)
     if handler is None:
