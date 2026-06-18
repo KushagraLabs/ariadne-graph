@@ -179,3 +179,74 @@ class TestCommunityAnalyzer:
         hotspots = await analyzer.find_hotspots("g", top_n=3, metric="coupling")
         assert hotspots
         assert hotspots[0].node_id == "hub"
+
+    @pytest.mark.asyncio
+    async def test_graph_cache_avoids_reloading(
+        self, analyzer: CommunityAnalyzer, store: FakeSearchableGraphStore
+    ) -> None:
+        """Repeated analysis calls should reuse the cached graph."""
+        nodes = [
+            CodeNode(id="a", graph_id="g", labels=["CodeFunction"], properties={}),
+            CodeNode(id="b", graph_id="g", labels=["CodeFunction"], properties={}),
+        ]
+        await store.add_nodes_batch("g", nodes)
+        edges = [
+            CodeEdge(source="a", target="b", graph_id="g", rel_type="CALLS"),
+        ]
+        await store.add_edges_batch("g", edges)
+
+        await analyzer.find_hotspots("g", top_n=2, metric="fan_in")
+        assert "g" in analyzer._cache
+
+        # Replace the store's data; cached graph should still be used.
+        store._nodes.clear()
+        store._edges.clear()
+        hotspots = await analyzer.find_hotspots("g", top_n=2, metric="fan_in")
+        assert len(hotspots) == 2
+
+    @pytest.mark.asyncio
+    async def test_detect_communities_caches_assignments(
+        self, analyzer: CommunityAnalyzer, store: FakeSearchableGraphStore
+    ) -> None:
+        """Community assignments are cached after detection."""
+        nodes = [
+            CodeNode(id="a", graph_id="g", labels=["CodeFunction"], properties={}),
+            CodeNode(id="b", graph_id="g", labels=["CodeFunction"], properties={}),
+        ]
+        await store.add_nodes_batch("g", nodes)
+
+        assignments = await analyzer.detect_communities("g")
+        cached = analyzer._cache.get("g")
+        assert cached is not None
+        assert cached[2] == assignments
+
+    @pytest.mark.asyncio
+    async def test_architecture_summary_single_pass_coupling(
+        self, analyzer: CommunityAnalyzer, store: FakeSearchableGraphStore
+    ) -> None:
+        """Architecture summary reports correct cross-community coupling."""
+        nodes = [
+            CodeNode(id="a", graph_id="g", labels=["CodeFunction"], properties={}),
+            CodeNode(id="b", graph_id="g", labels=["CodeFunction"], properties={}),
+            CodeNode(id="c", graph_id="g", labels=["CodeFunction"], properties={}),
+            CodeNode(id="d", graph_id="g", labels=["CodeFunction"], properties={}),
+        ]
+        await store.add_nodes_batch("g", nodes)
+        edges = [
+            CodeEdge(source="a", target="b", graph_id="g", rel_type="CALLS"),
+            CodeEdge(source="b", target="a", graph_id="g", rel_type="CALLS"),
+            CodeEdge(source="c", target="d", graph_id="g", rel_type="CALLS"),
+            CodeEdge(source="d", target="c", graph_id="g", rel_type="CALLS"),
+            CodeEdge(source="a", target="c", graph_id="g", rel_type="CALLS"),
+        ]
+        await store.add_edges_batch("g", edges)
+
+        summary = await analyzer.get_architecture_summary("g")
+        # Two communities (a,b) and (c,d) with one cross edge a->c.
+        cross_coupling: dict[int, dict[int, int]] = {}
+        for comm in summary.communities:
+            cross_coupling[comm.community_id] = comm.external_coupling
+
+        # Exactly one community should have a cross edge.
+        total_cross = sum(sum(v.values()) for v in cross_coupling.values())
+        assert total_cross == 1

@@ -152,18 +152,23 @@ async def code_graph_delete_project(repo_path: str) -> dict[str, Any]:
 # ============================================================================
 
 @mcp.tool()
-async def code_graph_retrieve(query: str, graph_id: str | None = None) -> dict[str, Any]:
+async def code_graph_retrieve(
+    query: str,
+    graph_id: str | None = None,
+    repo_path: str | None = None,
+) -> dict[str, Any]:
     """Retrieve a symbol and its neighborhood from the code graph.
 
     Args:
         query: Node ID or symbol name to retrieve.
         graph_id: Optional graph ID. Derived from repo_path if omitted.
+        repo_path: Optional repository path used to derive graph_id.
 
     Returns:
         Dict with results (nodes, neighbors, and edges).
     """
     registry = _get_registry()
-    input_data = RetrieveInput(query=query, graph_id=graph_id)
+    input_data = RetrieveInput(query=query, graph_id=graph_id, repo_path=repo_path)
     result = await registry.handle_retrieve(input_data)
     return result.model_dump()
 

@@ -6,6 +6,7 @@ summarization, and hotspot identification for code graphs.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, cast
 
@@ -27,18 +28,78 @@ class CommunityAnalyzer:
     Uses the Louvain algorithm for community detection on the undirected
     version of the code dependency graph. Provides architecture summaries
     and hotspot identification.
+
+    To avoid reloading large graphs on every analysis call, the analyzer
+    keeps an in-memory cache of the NetworkX graph and community assignments
+    per graph_id. Synchronous NetworkX/graph algorithms are executed in a
+    background thread so they do not block the asyncio event loop.
     """
 
     def __init__(self, graph_store: SearchableGraphStore) -> None:
         self.graph_store = graph_store
+        self._cache: dict[
+            str,
+            tuple[
+                nx.DiGraph,
+                dict[str, dict[str, Any]],
+                dict[str, int] | None,
+            ],
+        ] = {}
+
+    def _clear_cache(self, graph_id: str) -> None:
+        """Remove cached data for a graph."""
+        self._cache.pop(graph_id, None)
+
+    async def _load_graph(
+        self, graph_id: str
+    ) -> tuple[nx.DiGraph, dict[str, dict[str, Any]]]:
+        """Load or retrieve the cached NetworkX graph and node lookup.
+
+        Args:
+            graph_id: The repository graph identifier.
+
+        Returns:
+            Tuple of (directed graph, node_id -> node_data lookup).
+        """
+        cached = self._cache.get(graph_id)
+        if cached is not None:
+            return cached[0], cached[1]
+
+        node_rows = await self.graph_store.query(graph_id, "nodes")
+        edge_rows = await self.graph_store.query(graph_id, "edges")
+
+        digraph = nx.DiGraph()
+        node_lookup: dict[str, dict[str, Any]] = {}
+
+        for row in node_rows:
+            node_data = cast(dict[str, Any], row.get("n", row))
+            node_id = node_data.get("id", "")
+            if not node_id:
+                continue
+            node_lookup[node_id] = node_data
+            digraph.add_node(
+                node_id,
+                labels=node_data.get("labels", []),
+                properties=node_data.get("properties", {}),
+            )
+
+        for row in edge_rows:
+            edge_data = cast(dict[str, Any], row.get("r", row))
+            source = edge_data.get("source", "")
+            target = edge_data.get("target", "")
+            rel_type = edge_data.get("rel_type", "")
+            if source and target and source in node_lookup and target in node_lookup:
+                digraph.add_edge(source, target, rel_type=rel_type)
+
+        self._cache[graph_id] = (digraph, node_lookup, None)
+        return digraph, node_lookup
 
     async def detect_communities(self, graph_id: str) -> dict[str, int]:
         """Detect communities using the Louvain algorithm.
 
-        1. Query all nodes and edges for the graph.
-        2. Build a NetworkX DiGraph from edges.
-        3. Run Louvain on the undirected version.
-        4. Store assignments via graph_store.set_communities.
+        1. Load the graph (or use cached copy).
+        2. Run Louvain on the undirected version in a background thread.
+        3. Store assignments via graph_store.set_communities.
 
         Args:
             graph_id: The repository graph identifier.
@@ -46,32 +107,7 @@ class CommunityAnalyzer:
         Returns:
             Mapping of node_id -> community_id.
         """
-        # Fetch nodes and edges
-        node_rows = await self.graph_store.query(graph_id, "nodes")
-        edge_rows = await self.graph_store.query(graph_id, "edges")
-
-        # Build NetworkX directed graph
-        digraph = nx.DiGraph()
-
-        node_ids: set[str] = set()
-        for row in node_rows:
-            node_data = row.get("n", row)
-            node_id = node_data.get("id", "")
-            if node_id:
-                node_ids.add(node_id)
-                digraph.add_node(
-                    node_id,
-                    labels=node_data.get("labels", []),
-                    properties=node_data.get("properties", {}),
-                )
-
-        for row in edge_rows:
-            edge_data = row.get("r", row)
-            source = edge_data.get("source", "")
-            target = edge_data.get("target", "")
-            rel_type = edge_data.get("rel_type", "")
-            if source and target and source in node_ids and target in node_ids:
-                digraph.add_edge(source, target, rel_type=rel_type)
+        digraph, _node_lookup = await self._load_graph(graph_id)
 
         if digraph.number_of_nodes() == 0:
             logger.info("No nodes in graph %s, skipping community detection", graph_id)
@@ -81,22 +117,25 @@ class CommunityAnalyzer:
             logger.info("No edges in graph %s, assigning all to community 0", graph_id)
             assignments = dict.fromkeys(digraph.nodes(), 0)
             await self.graph_store.set_communities(graph_id, assignments)
+            self._cache[graph_id] = (digraph, _node_lookup, assignments)
             return assignments
 
-        # Run Louvain on the undirected version
         undirected = digraph.to_undirected()
         try:
             import community as community_louvain  # type: ignore[import-untyped]
 
-            assignments = cast(dict[str, int], community_louvain.best_partition(undirected))
+            assignments = cast(
+                dict[str, int],
+                await asyncio.to_thread(community_louvain.best_partition, undirected),
+            )
         except ImportError as exc:
             raise RuntimeError(
                 "python-louvain is required for community detection. "
                 "Install with: pip install python-louvain"
             ) from exc
 
-        # Store assignments
         await self.graph_store.set_communities(graph_id, assignments)
+        self._cache[graph_id] = (digraph, _node_lookup, assignments)
 
         logger.info(
             "Detected %d communities in graph %s (%d nodes, %d edges)",
@@ -107,6 +146,32 @@ class CommunityAnalyzer:
         )
 
         return assignments
+
+    async def get_community_assignments(self, graph_id: str) -> dict[str, int]:
+        """Return node_id -> community_id, detecting communities if needed.
+
+        Args:
+            graph_id: The repository graph identifier.
+
+        Returns:
+            Mapping of node_id -> community_id.
+        """
+        cached = self._cache.get(graph_id)
+        if cached is not None and cached[2] is not None:
+            return cached[2]
+
+        community_groups = await self.graph_store.get_communities(graph_id)
+        if community_groups:
+            assignments = {
+                node_id: cid
+                for cid, members in community_groups.items()
+                for node_id in members
+            }
+            if cached is not None:
+                self._cache[graph_id] = (cached[0], cached[1], assignments)
+            return assignments
+
+        return await self.detect_communities(graph_id)
 
     async def get_architecture_summary(
         self, graph_id: str
@@ -125,43 +190,14 @@ class CommunityAnalyzer:
         Returns:
             ArchitectureSummary with community info and hotspots.
         """
-        # Get or detect communities
-        community_groups = await self.graph_store.get_communities(graph_id)
-        if not community_groups:
-            assignments = await self.detect_communities(graph_id)
-            rebuilt_groups: dict[int, list[str]] = {}
-            for node_id, cid in assignments.items():
-                rebuilt_groups.setdefault(cid, []).append(node_id)
-            community_groups = rebuilt_groups
+        assignments = await self.get_community_assignments(graph_id)
+        digraph, node_lookup = await self._load_graph(graph_id)
 
-        # Fetch nodes and edges
-        node_rows = await self.graph_store.query(graph_id, "nodes")
-        edge_rows = await self.graph_store.query(graph_id, "edges")
+        community_groups: dict[int, list[str]] = {}
+        for node_id, cid in assignments.items():
+            community_groups.setdefault(cid, []).append(node_id)
 
-        # Build lookup tables
-        node_lookup: dict[str, dict[str, Any]] = {}
-        for row in node_rows:
-            node_data = row.get("n", row)
-            node_id = node_data.get("id", "")
-            if node_id:
-                node_lookup[node_id] = node_data
-
-        # Build directed graph for metrics
-        digraph = nx.DiGraph()
-        for row in edge_rows:
-            edge_data = row.get("r", row)
-            source = edge_data.get("source", "")
-            target = edge_data.get("target", "")
-            if source and target:
-                digraph.add_edge(source, target)
-
-        # Build a fast node -> community lookup map once.
-        node_community: dict[str, int] = {}
-        all_community_nodes: set[str] = set()
-        for cid, members in community_groups.items():
-            all_community_nodes.update(members)
-            for node_id in members:
-                node_community[node_id] = cid
+        all_community_nodes: set[str] = set(assignments.keys())
 
         # Calculate degree metrics
         in_degrees = dict(digraph.in_degree())
@@ -171,27 +207,31 @@ class CommunityAnalyzer:
             for node in all_community_nodes
         }
 
+        # Single-pass edge counting across all communities.
+        community_internal_edges: dict[int, int] = {}
+        community_external_edges: dict[int, dict[int, int]] = {}
+        for src, tgt in digraph.edges():
+            src_comm = assignments.get(src)
+            tgt_comm = assignments.get(tgt)
+            if src_comm is None or tgt_comm is None:
+                continue
+            if src_comm == tgt_comm:
+                community_internal_edges[src_comm] = (
+                    community_internal_edges.get(src_comm, 0) + 1
+                )
+            else:
+                external = community_external_edges.setdefault(src_comm, {})
+                external[tgt_comm] = external.get(tgt_comm, 0) + 1
+
         # Build community info
         communities: list[CommunityInfo] = []
         for community_id, members in sorted(community_groups.items()):
             member_set = set(members)
-
-            # Count internal and external edges in a single pass using the
-            # pre-built node -> community map. This avoids the previous
-            # O(edges * communities) nested loop.
-            internal_edges = 0
-            external_edges: dict[int, int] = {}
-            for src, tgt in digraph.edges():
-                src_comm = node_community.get(src)
-                tgt_comm = node_community.get(tgt)
-
-                if src_comm == community_id and tgt_comm == community_id:
-                    internal_edges += 1
-                elif src_comm == community_id and tgt_comm is not None:
-                    external_edges[tgt_comm] = external_edges.get(tgt_comm, 0) + 1
-
-            # Internal edge density: internal / possible_internal
             n = len(member_set)
+
+            internal_edges = community_internal_edges.get(community_id, 0)
+            external_edges = community_external_edges.get(community_id, {})
+
             max_internal = n * (n - 1) if n > 1 else 1
             density = internal_edges / max_internal if max_internal > 0 else 0.0
 
@@ -243,7 +283,7 @@ class CommunityAnalyzer:
                     file_path=file_path,
                     metric_type="complexity",
                     score=float(degree),
-                    community_id=node_community.get(node_id),
+                    community_id=assignments.get(node_id),
                 )
             )
 
@@ -274,68 +314,49 @@ class CommunityAnalyzer:
             graph_id: The repository graph identifier.
             top_n: Number of top hotspots to return.
             metric: Metric to use — "complexity" (degree centrality),
-                    "coupling" (betweenness centrality),
+                    "coupling" (approximated betweenness centrality),
                     "fan_in" (in-degree), "fan_out" (out-degree).
 
         Returns:
             List of hotspot info ranked by the chosen metric.
         """
-        # Fetch edges
-        edge_rows = await self.graph_store.query(graph_id, "edges")
-        node_rows = await self.graph_store.query(graph_id, "nodes")
-
-        # Build directed graph
-        digraph = nx.DiGraph()
-        node_lookup: dict[str, dict[str, Any]] = {}
-
-        for row in node_rows:
-            node_data = row.get("n", row)
-            node_id = node_data.get("id", "")
-            if node_id:
-                node_lookup[node_id] = node_data
-                digraph.add_node(node_id)
-
-        for row in edge_rows:
-            edge_data = row.get("r", row)
-            source = edge_data.get("source", "")
-            target = edge_data.get("target", "")
-            if source and target:
-                digraph.add_edge(source, target)
+        digraph, node_lookup = await self._load_graph(graph_id)
 
         if digraph.number_of_nodes() == 0:
             return []
 
-        # Get community assignments for context
-        community_groups = await self.graph_store.get_communities(graph_id)
-        node_community: dict[str, int] = {}
-        if community_groups:
-            for cid, members in community_groups.items():
-                for node_id in members:
-                    node_community[node_id] = cid
+        assignments = await self.get_community_assignments(graph_id)
 
-        # Calculate scores based on metric
+        # Calculate scores based on metric. CPU-heavy NetworkX calls run in a
+        # background thread so they do not block the event loop.
         scores: dict[str, float] = {}
 
         if metric == "complexity":
-            # Degree centrality (undirected)
             undirected = digraph.to_undirected()
-            scores = nx.degree_centrality(undirected)
+            scores = await asyncio.to_thread(nx.degree_centrality, undirected)
         elif metric == "coupling":
-            # Betweenness centrality
+            undirected = digraph.to_undirected()
+            n = undirected.number_of_nodes()
+            # Use approximate betweenness with a bounded sample size to keep
+            # runtime reasonable on large code graphs.
+            sample_size = min(100, n)
             try:
-                undirected = digraph.to_undirected()
-                scores = nx.betweenness_centrality(undirected)
+                scores = await asyncio.to_thread(
+                    nx.betweenness_centrality,
+                    undirected,
+                    k=sample_size,
+                )
             except Exception:
                 # Fallback if betweenness fails
-                scores = {n: float(d) for n, d in digraph.degree()}
+                scores = {n_id: float(d) for n_id, d in digraph.degree()}
         elif metric == "fan_in":
-            scores = {n: float(d) for n, d in digraph.in_degree()}
+            scores = {n_id: float(d) for n_id, d in digraph.in_degree()}
         elif metric == "fan_out":
-            scores = {n: float(d) for n, d in digraph.out_degree()}
+            scores = {n_id: float(d) for n_id, d in digraph.out_degree()}
         else:
             logger.warning("Unknown metric '%s', defaulting to complexity", metric)
             undirected = digraph.to_undirected()
-            scores = nx.degree_centrality(undirected)
+            scores = await asyncio.to_thread(nx.degree_centrality, undirected)
 
         # Sort and build results
         sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
@@ -354,7 +375,7 @@ class CommunityAnalyzer:
                     file_path=file_path,
                     metric_type=metric,
                     score=round(score, 6),
-                    community_id=node_community.get(node_id),
+                    community_id=assignments.get(node_id),
                 )
             )
 

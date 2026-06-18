@@ -67,7 +67,12 @@ def create_graph_store(config: AnalyzerConfig | None = None) -> GraphStore:
 
     # SQLite is the default local backend
     if graph_store is None:
-        db_path = cfg.db_path or os.environ.get("ARIADNE_DB") or ".ariadne/graph.db"
+        db_path = cfg.db_path or os.environ.get("ARIADNE_DB")
+        if not db_path:
+            # Default to the repo's local .ariadne/graph.db so that CLI
+            # commands and MCP servers started in a repo find its index.
+            repo_root = cfg.resolved_repo_root if cfg.repo_root else Path(os.getcwd())
+            db_path = str(repo_root / ".ariadne" / "graph.db")
         try:
             from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
 

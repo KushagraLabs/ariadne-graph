@@ -352,6 +352,33 @@ async def test_retrieve_node_fuzzy_fallback(
 
 
 @pytest.mark.asyncio
+async def test_retrieve_prefers_definition_over_import(
+    store: FakeSearchableGraphStore, retriever: GraphRetriever
+) -> None:
+    """When name matches both an import and a definition, return the definition."""
+    store.add(
+        "g1",
+        "train.trainer.Trainer",
+        labels=["KnowledgeNode", "CodeClass"],
+        name="Trainer",
+        qualname="train.trainer.Trainer",
+    )
+    store.add(
+        "g1",
+        "pipeline.pipeline:import:src.train.trainer.Trainer:Trainer",
+        labels=["KnowledgeNode", "CodeImport"],
+        name="Trainer",
+        import_type="symbol",
+    )
+
+    result = await retriever.retrieve_node("g1", "Trainer")
+
+    assert result["found"] is True
+    assert result["node"]["id"] == "train.trainer.Trainer"
+    assert "CodeClass" in result["node"]["labels"]
+
+
+@pytest.mark.asyncio
 async def test_trace_dependencies_downstream(
     store: FakeSearchableGraphStore, retriever: GraphRetriever
 ) -> None:

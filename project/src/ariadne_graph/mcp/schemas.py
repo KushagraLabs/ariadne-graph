@@ -40,6 +40,10 @@ class RetrieveInput(BaseModel):
 
     query: str = Field(description="Node ID or name to retrieve")
     graph_id: str | None = Field(default=None, description="Graph ID; derived from repo_path if omitted")
+    repo_path: str | None = Field(
+        default=None,
+        description="Optional repository path used to derive graph_id",
+    )
 
 
 class SearchSemanticInput(BaseModel):

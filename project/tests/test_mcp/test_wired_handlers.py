@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -22,8 +23,10 @@ from ariadne_graph.mcp.schemas import (
     IndexStatusInput,
     InspectFileInput,
     ListDiagnosticsInput,
+    LumenRetrieveInput,
     RetrieveInput,
     SearchCodeInput,
+    SearchSemanticInput,
     TraceDependenciesInput,
 )
 from ariadne_graph.mcp.tools import ToolRegistry
@@ -117,6 +120,59 @@ async def test_index_and_retrieve_memory(tmp_path: Path) -> None:
         for item in retrieve_result.results
     }
     assert "package.core.Widget" in node_ids
+
+
+@pytest.mark.asyncio
+async def test_retrieve_by_repo_path_memory(tmp_path: Path) -> None:
+    """Retrieve should derive graph_id from repo_path when graph_id is omitted."""
+    repo = tmp_path / "repo"
+    _write_sample_repo(repo)
+    registry = _make_registry(MemoryGraphStore(), repo)
+
+    index_result = await registry.handle_index(IndexInput(repo_path=str(repo)))
+    assert index_result.status == "success"
+
+    retrieve_result = await registry.handle_retrieve(
+        RetrieveInput(query="package.core.Widget", repo_path=str(repo))
+    )
+    assert retrieve_result.results
+    node_ids = {
+        item["data"].get("id") if item.get("type") != "retrieve" else item["data"].get("node", {}).get("id")
+        for item in retrieve_result.results
+    }
+    assert "package.core.Widget" in node_ids
+
+
+@pytest.mark.asyncio
+async def test_lumen_retrieve_defaults_to_workspace_root(tmp_path: Path) -> None:
+    """Lumen alias should default repo_path to the configured workspace root."""
+    repo = tmp_path / "repo"
+    _write_sample_repo(repo)
+    config = AnalyzerConfig(repo_root=repo, lumen_workspace_root=repo)
+    adapters: dict[str, LanguageAdapter] = {"python": PythonLanguageAdapter()}
+    store = MemoryGraphStore()
+    registry = ToolRegistry(
+        graph_store=store,
+        searchable_store=store,
+        adapters=adapters,
+        config=config,
+        snippet_extractor=SnippetExtractor(repo_root=repo),
+        embedding_provider=None,
+    )
+
+    index_result = await registry.handle_index(IndexInput(repo_path=str(repo)))
+    assert index_result.status == "success"
+
+    lumen_result = await registry.handle_lumen_code_graph_retrieve(
+        LumenRetrieveInput(query="package.core.Widget")
+    )
+    assert lumen_result.results
+    node_ids = {
+        item["data"].get("id") if item.get("type") != "retrieve" else item["data"].get("node", {}).get("id")
+        for item in lumen_result.results
+    }
+    assert "package.core.Widget" in node_ids
+    assert lumen_result.lumen_context["workspace_restricted"] is True
 
 
 @pytest.mark.asyncio
@@ -411,3 +467,79 @@ async def test_list_diagnostics_memory(tmp_path: Path) -> None:
     )
     assert warning_result.diagnostics
     assert all(d["level"] == "warning" for d in warning_result.diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_search_semantic_type_filter_with_none_node(tmp_path: Path) -> None:
+    """Semantic search type filter must tolerate hits that lack a node payload."""
+    repo = tmp_path / "repo"
+    _write_sample_repo(repo)
+    db_path = tmp_path / "graph.db"
+    store = SQLiteGraphStore(str(db_path))
+    registry = _make_registry(store, repo)
+
+    try:
+        index_result = await registry.handle_index(IndexInput(repo_path=str(repo)))
+        assert index_result.status == "success"
+        registry.register_graph_meta(str(repo), index_result.graph_id)
+
+        # Simulate a keyword/semantic backend that returns node-less hits.
+        assert registry.searcher is not None
+        original_search = registry.searcher.search
+
+        async def _fake_search(
+            graph_id: str, query: str, limit: int = 10, search_type: str = "hybrid"
+        ) -> list[dict[str, Any]]:
+            return [
+                {
+                    "node_id": "package.core.Widget",
+                    "score": 0.9,
+                    "node": None,
+                }
+            ]
+
+        registry.searcher.search = _fake_search  # type: ignore[method-assign]
+
+        result = await registry.handle_search_semantic(
+            SearchSemanticInput(
+                repo_path=str(repo),
+                query_text="widget",
+                limit=10,
+                types=["class"],
+            )
+        )
+        # The type filter should match because the node_id ends with Widget,
+        # but since the fake hit has no node, the old code crashed. The new
+        # code tolerates None and drops the hit (no class label available).
+        assert result.hits is not None
+        registry.searcher.search = original_search  # type: ignore[method-assign]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_search_code_language_filter_sqlite_keyword_hits(tmp_path: Path) -> None:
+    """Language filter works when SQLite keyword search returns node-less hits."""
+    repo = tmp_path / "repo"
+    _write_sample_repo(repo)
+    db_path = tmp_path / "graph.db"
+    store = SQLiteGraphStore(str(db_path))
+    registry = _make_registry(store, repo)
+
+    try:
+        index_result = await registry.handle_index(IndexInput(repo_path=str(repo)))
+        assert index_result.status == "success"
+
+        # SQLite search_keyword returns SearchHit objects without a node payload.
+        # The handler should hydrate the node to apply the language filter.
+        search_result = await registry.handle_search_code(
+            SearchCodeInput(pattern="helper", language="python", limit=10)
+        )
+        assert search_result.matches
+        node_ids = {m["node_id"] for m in search_result.matches}
+        assert "package.utils.helper" in node_ids
+        for match in search_result.matches:
+            file_path = match["properties"].get("file_path", "")
+            assert file_path.endswith(".py")
+    finally:
+        await store.close()

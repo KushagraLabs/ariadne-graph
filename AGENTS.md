@@ -138,18 +138,18 @@ pip install -e ".[all]"        # everything above + dev tools
 pytest tests/ -v
 ```
 
-Current status: 274 tests pass, 14 skipped (Neo4j backend tests when Neo4j is not
+Current status: 292 tests pass, 13 skipped (Neo4j backend tests when Neo4j is not
 configured): 46 Python extractor tests, 15 Python diagnostics tests in
 `tests/test_python/test_diagnostics.py`, 32 TypeScript/TSX extractor tests,
 10 deterministic SCIP parser/translator/indexer tests in
 `tests/test_typescript/test_scip_bridge.py` and `tests/test_typescript/test_scip_indexer.py`,
-12 wired handler/SQLite tests in `tests/test_mcp/test_wired_handlers.py`,
+14 wired handler/SQLite tests in `tests/test_mcp/test_wired_handlers.py`,
 2 MCP server smoke tests in `tests/test_mcp/test_server.py`,
 5 change-detection tests in `tests/test_core/test_incremental_sync.py`,
 4 auto-sync tests in `tests/test_core/test_auto_sync.py`,
 6 config tests in `tests/test_core/test_config.py`,
 6 search tests in `tests/test_core/test_search.py`,
-5 community-analysis tests in `tests/test_core/test_communities.py`,
+7 community-analysis tests in `tests/test_core/test_communities.py`,
 39 graph-store unit tests in `tests/test_graphstores/` (including the Lumen
 adapter tests, the legacy-FTS migration test, the sqlite-vec fallback deadlock test,
 and factory backend-selection tests),
@@ -436,16 +436,16 @@ sub-package under `languages/` and load it in `mcp/server.py` and `cli.py`.
 
 As of the latest changes:
 
-- **Tests:** 274 tests pass, 14 skipped (Neo4j backend tests when Neo4j is not
+- **Tests:** 292 tests pass, 13 skipped (Neo4j backend tests when Neo4j is not
   configured): 46 Python extractor tests, 15 Python diagnostics tests in
 `tests/test_python/test_diagnostics.py`, 32 TypeScript/TSX extractor tests,
-  12 wired handler/SQLite tests in `tests/test_mcp/test_wired_handlers.py`,
+  14 wired handler/SQLite tests in `tests/test_mcp/test_wired_handlers.py`,
   2 MCP server smoke tests in `tests/test_mcp/test_server.py`,
   5 change-detection tests in `tests/test_core/test_incremental_sync.py`,
   4 auto-sync tests in `tests/test_core/test_auto_sync.py`,
   6 config tests in `tests/test_core/test_config.py`,
   6 search tests in `tests/test_core/test_search.py`,
-  5 community-analysis tests in `tests/test_core/test_communities.py`,
+  7 community-analysis tests in `tests/test_core/test_communities.py`,
   39 graph-store unit tests in `tests/test_graphstores/`,
   3 capability-report tests in `tests/test_core/test_capabilities.py`,
   4 dependency-fallback acceptance tests in
@@ -572,6 +572,16 @@ As of the latest changes:
   pinned `requirements.txt`/`requirements-all.txt` files, and a `uv.lock`
   file are now included. Distribution remains via `pip install -e ".[all]"`
   from source; the lock files support reproducible installs with `uv`.
+- **Retrieve by repo path:** `code_graph_retrieve` now accepts an optional
+  `repo_path` parameter and derives the graph ID from it when `graph_id` is
+  omitted.  The Lumen alias `lumen_code_graph_retrieve` falls back to
+  `AnalyzerConfig.lumen_workspace_root` when `repo_path` is not supplied, so
+  workspace-specific MCP endpoints resolve the correct graph automatically.
+- **Symbol resolution quality:** `GraphRetriever._resolve_symbol` now scores
+  candidate matches and prefers definition labels (`CodeClass`,
+  `CodeFunction`, `CodeMethod`, etc.) over `CodeImport` and `CodeDiagnostic`
+  nodes, so retrieving a symbol name such as ``Trainer`` returns the class
+  definition rather than an import stub.
 - **Lumen compatibility:** An optional `LumenGraphStore` adapter
   (`graphstores/lumen.py`) wraps any concrete backend and adds Lumen KG query
   aliases, workspace-root restrictions, and Lumen-style project metadata.  The

@@ -42,6 +42,15 @@ class TestCreateGraphStore:
         store = create_graph_store(config)
         assert isinstance(store, SQLiteGraphStore)
 
+    def test_default_db_path_is_repo_relative(self, tmp_path: Path) -> None:
+        """When no db_path or env is set, SQLite DB defaults to repo/.ariadne/graph.db."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        config = AnalyzerConfig(repo_root=repo)
+        store = create_graph_store(config)
+        assert isinstance(store, SQLiteGraphStore)
+        assert store.db_path == repo / ".ariadne" / "graph.db"
+
     def test_lumen_wrapper_when_enabled(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

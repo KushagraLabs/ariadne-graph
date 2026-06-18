@@ -6,6 +6,7 @@ computation, and impact analysis for change planning.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections import deque
 from typing import Any, cast
@@ -271,6 +272,42 @@ class GraphRetriever:
             coupling_scores=coupling_scores,
         )
 
+    @staticmethod
+    def _symbol_match_score(node_data: dict[str, Any], symbol: str) -> int:
+        """Score how well a node matches a symbol query.
+
+        Higher scores are better. Exact ID matches beat suffix matches, which
+        beat name/qualname matches. Definition nodes are preferred over
+        imports and diagnostics.
+        """
+        labels = set(node_data.get("labels", []) or [])
+        nid = node_data.get("id", "")
+        props = node_data.get("properties", {})
+        name = props.get("name", "")
+        qualname = props.get("qualname", "")
+
+        # Priority boost for definition labels over imports/diagnostics.
+        if labels & {"CodeClass", "CodeFunction", "CodeMethod", "CodeInterface", "CodeTypeAlias"}:
+            label_score = 100
+        elif "CodeModule" in labels or "CodeFile" in labels:
+            label_score = 90
+        elif "CodeImport" in labels:
+            label_score = 10
+        elif "CodeDiagnostic" in labels:
+            label_score = 0
+        else:
+            label_score = 50
+
+        if nid == symbol:
+            return 1000 + label_score
+        if nid.endswith(f".{symbol}") or nid.endswith(f":{symbol}"):
+            return 800 + label_score
+        if qualname and qualname == symbol:
+            return 700 + label_score
+        if name == symbol:
+            return 600 + label_score
+        return -1
+
     async def _resolve_symbol(
         self, graph_id: str, symbol: str
     ) -> dict[str, Any] | None:
@@ -284,39 +321,48 @@ class GraphRetriever:
         if rows:
             return cast(dict[str, Any], rows[0].get("n", rows[0]))
 
+        candidates: list[tuple[int, dict[str, Any]]] = []
+
         # Try name match
-        rows = await self.graph_store.query(
-            graph_id,
-            "node_by_name",
-            params={"name": symbol},
-        )
-        if rows:
-            return cast(dict[str, Any], rows[0].get("n", rows[0]))
+        with contextlib.suppress(Exception):
+            rows = await self.graph_store.query(
+                graph_id,
+                "node_by_name",
+                params={"name": symbol},
+            )
+            for row in rows:
+                node_data = cast(dict[str, Any], row.get("n", row))
+                score = self._symbol_match_score(node_data, symbol)
+                if score >= 0:
+                    candidates.append((score, node_data))
 
         # Try fuzzy
-        rows = await self.graph_store.query(
-            graph_id,
-            "node_name_fuzzy",
-            params={"name": symbol},
-        )
-        if rows:
-            return cast(dict[str, Any], rows[0].get("n", rows[0]))
+        with contextlib.suppress(Exception):
+            rows = await self.graph_store.query(
+                graph_id,
+                "node_name_fuzzy",
+                params={"name": symbol},
+            )
+            for row in rows:
+                node_data = cast(dict[str, Any], row.get("n", row))
+                score = self._symbol_match_score(node_data, symbol)
+                if score >= 0:
+                    candidates.append((score, node_data))
 
         # Fallback: scan all nodes and match by id suffix or name property
         try:
             all_nodes = await self.graph_store.query(graph_id, "nodes")
             for row in all_nodes:
                 node_data = row.get("n", row)
-                nid = node_data.get("id", "")
-                if nid == symbol or nid.endswith(f".{symbol}") or nid.endswith(f":{symbol}"):
-                    return cast(dict[str, Any], node_data)
-                props = node_data.get("properties", {})
-                name = props.get("name", "")
-                qualname = props.get("qualname", "")
-                if name == symbol or qualname == symbol:
-                    return cast(dict[str, Any], node_data)
+                score = self._symbol_match_score(node_data, symbol)
+                if score >= 0:
+                    candidates.append((score, node_data))
         except Exception:
             pass
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            return candidates[0][1]
 
         return None
 

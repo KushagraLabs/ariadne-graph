@@ -7,7 +7,7 @@ import hashlib
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import xxhash
 
@@ -639,8 +639,12 @@ class ToolRegistry:
         """Retrieve a symbol and its neighborhood from the graph."""
         graph_id = input.graph_id
         if graph_id is None:
-            # Try to derive from query as a repo path
-            graph_id = _graph_id_from_repo_path(input.query)
+            if input.repo_path:
+                graph_id = _graph_id_from_repo_path(input.repo_path)
+            else:
+                # For backwards compatibility, treat the query itself as a
+                # repo path only when no other identifier is supplied.
+                graph_id = _graph_id_from_repo_path(input.query)
 
         exists = await self._graph_exists(graph_id)
         if not exists:
@@ -668,11 +672,15 @@ class ToolRegistry:
         the canonical retrieve handler.  The response is augmented with a small
         Lumen-style context block.
         """
-        graph_id = input.graph_id
-        if graph_id is None and input.repo_path:
-            graph_id = _graph_id_from_repo_path(input.repo_path)
+        repo_path = input.repo_path
+        if repo_path is None and self.config.lumen_workspace_root:
+            repo_path = str(self.config.lumen_workspace_root)
 
-        retrieve_input = RetrieveInput(query=input.query, graph_id=graph_id)
+        graph_id = input.graph_id
+        if graph_id is None and repo_path:
+            graph_id = _graph_id_from_repo_path(repo_path)
+
+        retrieve_input = RetrieveInput(query=input.query, graph_id=graph_id, repo_path=repo_path)
         canonical = await self.handle_retrieve(retrieve_input)
 
         lumen_context: dict[str, Any] = {
@@ -734,12 +742,16 @@ class ToolRegistry:
         # Apply type filter post-search if requested
         if input.types:
             type_set = {t.lower() for t in input.types}
+
+            def _hit_labels(hit: dict[str, Any]) -> list[str]:
+                node = hit.get("node")
+                if not isinstance(node, dict):
+                    return []
+                return node.get("labels", []) or []
+
             all_hits = [
                 hit for hit in all_hits
-                if any(
-                    label.lower() in type_set
-                    for label in (hit.get("node", {}).get("labels", []) or [])
-                )
+                if any(label.lower() in type_set for label in _hit_labels(hit))
             ]
 
         all_hits.sort(key=lambda h: h.get("score", 0.0), reverse=True)
@@ -761,6 +773,36 @@ class ToolRegistry:
 
         matches: list[dict[str, Any]] = []
 
+        def _language_from_props(props: dict[str, Any]) -> str:
+            """Return a node's language, inferring from file_path when absent."""
+            lang = str(props.get("language", ""))
+            if lang:
+                return lang
+            file_path = str(props.get("file_path", ""))
+            if file_path.endswith((".ts", ".tsx")):
+                return "typescript"
+            if file_path.endswith((".js", ".jsx")):
+                return "javascript"
+            if file_path.endswith(".py"):
+                return "python"
+            return ""
+
+        async def _fetch_hit_node(graph_id: str, node_id: str) -> dict[str, Any] | None:
+            """Hydrate a keyword-search hit with its node record if available."""
+            try:
+                rows = await self.graph_store.query(
+                    graph_id,
+                    "node_by_id",
+                    params={"node_id": node_id},
+                )
+                if rows:
+                    return cast(dict[str, Any], rows[0].get("n", rows[0]))
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch node %s for language filter: %s", node_id, exc
+                )
+            return None
+
         for graph_id in graph_ids:
             # Use HybridSearcher keyword search when available
             if self.searcher is not None:
@@ -772,10 +814,15 @@ class ToolRegistry:
                         search_type="keyword",
                     )
                     for hit in hits:
-                        node = hit.get("node") or {}
+                        node = hit.get("node")
+                        if not node:
+                            node = await _fetch_hit_node(
+                                graph_id, hit.get("node_id", "")
+                            )
+                        node = node or {}
                         props = node.get("properties", {}) if isinstance(node, dict) else {}
                         if input.language:
-                            node_lang = props.get("language", "")
+                            node_lang = _language_from_props(props)
                             if input.language.lower() not in node_lang.lower():
                                 continue
                         matches.append({
@@ -800,7 +847,7 @@ class ToolRegistry:
                     props = node_data.get("properties", {})
 
                     if input.language:
-                        node_lang = props.get("language", "")
+                        node_lang = _language_from_props(props)
                         if input.language.lower() not in node_lang.lower():
                             continue
 
