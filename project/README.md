@@ -114,6 +114,8 @@ ariadne_graph/
 | `ARIADNE_NEO4J_USER` | `neo4j` | Neo4j username |
 | `ARIADNE_NEO4J_PASSWORD` | `password` | Neo4j password |
 | `ARIADNE_EMBEDDING_PROVIDER` | `local` | Embedding provider for semantic search |
+| `ARIADNE_AUTO_SYNC` | `false` | `true`/`false` to enable background auto-sync in the MCP server |
+| `ARIADNE_SYNC_INTERVAL` | `30` | Seconds between auto-sync polls when `ARIADNE_AUTO_SYNC=true` |
 | `ARIADNE_SCIP_TYPESCRIPT_ENABLED` | unset | `true`/`false` to force SCIP indexing on/off |
 | `ARIADNE_SCIP_TYPESCRIPT_PATH` | unset | Path to `scip-typescript` binary or `npx` |
 | `ARIADNE_SCIP_TYPESCRIPT_ARGS` | unset | Comma-separated extra args for `scip-typescript index` |

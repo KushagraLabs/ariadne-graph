@@ -33,8 +33,17 @@ class AnalyzerConfig(BaseModel):
     embedding_model: str = Field(default="all-MiniLM-L6-v2")
     embedding_dimensions: int = Field(default=384)
     embedding_batch_size: int = Field(default=32)
-    incremental_sync_interval: float = Field(default=30.0, description="Seconds between sync polls")
-    auto_sync: bool = Field(default=False, description="Enable automatic background sync")
+    incremental_sync_interval: float = Field(
+        default_factory=lambda: float(
+            os.environ.get("ARIADNE_SYNC_INTERVAL", "30.0")
+        ),
+        description="Seconds between sync polls",
+    )
+    auto_sync: bool = Field(
+        default_factory=lambda: os.environ.get("ARIADNE_AUTO_SYNC", "").lower()
+        in {"1", "true", "yes", "on"},
+        description="Enable automatic background sync",
+    )
 
     # Storage configuration (can be set via environment variables or explicitly)
     db_path: str | None = Field(
