@@ -534,3 +534,145 @@ class IncrementalSync:
         )
 
         return report
+
+    # ------------------------------------------------------------------
+    # Targeted sync for a known set of changed files
+    # ------------------------------------------------------------------
+
+    async def targeted_sync(
+        self,
+        adapter: LanguageAdapter,
+        changed_files: list[Path],
+        all_known_files: list[Path] | None = None,
+    ) -> ChangeReport:
+        """Sync only a specific set of changed files for one adapter.
+
+        Discovers the current file set so removed-file cleanup remains
+        correct, but only re-parses the supplied ``changed_files``. This is
+        the entry point used by the filesystem watcher.
+
+        Args:
+            adapter: Language adapter for file discovery and extraction.
+            changed_files: Files that the watcher detected as changed.
+            all_known_files: Optional union of all current files across
+                adapters. Used for removed-file cleanup in multi-adapter
+                repos so one adapter does not delete another adapter's
+                facts.
+
+        Returns:
+            A ChangeReport summarizing the sync.
+        """
+        cfg = self.config
+        graph_id = cfg.graph_id
+        repo_root = cfg.resolved_repo_root
+        if graph_id is None:
+            raise ValueError("AnalyzerConfig.graph_id must be set before syncing")
+        if not changed_files:
+            return ChangeReport(
+                added=[],
+                modified=[],
+                deleted=[],
+                unchanged=[],
+                message="No changed files to sync",
+            )
+
+        # 1. Discover all current files for this adapter (needed for context
+        #    and removed-file detection).
+        all_files = adapter.discover_files(repo_root, cfg)
+        all_file_paths = {str(p.resolve()) for p in all_files}
+
+        # 2. Validate supplied changed files: drop files this adapter does not
+        #    own and de-duplicate.
+        owned_changed: list[Path] = []
+        seen: set[str] = set()
+        for file_path in changed_files:
+            path_str = str(file_path.resolve())
+            if path_str not in all_file_paths:
+                continue
+            if path_str in seen:
+                continue
+            seen.add(path_str)
+            owned_changed.append(file_path)
+
+        if not owned_changed:
+            return ChangeReport(
+                added=[],
+                modified=[],
+                deleted=[],
+                unchanged=[],
+                message="None of the changed files are owned by this adapter",
+            )
+
+        # 3. Build extraction context with the exact changed set.
+        context = ExtractionContext(
+            graph_id=graph_id,
+            repo_root=repo_root,
+            source_commit=None,
+            all_files=all_files,
+            changed_files=owned_changed,
+        )
+
+        # 4. Optional project-wide preparation (e.g. SCIP for TypeScript).
+        try:
+            await adapter.prepare_project(
+                context, cfg, all_files, owned_changed, self.graph_store
+            )
+        except Exception as exc:
+            logger.warning(
+                "Project-wide preparation failed for %s adapter during targeted sync: %s",
+                adapter.language,
+                exc,
+            )
+
+        # 5. Classify changed files as added vs modified.
+        added_paths: list[str] = []
+        modified_paths: list[str] = []
+        for file_path in owned_changed:
+            path_str = str(file_path.resolve())
+            stored_hash = await self.graph_store.get_stored_hash(graph_id, path_str)
+            if stored_hash is None:
+                added_paths.append(path_str)
+            else:
+                modified_paths.append(path_str)
+
+        # 6. Sync only the changed files.
+        success_count = 0
+        for file_path in owned_changed:
+            ok = await self.sync_file(adapter, file_path, context)
+            if ok:
+                success_count += 1
+
+        logger.info(
+            "Targeted sync for %s: synced %d/%d changed files",
+            adapter.language,
+            success_count,
+            len(owned_changed),
+        )
+
+        # 7. Clean up removed files.
+        deleted_paths: list[str] = []
+        if all_known_files is not None:
+            known_paths = {str(p.resolve()) for p in all_known_files}
+            removed_strs = await self._get_stored_files_not_in(graph_id, known_paths)
+        else:
+            current_paths = {str(p.resolve()) for p in all_files}
+            removed_strs = await self._get_stored_files_not_in(graph_id, current_paths)
+
+        for removed_path in removed_strs:
+            try:
+                await self.graph_store.delete_file_facts(graph_id, removed_path)
+                deleted_paths.append(removed_path)
+            except Exception as exc:
+                logger.warning("Failed to clean up removed file %s: %s", removed_path, exc)
+
+        unchanged = [p for p in all_files if str(p.resolve()) not in seen]
+        return ChangeReport(
+            added=added_paths,
+            modified=modified_paths,
+            deleted=deleted_paths,
+            unchanged=[str(p.resolve()) for p in unchanged],
+            message=(
+                f"Targeted sync for {adapter.language}: "
+                f"+{len(added_paths)} ~{len(modified_paths)} -{len(deleted_paths)}"
+            ),
+        )

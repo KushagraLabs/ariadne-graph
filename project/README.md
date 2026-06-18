@@ -115,7 +115,9 @@ ariadne_graph/
 | `ARIADNE_NEO4J_PASSWORD` | `password` | Neo4j password |
 | `ARIADNE_EMBEDDING_PROVIDER` | `local` | Embedding provider for semantic search |
 | `ARIADNE_AUTO_SYNC` | `false` | `true`/`false` to enable background auto-sync in the MCP server |
-| `ARIADNE_SYNC_INTERVAL` | `30` | Seconds between auto-sync polls when `ARIADNE_AUTO_SYNC=true` |
+| `ARIADNE_WATCH_MODE` | `auto` | `auto` (file watcher), `poll` (interval polling), or `off` |
+| `ARIADNE_WATCH_DEBOUNCE` | `2.0` | Seconds of filesystem quiet before a watched sync triggers |
+| `ARIADNE_SYNC_INTERVAL` | `30` | Seconds between auto-sync polls when `ARIADNE_WATCH_MODE=poll` |
 | `ARIADNE_SCIP_TYPESCRIPT_ENABLED` | unset | `true`/`false` to force SCIP indexing on/off |
 | `ARIADNE_SCIP_TYPESCRIPT_PATH` | unset | Path to `scip-typescript` binary or `npx` |
 | `ARIADNE_SCIP_TYPESCRIPT_ARGS` | unset | Comma-separated extra args for `scip-typescript index` |
@@ -123,7 +125,7 @@ ariadne_graph/
 
 ### Optional extras
 
-`pip install -e ".[typescript]"` (Tree-sitter + protobuf for SCIP), `".[semantic]"` (sentence-transformers + torch), `".[vector]"` (sqlite-vec), `".[neo4j]"`, or `".[all]"`.
+`pip install -e ".[typescript]"` (Tree-sitter + protobuf for SCIP), `".[semantic]"` (sentence-transformers + torch), `".[vector]"` (sqlite-vec), `".[neo4j]"`, `".[watch]"` (filesystem watcher for live updates), or `".[all]"`.
 
 > **Note:** SCIP parsing requires `protobuf>=6.30` — the vendored bindings embed a gen-runtime gate from `scip-typescript`'s protoc version. This is pinned in the `typescript`/`all` extras.
 

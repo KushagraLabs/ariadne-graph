@@ -7,11 +7,14 @@ import hashlib
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import xxhash
 
 from ariadne_graph.core.auto_sync import AutoSyncManager
+
+if TYPE_CHECKING:
+    from ariadne_graph.core.watch_sync import WatchSyncManager
 from ariadne_graph.core.capabilities import get_capabilities
 from ariadne_graph.core.communities import CommunityAnalyzer
 from ariadne_graph.core.config import AnalyzerConfig
@@ -116,7 +119,7 @@ class ToolRegistry:
         self.snippet_extractor = snippet_extractor
         self.embedding_provider = embedding_provider
         self.freshness_tracker = FreshnessTracker(graph_store)
-        self.auto_sync_manager: AutoSyncManager | None = None
+        self.auto_sync_manager: AutoSyncManager | WatchSyncManager | None = None
         # Track graph metadata (repo_path -> {graph_id, indexed_files, last_indexed})
         self._graph_meta: dict[str, dict[str, Any]] = {}
 
@@ -249,8 +252,30 @@ class ToolRegistry:
             logger.warning("Failed to persist project metadata: %s", exc)
 
     async def start_auto_sync(self) -> None:
-        """Start the background auto-sync polling task."""
-        if self.auto_sync_manager is None:
+        """Start the background auto-sync task.
+
+        Uses a filesystem watcher when ``watch_mode`` is ``auto`` and
+        ``watchdog`` is installed; otherwise falls back to interval polling.
+        """
+        if self.config.watch_mode == "off":
+            logger.info("Auto-sync is disabled (watch_mode=off)")
+            return
+
+        if self.config.watch_mode == "auto":
+            from ariadne_graph.core.watch_sync import WatchSyncManager
+
+            if WatchSyncManager.is_available():
+                self.auto_sync_manager = WatchSyncManager(self)
+            else:
+                logger.warning(
+                    "watch_mode=auto but watchdog is not installed; falling back to polling"
+                )
+                from ariadne_graph.core.auto_sync import AutoSyncManager
+
+                self.auto_sync_manager = AutoSyncManager(
+                    self, self.config.incremental_sync_interval
+                )
+        else:
             from ariadne_graph.core.auto_sync import AutoSyncManager
 
             self.auto_sync_manager = AutoSyncManager(
@@ -259,7 +284,7 @@ class ToolRegistry:
         await self.auto_sync_manager.start()
 
     async def stop_auto_sync(self) -> None:
-        """Stop the background auto-sync polling task."""
+        """Stop the background auto-sync task (watcher or polling)."""
         if self.auto_sync_manager is not None:
             await self.auto_sync_manager.stop()
 
@@ -370,6 +395,109 @@ class ToolRegistry:
             message=message,
         )
 
+    async def handle_targeted_sync(
+        self, repo_path: str, changed_files: list[Path]
+    ) -> IndexOutput:
+        """Sync a known set of changed files without rediscovering the repo.
+
+        This is the entry point used by the filesystem watcher. It groups
+        changed files by language adapter, runs a targeted incremental sync
+        for each adapter, and re-computes embeddings for affected nodes.
+        """
+        resolved = str(Path(repo_path).resolve())
+        graph_id = self._get_graph_id(resolved)
+        config = self.config.model_copy(
+            update={"repo_root": Path(resolved), "graph_id": graph_id}
+        )
+
+        if not changed_files:
+            return IndexOutput(
+                status="success",
+                files_indexed=0,
+                graph_id=graph_id,
+                message="No changed files to sync",
+            )
+
+        # Discover all current files once for removed-file cleanup.
+        all_current_files: list[Path] = []
+        for adapter in self.adapters.values():
+            try:
+                all_current_files.extend(adapter.discover_files(Path(resolved), config))
+            except Exception as exc:
+                logger.warning("File discovery failed during targeted sync: %s", exc)
+
+        changed_paths = {str(p.resolve()) for p in changed_files}
+        errors: list[str] = []
+        changed_count = 0
+
+        for lang_name, adapter in self.adapters.items():
+            owned = [p for p in changed_files if str(p.resolve()) in changed_paths]
+            if not owned:
+                continue
+            try:
+                sync = IncrementalSync(self.graph_store, config)
+                report = await sync.targeted_sync(
+                    adapter, owned, all_known_files=all_current_files
+                )
+                changed_count += len(report.added) + len(report.modified)
+            except Exception as exc:
+                errors.append(f"{lang_name} targeted sync failed: {exc}")
+
+        # Re-compute embeddings for changed nodes.
+        if (
+            self.embedding_service is not None
+            and self.searchable_store is not None
+            and changed_paths
+        ):
+            try:
+                nodes_to_embed: list[CodeNode] = []
+                for file_path in changed_paths:
+                    try:
+                        rows = await self.searchable_store.query(
+                            graph_id, "nodes_by_file", {"file_path": file_path}
+                        )
+                    except Exception:
+                        rows = []
+                    for row in rows:
+                        node_data = dict(row.get("n", row))
+                        if node_data:
+                            node_data.setdefault("graph_id", graph_id)
+                            nodes_to_embed.append(CodeNode(**node_data))
+                if nodes_to_embed:
+                    await self.embedding_service.embed_nodes(graph_id, nodes_to_embed)
+            except Exception as exc:
+                logger.warning("Failed to compute embeddings during targeted sync: %s", exc)
+
+        # Authoritative file count from the graph store.
+        try:
+            count_rows = await self.graph_store.query(graph_id, "count_files")
+            total_indexed = count_rows[0].get("count", 0) if count_rows else changed_count
+        except Exception as exc:
+            logger.warning("Failed to count indexed files: %s", exc)
+            total_indexed = changed_count
+
+        # Mark sync as enabled because this path is only used by auto-sync.
+        await self._record_index_meta(
+            resolved, graph_id, total_indexed, sync_enabled=True
+        )
+        try:
+            await self.freshness_tracker.mark_indexed(
+                graph_id, resolved, file_count=total_indexed, sync_enabled=True
+            )
+        except Exception as exc:
+            logger.warning("Failed to record freshness metadata: %s", exc)
+
+        status = "success" if not errors else ("partial" if changed_count > 0 else "error")
+        message = f"Targeted sync: {changed_count} files updated"
+        if errors:
+            message += f" with {len(errors)} errors"
+        return IndexOutput(
+            status=status,
+            files_indexed=total_indexed,
+            graph_id=graph_id,
+            message=message,
+        )
+
     async def handle_index_status(self, input: IndexStatusInput) -> IndexStatusOutput:
         """Check index status for a repository."""
         repo_path = str(Path(input.repo_path).resolve())
@@ -437,11 +565,7 @@ class ToolRegistry:
                     pass
 
         # If auto-sync is actively running for this registry, report it as enabled.
-        if (
-            self.auto_sync_manager is not None
-            and self.auto_sync_manager._task is not None
-            and not self.auto_sync_manager._task.done()
-        ):
+        if self.auto_sync_manager is not None and self.auto_sync_manager.is_running():
             sync_enabled = True
 
         return IndexStatusOutput(

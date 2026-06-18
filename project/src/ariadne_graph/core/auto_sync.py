@@ -55,6 +55,10 @@ class AutoSyncManager:
         self._task = asyncio.create_task(self._loop(), name="ariadne-auto-sync")
         logger.info("Auto-sync started with interval %.1fs", self.interval)
 
+    def is_running(self) -> bool:
+        """Return True if the polling task is currently active."""
+        return self._task is not None and not self._task.done()
+
     async def stop(self) -> None:
         """Signal the polling task to stop and wait for it to finish."""
         if self._task is None or self._task.done():

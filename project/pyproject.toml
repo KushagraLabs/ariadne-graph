@@ -36,6 +36,7 @@ semantic = ["sentence-transformers>=2.0", "torch>=2.0"]
 neo4j = ["neo4j>=5.0"]
 vector = ["sqlite-vec>=0.1"]
 typescript = ["tree-sitter>=0.23", "tree-sitter-typescript>=0.23", "protobuf>=6.30"]
+watch = ["watchdog>=3.0"]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "pytest-cov>=4.0", "ruff>=0.1.0", "mypy>=1.0"]
 all = [
     "sentence-transformers>=2.0",
@@ -45,6 +46,7 @@ all = [
     "tree-sitter>=0.23",
     "tree-sitter-typescript>=0.23",
     "protobuf>=6.30",
+    "watchdog>=3.0",
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
@@ -43,6 +44,14 @@ class AnalyzerConfig(BaseModel):
         default_factory=lambda: os.environ.get("ARIADNE_AUTO_SYNC", "").lower()
         in {"1", "true", "yes", "on"},
         description="Enable automatic background sync",
+    )
+    watch_mode: Literal["auto", "poll", "off"] = Field(
+        default="auto",
+        description="Auto-sync trigger mode: auto=file watcher, poll=interval polling, off=disable",
+    )
+    watch_debounce: float = Field(
+        default_factory=lambda: float(os.environ.get("ARIADNE_WATCH_DEBOUNCE", "2.0")),
+        description="Seconds of filesystem quiet before triggering a watched sync",
     )
 
     # Storage configuration (can be set via environment variables or explicitly)
@@ -109,6 +118,19 @@ class AnalyzerConfig(BaseModel):
         if self.graph_id is None:
             path_str = str(self.repo_root.resolve())
             self.graph_id = hashlib.sha256(path_str.encode()).hexdigest()[:16]
+        # Environment variables override field defaults for sync settings.
+        if "ARIADNE_WATCH_MODE" in os.environ:
+            self.watch_mode = cast(
+                Literal["auto", "poll", "off"],
+                _env_choice(
+                    os.environ.get("ARIADNE_WATCH_MODE"),
+                    {"auto", "poll", "off"},
+                    "auto",
+                ),
+            )
+        if "ARIADNE_WATCH_DEBOUNCE" in os.environ:
+            with contextlib.suppress(ValueError):
+                self.watch_debounce = float(os.environ["ARIADNE_WATCH_DEBOUNCE"])
 
     @property
     def resolved_repo_root(self) -> Path:
@@ -125,6 +147,16 @@ def _env_bool(value: str | None) -> bool | None:
     if lowered in {"0", "false", "no", "off"}:
         return False
     return None
+
+
+def _env_choice(value: str | None, choices: set[str], default: str) -> str:
+    """Return a cleaned env value if it is in choices, otherwise default."""
+    if value is None:
+        return default
+    lowered = value.strip().lower()
+    if lowered in choices:
+        return lowered
+    return default
 
 
 def _env_list(value: str) -> list[str]:
