@@ -24,6 +24,7 @@ class AnalyzerConfig(BaseModel):
         ".git", "__pycache__", "*.pyc", "node_modules", ".venv", "venv",
         ".tox", ".pytest_cache", ".mypy_cache", "*.egg-info", "dist", "build",
         ".idea", ".vscode", ".DS_Store", ".claude",
+        ".worktrees", "external",
     ])
     python_paths: list[str] = Field(default_factory=list)
     max_file_size: int = Field(default=1_000_000, description="Maximum file size in bytes to parse")
