@@ -211,6 +211,17 @@ python -m ariadne_graph.mcp.server
 
 ## 5. Testing instructions
 
+> **Definition of done (READ THIS — overrides "it works" and "tests pass"):**
+> No feature is done until a test FAILS on the wrong/cheap implementation and
+> PASSES on the real one — shown going red, then green, on the *hard case*
+> (the input a fuzzy/heuristic version gets wrong). Do NOT weaken or delete a
+> test to make it pass. Do NOT satisfy a resolution test with bare-name
+> fallback. If you cannot make it real, STOP and say so. A test that passes
+> immediately often tests nothing. Full rationale and the per-feature
+> template: see [`VERIFICATION.md`](VERIFICATION.md) at the repo root.
+> Worked example: `project/tests/test_python/test_hardcase_call_resolution.py`
+> (two files defining `save()` — the call must resolve to the *local* one).
+
 - The test runner is **pytest** with `asyncio_mode = "auto"` configured in
   `pyproject.toml`.
 - Tests live under `tests/`. Active suites cover the Python AST extractor,
