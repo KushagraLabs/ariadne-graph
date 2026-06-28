@@ -237,10 +237,12 @@ class PythonFactExtractor(UniqueIdMixin, ast.NodeVisitor):
     def _line_range(self, node: ast.AST) -> dict[str, int]:
         """Return line_start / line_end dict for an AST node."""
         result: dict[str, int] = {}
-        if hasattr(node, "lineno") and node.lineno is not None:
-            result["line_start"] = node.lineno
-        if hasattr(node, "end_lineno") and node.end_lineno is not None:
-            result["line_end"] = node.end_lineno
+        lineno = getattr(node, "lineno", None)
+        if lineno is not None:
+            result["line_start"] = lineno
+        end_lineno = getattr(node, "end_lineno", None)
+        if end_lineno is not None:
+            result["line_end"] = end_lineno
         return result
 
     def _make_snippet(self, node: ast.AST) -> str:
@@ -749,16 +751,50 @@ class PythonFactExtractor(UniqueIdMixin, ast.NodeVisitor):
         caller = self._current_function
 
         if func_name and caller:
+            # Record the call-site position of the callee name so a SCIP
+            # resolver can match this edge to a compiler-resolved occurrence
+            # and rewrite the (fuzzy) bare-name target to a real node id.
+            props: dict[str, Any] = {"callee": func_name}
+            callee_pos = self._callee_position(node.func)
+            if callee_pos is not None:
+                props["callee_line"], props["callee_col"] = callee_pos
             self._add_edge(
                 caller,
                 func_name,
                 "CALLS",
-                {"callee": func_name},
+                props,
             )
             # Mark import as used
             self._mark_import_used(func_name)
 
         self.generic_visit(node)
+
+    @staticmethod
+    def _callee_position(func: ast.expr) -> tuple[int, int] | None:
+        """Return the (1-based line, 0-based col) of the callee name token.
+
+        For ``foo()`` this is the ``foo`` name; for ``a.b.foo()`` it is the
+        trailing ``foo`` attribute. These coordinates align with the SCIP
+        occurrence range of the reference, enabling positional matching.
+        """
+        target: ast.expr = func
+        # For attribute access (a.b.foo), SCIP marks the trailing attribute.
+        # ast does not expose the attribute token position directly, but the
+        # end position of the whole expression bounds it; use the node's own
+        # position for plain names and best-effort for attributes.
+        if isinstance(target, ast.Attribute):
+            # The attribute name ends at end_col_offset; its start is
+            # end_col_offset - len(attr).
+            end_line = getattr(target, "end_lineno", None)
+            end_col = getattr(target, "end_col_offset", None)
+            if end_line is not None and end_col is not None:
+                return (end_line, end_col - len(target.attr))
+            return None
+        lineno = getattr(target, "lineno", None)
+        col_offset = getattr(target, "col_offset", None)
+        if lineno is not None and col_offset is not None:
+            return (lineno, col_offset)
+        return None
 
     def _mark_import_used(self, name: str) -> None:
         """Mark an import as used based on a name reference."""

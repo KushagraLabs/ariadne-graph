@@ -93,6 +93,20 @@ class AnalyzerConfig(BaseModel):
         description="Use --infer-tsconfig for JS-only projects. None = auto.",
     )
 
+    # SCIP-Python indexer (optional)
+    scip_python_enabled: bool | None = Field(
+        default_factory=lambda: _env_bool(os.environ.get("ARIADNE_SCIP_PYTHON_ENABLED")),
+        description="Enable scip-python for cross-file call resolution. None = auto-detect.",
+    )
+    scip_python_path: str | None = Field(
+        default_factory=lambda: os.environ.get("ARIADNE_SCIP_PYTHON_PATH"),
+        description="Path to scip-python binary, 'npx', or None to search PATH.",
+    )
+    scip_python_args: list[str] = Field(
+        default_factory=lambda: _env_list(os.environ.get("ARIADNE_SCIP_PYTHON_ARGS", "")),
+        description="Extra CLI args passed to scip-python.",
+    )
+
     # Lumen compatibility (optional)
     lumen_enabled: bool = Field(
         default_factory=lambda: os.environ.get("LUMEN_CODE_GRAPH_PROVIDER", "")
