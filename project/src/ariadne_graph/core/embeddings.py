@@ -101,8 +101,14 @@ class LocalEmbeddingProvider:
             self._model = await loop.run_in_executor(
                 None, lambda: SentenceTransformer(self._model_name)
             )
-            # Update dimensions from actual model if different
-            self._dimensions = self._model.get_sentence_embedding_dimension()
+            # Update dimensions from actual model if different. The method was
+            # renamed in sentence-transformers 5.x; fall back for older versions.
+            get_dim = getattr(
+                self._model,
+                "get_embedding_dimension",
+                self._model.get_sentence_embedding_dimension,
+            )
+            self._dimensions = get_dim()
             logger.info(
                 "Embedding model loaded: %s (dim=%d)",
                 self._model_name,
