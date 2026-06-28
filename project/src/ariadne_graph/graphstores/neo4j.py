@@ -152,12 +152,31 @@ class Neo4jGraphStore:
         )
 
     async def delete_file_facts(self, graph_id: str, file_path: str) -> None:
-        """Delete all nodes and stored metadata originating from *file_path*."""
+        """Delete all nodes and stored metadata originating from *file_path*.
+
+        Relationships are deleted by ownership (``owner_file_path``), not by
+        endpoint membership: a cross-file edge such as ``a.caller -> b.save`` is
+        owned by ``a.py`` and must survive a reindex of ``b.py``. So we first
+        delete the relationships this file produced, then delete this file's
+        nodes that have no surviving (externally-owned) relationships. Nodes
+        still referenced by another file's edge are left in place and will be
+        MERGE-updated when re-extracted.
+        """
+        # 1. Delete relationships produced by this file.
+        await self._execute_write(
+            """
+            MATCH (:KnowledgeNode {_graph_id: $g})-[r {owner_file_path: $p}]->()
+            DELETE r
+            """,
+            {"g": graph_id, "p": file_path},
+        )
+        # 2. Delete this file's nodes that are now isolated; keep nodes still
+        #    referenced by a surviving edge owned by another file.
         await self._execute_write(
             """
             MATCH (n:KnowledgeNode {_graph_id: $g})
-            WHERE n.file_path = $p
-            DETACH DELETE n
+            WHERE n.file_path = $p AND NOT (n)--()
+            DELETE n
             """,
             {"g": graph_id, "p": file_path},
         )

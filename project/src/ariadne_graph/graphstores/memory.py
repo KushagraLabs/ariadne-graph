@@ -44,11 +44,29 @@ class MemoryGraphStore:
             if key[0] == graph_id and node.properties.get("file_path") == file_path:
                 node_ids_to_remove.add(node.id)
                 del self._nodes[key]
+        # Delete edges *produced by* this file (tracked via owner_file_path),
+        # not every edge merely touching one of its nodes. A cross-file edge
+        # such as ``a.caller -> b.save`` is owned by ``a.py``; reindexing
+        # ``b.py`` must not remove it. Edges predating owner tracking fall back
+        # to source/target membership.
         self._edges = [
-            e for e in self._edges
-            if not (e.graph_id == graph_id and (e.source in node_ids_to_remove or e.target in node_ids_to_remove))
+            e
+            for e in self._edges
+            if not (
+                e.graph_id == graph_id
+                and self._edge_belongs_to_file(e, file_path, node_ids_to_remove)
+            )
         ]
         self._hashes.pop((graph_id, file_path), None)
+
+    @staticmethod
+    def _edge_belongs_to_file(
+        edge: CodeEdge, file_path: str, node_ids: set[str]
+    ) -> bool:
+        owner = edge.properties.get("owner_file_path")
+        if owner is not None:
+            return owner == file_path
+        return edge.source in node_ids or edge.target in node_ids
 
     async def add_nodes_batch(
         self, graph_id: str, nodes: Sequence[CodeNode]

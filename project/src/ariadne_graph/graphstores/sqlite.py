@@ -468,16 +468,29 @@ class SQLiteGraphStore:
                 await db.commit()
                 return
 
-            # Chunk size keeps edge deletes (graph_id + source + target) under
-            # the SQLite 999-parameter limit.
-            node_id_chunks = self._chunked(node_ids, size=400)
+            # Delete edges *produced by* this file (tracked via the
+            # owner_file_path property), not every edge merely touching one of
+            # its nodes. A cross-file edge such as ``a.caller -> b.save`` is
+            # owned by ``a.py``; reindexing ``b.py`` must not remove it.
+            await db.execute(
+                """
+                DELETE FROM edges
+                WHERE graph_id = ?
+                  AND json_extract(properties, '$.owner_file_path') = ?
+                """,
+                (graph_id, file_path),
+            )
 
-            # Delete related edges
+            # Legacy fallback: edges predating owner tracking have no
+            # owner_file_path and are removed by node membership. Chunk size
+            # keeps deletes under the SQLite 999-parameter limit.
+            node_id_chunks = self._chunked(node_ids, size=400)
             for chunk, placeholders in node_id_chunks:
                 await db.execute(
                     f"""
                     DELETE FROM edges
                     WHERE graph_id = ?
+                      AND json_extract(properties, '$.owner_file_path') IS NULL
                       AND (source IN ({placeholders}) OR target IN ({placeholders}))
                     """,
                     (graph_id, *chunk, *chunk),
