@@ -1,0 +1,9 @@
+{
+  "include": ["project/src", "project/tests"],
+  "pythonVersion": "3.11",
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportMissingImports": "warning",
+  "reportAttributeAccessIssue": "warning",
+  "reportPossiblyUnbound": "warning"
+}
