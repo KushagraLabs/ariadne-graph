@@ -72,8 +72,10 @@ const cy = cytoscape({
         "text-valign": "bottom", "text-margin-y": 4, "width": "data(size)", "height": "data(size)",
         "border-width": 1, "border-color": "#0b0d11" } },
     { selector: "edge", style: {
-        "width": 1, "line-color": "#3a4050",
-        "curve-style": "haystack", "opacity": 0.5 } },
+        "width": ele => Math.min(6, 1 + Math.log2((ele.data("weight") || 1) + 1)),
+        "line-color": "#4a5570", "target-arrow-color": "#4a5570",
+        "target-arrow-shape": "triangle", "arrow-scale": 0.7,
+        "curve-style": "bezier", "opacity": 0.55 } },
     { selector: "node:selected", style: { "border-width": 3, "border-color": "#6ea8fe" } },
   ],
 });
@@ -105,12 +107,17 @@ async function selectRepo(graph, root) {
 async function showFolders() {
   state.folder = null;
   crumbs();
-  const { folders } = await j(`/api/graph/folders?graph=${state.graph}&repo_root=${encodeURIComponent(state.repoRoot)}`);
-  const els = folders.map(f => ({ data: {
+  const { folders, edges } = await j(`/api/graph/folders?graph=${state.graph}&repo_root=${encodeURIComponent(state.repoRoot)}`);
+  const ids = new Set(folders.map(f => "folder:" + f.folder));
+  const nodes = folders.map(f => ({ data: {
     id: "folder:" + f.folder, label: f.folder, kind: "folder",
     worst: f.worst_level, size: sizeFor(f.diagnostic_count),
     file_count: f.file_count, diag: f.diagnostic_count } }));
-  render(els, []);
+  const eds = (edges || [])
+    .filter(e => ids.has("folder:" + e.source) && ids.has("folder:" + e.target))
+    .map(e => ({ data: { id: `fe:${e.source}>${e.target}`, source: "folder:" + e.source,
+                         target: "folder:" + e.target, weight: e.weight } }));
+  render(nodes, eds);
   document.getElementById("note").textContent = "";
 }
 
@@ -118,10 +125,15 @@ async function showFiles(folder) {
   state.folder = folder;
   crumbs();
   const data = await j(`/api/graph/files?graph=${state.graph}&repo_root=${encodeURIComponent(state.repoRoot)}&folder=${encodeURIComponent(folder)}`);
-  const els = data.files.map(f => ({ data: {
+  const byPath = new Map(data.files.map(f => [f.file_path, f.id]));
+  const nodes = data.files.map(f => ({ data: {
     id: f.id, label: f.name, kind: "file", path: f.file_path,
     worst: f.worst_level, size: sizeFor(f.diagnostic_count), diag: f.diagnostic_count } }));
-  render(els, []);
+  const eds = (data.edges || [])
+    .filter(e => byPath.has(e.source) && byPath.has(e.target))
+    .map(e => ({ data: { id: `ce:${byPath.get(e.source)}>${byPath.get(e.target)}`,
+                         source: byPath.get(e.source), target: byPath.get(e.target), weight: e.weight } }));
+  render(nodes, eds);
   document.getElementById("note").textContent =
     data.truncated ? `Showing top ${data.files.length} of ${data.total} files (${data.truncated} hidden).` : "";
 }
@@ -129,7 +141,8 @@ async function showFiles(folder) {
 function render(nodes, edges) {
   cy.elements().remove();
   cy.add(nodes.concat(edges));
-  cy.layout({ name: "cose", animate: false, idealEdgeLength: 60, nodeRepulsion: 8000 }).run();
+  cy.layout({ name: "cose", animate: false, idealEdgeLength: 80,
+    nodeRepulsion: 12000, gravity: 0.3, componentSpacing: 120 }).run();
   cy.fit(undefined, 40);
 }
 

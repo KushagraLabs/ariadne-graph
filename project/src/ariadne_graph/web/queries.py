@@ -48,6 +48,71 @@ async def _rows(store: SQLiteGraphStore, sql: str, params: tuple[Any, ...]) -> l
         await db.close()  # releases the store lock; underlying conn stays open
 
 
+# SCIP-resolved cross-file dependency edges live in the REFERENCES rel_type
+# (every symbol occurrence resolving to its definition in another file). The
+# older AST-derived CALLS edges are NOT resolved (targets are bare names), so we
+# deliberately use REFERENCES for real file→file links.
+_XREF_SQL = """
+SELECT json_extract(sn.properties, '$.file_path') AS sf,
+       json_extract(tn.properties, '$.file_path') AS tf
+FROM edges e
+JOIN nodes sn ON sn.graph_id = e.graph_id AND sn.id = e.source
+JOIN nodes tn ON tn.graph_id = e.graph_id AND tn.id = e.target
+WHERE e.graph_id = ?
+  AND e.rel_type = 'REFERENCES'
+  AND json_extract(sn.properties, '$.file_path') IS NOT NULL
+  AND json_extract(tn.properties, '$.file_path') IS NOT NULL
+  AND json_extract(sn.properties, '$.file_path') != json_extract(tn.properties, '$.file_path')
+"""
+
+
+async def folder_edges(
+    store: SQLiteGraphStore, graph_id: str, *, repo_root: str
+) -> list[dict[str, Any]]:
+    """Altitude 1 edges: folder→folder dependency, weighted by cross-file refs.
+
+    A reference from a file in folder A to a file in folder B contributes to an
+    A→B edge. Self-edges (within one folder) are dropped.
+    """
+    rows = await _rows(store, _XREF_SQL, (graph_id,))
+    weights: dict[tuple[str, str], int] = {}
+    for r in rows:
+        src = _folder_of(r["sf"], repo_root)
+        tgt = _folder_of(r["tf"], repo_root)
+        if src is None or tgt is None or src == tgt:
+            continue
+        weights[(src, tgt)] = weights.get((src, tgt), 0) + 1
+    return [
+        {"source": s, "target": t, "weight": w} for (s, t), w in weights.items()
+    ]
+
+
+async def file_edges(
+    store: SQLiteGraphStore, graph_id: str, *, repo_root: str, folder: str
+) -> list[dict[str, Any]]:
+    """Altitude 2 edges: file→file dependency within a folder's subtree.
+
+    Only edges where BOTH endpoints are files inside ``folder`` are returned, so
+    the edge set matches the file nodes shown at this altitude.
+    """
+    abs_prefix = f"{repo_root.rstrip('/')}/{folder}/"
+    rel_prefix = f"{folder}/"
+
+    def _in_folder(path: str) -> bool:
+        return path.startswith(abs_prefix) or path.startswith(rel_prefix)
+
+    rows = await _rows(store, _XREF_SQL, (graph_id,))
+    weights: dict[tuple[str, str], int] = {}
+    for r in rows:
+        sf, tf = r["sf"], r["tf"]
+        if not _in_folder(sf) or not _in_folder(tf):
+            continue
+        weights[(sf, tf)] = weights.get((sf, tf), 0) + 1
+    return [
+        {"source": s, "target": t, "weight": w} for (s, t), w in weights.items()
+    ]
+
+
 async def list_folders(
     store: SQLiteGraphStore, graph_id: str, *, repo_root: str
 ) -> list[dict[str, Any]]:

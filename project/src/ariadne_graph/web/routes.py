@@ -72,7 +72,8 @@ def register_routes(mcp: FastMCP) -> None:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         folders = await queries.list_folders(store, graph_id, repo_root=repo_root)
-        return JSONResponse({"folders": folders})
+        edges = await queries.folder_edges(store, graph_id, repo_root=repo_root)
+        return JSONResponse({"folders": folders, "edges": edges})
 
     @mcp.custom_route("/api/graph/files", methods=["GET"])
     async def api_files(request: Request) -> Response:
@@ -89,8 +90,13 @@ def register_routes(mcp: FastMCP) -> None:
             store, graph_id, repo_root=repo_root, folder=folder, limit=_NODE_CAP
         )
         total = await queries.count_files(store, graph_id, repo_root=repo_root, folder=folder)
+        edges = await queries.file_edges(store, graph_id, repo_root=repo_root, folder=folder)
+        # Only keep edges whose endpoints are among the (capped) files shown.
+        shown = {f["file_path"] for f in files}
+        edges = [e for e in edges if e["source"] in shown and e["target"] in shown]
         payload: dict[str, Any] = {
             "files": files,
+            "edges": edges,
             "truncated": max(0, total - len(files)),
             "total": total,
         }

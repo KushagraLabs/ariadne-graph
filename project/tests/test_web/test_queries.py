@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from ariadne_graph.core.models import CodeNode
+from ariadne_graph.core.models import CodeEdge, CodeNode
 from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
 from ariadne_graph.web import queries
 
@@ -142,6 +142,72 @@ async def test_mixed_absolute_and_relative_paths(store: SQLiteGraphStore) -> Non
     files = await queries.list_files(store, "g", repo_root=repo, folder="server")
     paths = {f["file_path"] for f in files}
     assert paths == {f"{repo}/server/index.ts", "server/routes.ts"}
+
+
+def _sym(node_id: str, graph_id: str, path: str) -> CodeNode:
+    """A code symbol node carrying its file_path (source/target of REFERENCES)."""
+    return CodeNode(
+        id=node_id, graph_id=graph_id,
+        labels=["KnowledgeNode", "CodeFunction"],
+        properties={"name": node_id, "file_path": path},
+    )
+
+
+async def test_folder_edges_from_references(store: SQLiteGraphStore) -> None:
+    """Folder→folder edges come from cross-file REFERENCES; same-folder and
+    intra-file references are dropped.
+    """
+    repo = "/Users/x/Documents/repo_a"
+    await store.add_nodes_batch("g", [
+        _sym("a", "g", f"{repo}/server/index.ts"),
+        _sym("b", "g", f"{repo}/shared/util.ts"),
+        _sym("c", "g", f"{repo}/server/other.ts"),
+    ])
+    await store.add_edges_batch("g", [
+        # server -> shared (counts)
+        CodeEdge(source="a", target="b", graph_id="g", rel_type="REFERENCES", properties={}),
+        # server -> server (same folder, dropped)
+        CodeEdge(source="a", target="c", graph_id="g", rel_type="REFERENCES", properties={}),
+    ])
+
+    edges = await queries.folder_edges(store, "g", repo_root=repo)
+    assert edges == [{"source": "server", "target": "shared", "weight": 1}]
+
+
+async def test_edges_scoped_by_graph(store: SQLiteGraphStore) -> None:
+    """Hard case: folder edges for graph A must not include graph B's references."""
+    repo = "/Users/x/Documents/repo_a"
+    await store.add_nodes_batch("gA", [
+        _sym("a1", "gA", f"{repo}/src/one.ts"), _sym("a2", "gA", f"{repo}/lib/two.ts"),
+    ])
+    await store.add_nodes_batch("gB", [
+        _sym("b1", "gB", f"{repo}/x/p.ts"), _sym("b2", "gB", f"{repo}/y/q.ts"),
+    ])
+    await store.add_edges_batch("gA", [
+        CodeEdge(source="a1", target="a2", graph_id="gA", rel_type="REFERENCES", properties={})])
+    await store.add_edges_batch("gB", [
+        CodeEdge(source="b1", target="b2", graph_id="gB", rel_type="REFERENCES", properties={})])
+
+    edges = await queries.folder_edges(store, "gA", repo_root=repo)
+    assert edges == [{"source": "src", "target": "lib", "weight": 1}]  # no x→y from gB
+
+
+async def test_file_edges_within_folder(store: SQLiteGraphStore) -> None:
+    """File→file edges only when both endpoints are inside the folder subtree."""
+    repo = "/Users/x/Documents/repo_a"
+    await store.add_nodes_batch("g", [
+        _sym("a", "g", f"{repo}/server/index.ts"),
+        _sym("b", "g", f"{repo}/server/db.ts"),
+        _sym("c", "g", f"{repo}/shared/util.ts"),
+    ])
+    await store.add_edges_batch("g", [
+        CodeEdge(source="a", target="b", graph_id="g", rel_type="REFERENCES", properties={}),
+        CodeEdge(source="a", target="c", graph_id="g", rel_type="REFERENCES", properties={}),  # leaves folder
+    ])
+
+    edges = await queries.file_edges(store, "g", repo_root=repo, folder="server")
+    assert edges == [{"source": f"{repo}/server/index.ts",
+                      "target": f"{repo}/server/db.ts", "weight": 1}]
 
 
 async def test_cap_and_truncation(store: SQLiteGraphStore) -> None:
