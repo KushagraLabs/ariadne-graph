@@ -24,7 +24,10 @@ class AnalyzerConfig(BaseModel):
         ".git", "__pycache__", "*.pyc", "node_modules", ".venv", "venv",
         ".tox", ".pytest_cache", ".mypy_cache", "*.egg-info", "dist", "build",
         ".idea", ".vscode", ".DS_Store", ".claude",
-        ".worktrees", "external",
+        # Throwaway agent/scratch/worktree dirs — must be plain names, not
+        # dotted (`worktrees`, not `.worktrees`) to match the real on-disk
+        # dir names that were bloating the index.
+        "worktrees", ".worktrees", "external", ".gc", "_tmp", ".gemini",
     ])
     python_paths: list[str] = Field(default_factory=list)
     max_file_size: int = Field(default=1_000_000, description="Maximum file size in bytes to parse")

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ariadne — code graph</title>
+<script src="/graph/cytoscape.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --ink: #e6e9ef; --muted: #8b94a7;
+    --line: #262b36; --accent: #6ea8fe;
+    --ok: #3fb27f; --info: #6ea8fe; --warn: #e0a44a; --error: #e05a5a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #app { display: grid; grid-template-columns: 1fr 320px; grid-template-rows: auto 1fr; height: 100%; }
+  header { grid-column: 1 / 3; display: flex; gap: 12px; align-items: center;
+    padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+  select, button { background: #10131a; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 9px; font-size: 13px; }
+  button { cursor: pointer; } button:hover { border-color: var(--accent); }
+  #crumbs { color: var(--muted); font-size: 13px; }
+  #crumbs a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  #cy { width: 100%; height: 100%; }
+  #side { border-left: 1px solid var(--line); background: var(--panel); padding: 14px; overflow-y: auto; }
+  #side h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); margin: 0 0 8px; }
+  .legend div { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+  .sel-title { font-weight: 600; margin: 14px 0 4px; word-break: break-all; }
+  .stat { color: var(--muted); font-size: 13px; }
+  #note { color: var(--warn); font-size: 12px; margin-top: 10px; }
+  #empty { color: var(--muted); padding: 30px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Ariadne</h1>
+    <select id="repo"></select>
+    <span id="crumbs"></span>
+    <span style="flex:1"></span>
+    <button id="reset">Reset view</button>
+  </header>
+  <div id="cy"></div>
+  <aside id="side">
+    <h2>Hygiene legend</h2>
+    <div class="legend">
+      <div><span class="dot" style="background:var(--ok)"></span> clean</div>
+      <div><span class="dot" style="background:var(--info)"></span> info</div>
+      <div><span class="dot" style="background:var(--warn)"></span> warning</div>
+      <div><span class="dot" style="background:var(--error)"></span> error</div>
+    </div>
+    <p class="stat" style="margin-top:10px">Node size = diagnostic count. Click a
+      folder to drill into its files.</p>
+    <div id="detail"></div>
+    <div id="note"></div>
+  </aside>
+</div>
+<script>
+const LEVEL_COLOR = { error: "#e05a5a", warning: "#e0a44a", info: "#6ea8fe", null: "#3fb27f" };
+const state = { graph: null, repoRoot: null, folder: null };
+
+const cy = cytoscape({
+  container: document.getElementById("cy"),
+  style: [
+    { selector: "node", style: {
+        "background-color": ele => LEVEL_COLOR[ele.data("worst")] || "#3fb27f",
+        "label": "data(label)", "color": "#c7ccd6", "font-size": 10,
+        "text-valign": "bottom", "text-margin-y": 4, "width": "data(size)", "height": "data(size)",
+        "border-width": 1, "border-color": "#0b0d11" } },
+    { selector: "edge", style: {
+        "width": 1, "line-color": "#3a4050",
+        "curve-style": "haystack", "opacity": 0.5 } },
+    { selector: "node:selected", style: { "border-width": 3, "border-color": "#6ea8fe" } },
+  ],
+});
+
+function sizeFor(count) { return 18 + Math.min(42, Math.sqrt(count || 0) * 6); }
+
+async function j(url) { const r = await fetch(url); if (!r.ok) throw new Error(await r.text()); return r.json(); }
+
+async function loadRepos() {
+  const { repos } = await j("/api/graph/repos");
+  const sel = document.getElementById("repo");
+  sel.innerHTML = "";
+  repos.filter(r => r.file_count > 0).forEach(r => {
+    const o = document.createElement("option");
+    o.value = r.graph_id; o.dataset.root = r.repo_root;
+    o.textContent = `${r.repo_root.split("/").pop() || r.repo_root} (${r.file_count} files)`;
+    sel.appendChild(o);
+  });
+  sel.onchange = () => selectRepo(sel.value, sel.selectedOptions[0].dataset.root);
+  if (sel.options.length) selectRepo(sel.value, sel.selectedOptions[0].dataset.root);
+  else document.getElementById("cy").innerHTML = '<div id="empty">No indexed repos with data.</div>';
+}
+
+async function selectRepo(graph, root) {
+  state.graph = graph; state.repoRoot = root; state.folder = null;
+  await showFolders();
+}
+
+async function showFolders() {
+  state.folder = null;
+  crumbs();
+  const { folders } = await j(`/api/graph/folders?graph=${state.graph}&repo_root=${encodeURIComponent(state.repoRoot)}`);
+  const els = folders.map(f => ({ data: {
+    id: "folder:" + f.folder, label: f.folder, kind: "folder",
+    worst: f.worst_level, size: sizeFor(f.diagnostic_count),
+    file_count: f.file_count, diag: f.diagnostic_count } }));
+  render(els, []);
+  document.getElementById("note").textContent = "";
+}
+
+async function showFiles(folder) {
+  state.folder = folder;
+  crumbs();
+  const data = await j(`/api/graph/files?graph=${state.graph}&repo_root=${encodeURIComponent(state.repoRoot)}&folder=${encodeURIComponent(folder)}`);
+  const els = data.files.map(f => ({ data: {
+    id: f.id, label: f.name, kind: "file", path: f.file_path,
+    worst: f.worst_level, size: sizeFor(f.diagnostic_count), diag: f.diagnostic_count } }));
+  render(els, []);
+  document.getElementById("note").textContent =
+    data.truncated ? `Showing top ${data.files.length} of ${data.total} files (${data.truncated} hidden).` : "";
+}
+
+function render(nodes, edges) {
+  cy.elements().remove();
+  cy.add(nodes.concat(edges));
+  cy.layout({ name: "cose", animate: false, idealEdgeLength: 60, nodeRepulsion: 8000 }).run();
+  cy.fit(undefined, 40);
+}
+
+cy.on("tap", "node", evt => {
+  const d = evt.target.data();
+  showDetail(d);
+  if (d.kind === "folder") showFiles(d.label);
+});
+
+function row(cls, text) { const d = document.createElement("div"); d.className = cls; d.textContent = text; return d; }
+
+function showDetail(d) {
+  // textContent everywhere: labels/paths come from on-disk file names — treat as untrusted.
+  const el = document.getElementById("detail");
+  el.replaceChildren();
+  el.appendChild(row("sel-title", d.label));
+  el.appendChild(row("stat", d.kind === "folder" ? `${d.file_count} files` : (d.path || "")));
+  el.appendChild(row("stat", `${d.diag || 0} diagnostics${d.worst ? " · worst: " + d.worst : ""}`));
+}
+
+function crumbs() {
+  const c = document.getElementById("crumbs");
+  c.replaceChildren();
+  const repo = state.repoRoot ? (state.repoRoot.split("/").pop() || state.repoRoot) : "";
+  const link = document.createElement("a");
+  link.textContent = repo; link.onclick = showFolders;
+  c.appendChild(link);
+  if (state.folder) c.appendChild(document.createTextNode(` ▸ ${state.folder}`));
+}
+
+document.getElementById("reset").onclick = () => state.folder ? showFolders() : cy.fit(undefined, 40);
+loadRepos().catch(e => { document.getElementById("cy").innerHTML = '<div id="empty">'+e.message+'</div>'; });
+</script>
+</body>
+</html>

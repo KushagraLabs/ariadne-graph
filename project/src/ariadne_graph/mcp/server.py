@@ -66,6 +66,12 @@ def _get_registry() -> ToolRegistry:
 
 mcp = FastMCP("ariadne")
 
+# Mount the read-only browser graph view (GET /graph + /api/graph/*) on the same
+# streamable-http app, so the shared daemon serves it with no extra process.
+from ariadne_graph.web import register_routes  # noqa: E402
+
+register_routes(mcp)
+
 
 # ============================================================================
 # INDEXING TOOLS (4)
@@ -545,12 +551,23 @@ def initialise_registry(
 async def _run_server_async(
     transport: Literal["stdio", "sse", "streamable-http"],
     mount_path: str | None,
+    host: str | None = None,
+    port: int | None = None,
 ) -> None:
     """Async server runner: starts auto-sync, runs MCP transport, cleans up.
 
     Runs inside the event loop created by ``anyio.run`` so that auto-sync and
     the server share the same loop and are shut down gracefully.
+
+    ``host``/``port`` override the HTTP bind address for the ``sse`` and
+    ``streamable-http`` transports so a single shared daemon can bind a fixed
+    port. They are ignored for stdio.
     """
+    if host is not None:
+        mcp.settings.host = host
+    if port is not None:
+        mcp.settings.port = port
+
     registry = _get_registry()
     logger.info("ToolRegistry initialised with %d adapters", len(registry.adapters))
 
