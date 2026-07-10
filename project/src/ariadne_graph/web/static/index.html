@@ -250,6 +250,23 @@ const clamp01 = x => Math.max(0, Math.min(1, x));
 const couple = w => clamp01(w);
 
 function colorFor(worst) { return LEVEL_COLOR[worst] || "#3fb27f"; }
+
+// --- Pack dir-circle tinting (Task 5) ----------------------------------------
+// Directory territories read as nested boxes: a FAINT module-hue fill (fainter
+// the deeper the nesting, so containment reads visually) plus a thin stroke that
+// carries the dir's worst-hygiene tint (unhealthy modules glow even before you
+// drill in). Two independent color channels on one circle: hue = which module,
+// stroke = how healthy.
+const DIR_STROKE = "#3a4256";                 // base neutral dir outline
+// depth-1 ~12% opacity, deeper progressively fainter, floored so deep dirs don't
+// vanish. depth is the pack depth (1 = top-level module dir).
+function dirFillOpacity(depth) { return Math.max(0.03, 0.12 / Math.max(1, depth)); }
+// Blend the neutral stroke toward the worst-level hygiene color (0 = clean →
+// stays neutral; error/warn/info → tinted). d3.rgb interpolation, 55% toward hue.
+function dirStroke(worst) {
+  if (!worst) return DIR_STROKE;              // no diagnostics anywhere → plain outline
+  return d3.interpolateRgb(DIR_STROKE, colorFor(worst))(0.55);
+}
 function sizeFor(count) { return 10 + Math.min(24, Math.sqrt(count || 0) * 3.5); }
 
 async function j(url) { const r = await fetch(url); if (!r.ok) throw new Error(await r.text()); return r.json(); }
@@ -298,6 +315,13 @@ function render(nodes, links) {
                     : state.labelMode === "on" ? false
                     : n > 200;
 
+  // A top-level MODULE dir = a depth-1 dir circle in the pack view (the ~8 organs).
+  // Its label is pinned on regardless of density/zoom; sub-dirs (depth>1) and files
+  // obey the dense rule. Folder-view items are kind "folder"/"file", never depth-1
+  // "dir", so this is inert there. Hoisted (function decl) — the zoom handler below
+  // closes over it before it fires.
+  function isModuleDir(d) { return d.kind === "dir" && d.depth === 1; }
+
   const { w, h } = stageSize();
   gRoot = svg.append("g");
   let labelsForced = false;
@@ -307,7 +331,9 @@ function render(nodes, links) {
     const shouldForce = e.transform.k >= LABEL_ZOOM;
     if (denseLabels && shouldForce !== labelsForced) {
       labelsForced = shouldForce;
-      gRoot.selectAll(".node-label").style("display", labelsForced ? null : "none");
+      // Module labels stay pinned on; only sub-dir/file labels toggle with zoom.
+      gRoot.selectAll(".node-label")
+        .style("display", d => (labelsForced || isModuleDir(d)) ? null : "none");
     }
   });
   svg.call(zoom);
@@ -407,19 +433,30 @@ function render(nodes, links) {
     .on("mouseleave", function (e, d) { if (d.kind !== "hub") d3.select(this).transition().duration(150)
       .attr("stroke-opacity", d.violation ? 0.85 : 0.5).attr("stroke", d.violation ? VIOL : DEP_OK); });
 
-  const node = gRoot.append("g").selectAll("g").data(nodes).enter().append("g")
+  // Draw order = pack DEPTH ascending, so parent dir circles render before (under)
+  // their children/descendants — otherwise a later-drawn parent would cover the
+  // leaves inside it. Flat/folder view has no meaningful depth nesting; the sort
+  // is stable and harmless there. `.data` keeps its own order for tick updates.
+  const drawNodes = hasHubs ? nodes.slice().sort((a, b) => (a.depth || 0) - (b.depth || 0)) : nodes;
+  const node = gRoot.append("g").selectAll("g").data(drawNodes).enter().append("g")
     .style("cursor", "pointer")
     .call(d3.drag().on("start", dragStart).on("drag", dragMove).on("end", dragEnd));
 
-  // Fill = directory hue (or hygiene gradient in the folder view where there are
-  // no dir hubs); a thin hygiene-colored ring carries the health signal on top.
+  // Pack view: FILE leaves fill by hygiene color (green/blue/amber/red — the health
+  // signal is the leaf itself); DIR circles get a faint module-hue fill (fainter the
+  // deeper they nest) with a worst-level-tinted thin stroke — nested territories that
+  // glow when unhealthy. Folder view (no hubs) keeps the hygiene radial gradient.
+  const packFill = d => d.kind === "file" ? colorFor(d.worst) : d.color;
   node.append("circle")
     .attr("r", d => d.size)
-    .attr("fill", d => hasHubs ? d.color : `url(#grad-${d.worst || "null"})`)
-    .attr("fill-opacity", d => d.kind === "file" ? 0.92 : 1)
-    .attr("stroke", d => hasHubs ? colorFor(d.worst) : "#0b0d11")
-    .attr("stroke-width", d => d.kind === "dir" ? 3 : hasHubs ? 2 : 1.5)
-    .attr("filter", "url(#nshadow)")
+    .attr("fill", d => hasHubs ? packFill(d) : `url(#grad-${d.worst || "null"})`)
+    .attr("fill-opacity", d => hasHubs
+      ? (d.kind === "dir" ? dirFillOpacity(d.depth) : 0.92)
+      : (d.kind === "file" ? 0.92 : 1))
+    .attr("stroke", d => !hasHubs ? "#0b0d11"
+      : d.kind === "dir" ? dirStroke(d.worst) : colorFor(d.worst))
+    .attr("stroke-width", d => d.kind === "dir" ? (hasHubs ? 1.2 : 3) : hasHubs ? 2 : 1.5)
+    .attr("filter", d => hasHubs && d.kind === "dir" ? null : "url(#nshadow)")
     .on("click", (e, d) => {
       showDetail(d);
       if (d.kind === "folder") showFiles(d.label);           // top level → into a folder
@@ -432,9 +469,11 @@ function render(nodes, links) {
     })
     .on("mouseleave", function (e, d) {
       d3.select(this).transition().duration(150)
-        .attr("r", d.size).attr("stroke", hasHubs ? colorFor(d.worst) : "#0b0d11")
-        .attr("stroke-width", d.kind === "dir" ? 3 : hasHubs ? 2 : 1.5);
-      if (denseLabels && !labelsForced && d.kind !== "dir")
+        .attr("r", d.size)
+        .attr("stroke", !hasHubs ? "#0b0d11"
+          : d.kind === "dir" ? dirStroke(d.worst) : colorFor(d.worst))
+        .attr("stroke-width", d.kind === "dir" ? (hasHubs ? 1.2 : 3) : hasHubs ? 2 : 1.5);
+      if (denseLabels && !labelsForced && !isModuleDir(d))
         d3.select(this.parentNode).select(".node-label").style("display", "none");
     });
 
@@ -452,15 +491,17 @@ function render(nodes, links) {
     .attr("font-size", d => Math.max(8, d.size * 0.7)).attr("fill", "#0b0d11")
     .attr("font-weight", 700)
     .text(d => (d.label || "").substring(0, 3).toUpperCase());
-  // full label below. Dir hubs ALWAYS show their name (the "department"); file
-  // labels follow the dense rule (hidden when crowded, shown on hover/zoom).
+  // full label below. TOP-LEVEL MODULE dirs (pack depth 1) ALWAYS show their name
+  // (the "organs" — never hidden by density/zoom). Sub-dir + file labels follow the
+  // dense rule (hidden when crowded, revealed on hover/zoom). Module labels sit a
+  // touch larger so the ~8 territory names anchor the view.
   node.append("text").attr("class", "node-label").attr("text-anchor", "middle")
     .attr("dy", d => d.size + 12)
-    .attr("font-size", d => d.kind === "dir" ? 13 : 10)
+    .attr("font-size", d => isModuleDir(d) ? 14 : d.kind === "dir" ? 12 : 10)
     .attr("font-weight", d => d.kind === "dir" ? 700 : 400)
     .attr("fill", d => d.kind === "dir" ? d.color : "#c7ccd6")
     .text(d => d.label)
-    .style("display", d => (denseLabels && d.kind !== "dir") ? "none" : null);
+    .style("display", d => (denseLabels && !isModuleDir(d)) ? "none" : null);
   // native tooltip; textContent-safe (d.label from disk file names)
   node.append("title").text(d => d.kind === "folder"
     ? `${d.label}\n${d.file_count} files · ${d.diag || 0} diagnostics`
@@ -638,12 +679,26 @@ function renderScope() {
     if (segs.length > MAX_DEPTH) drillable.add(segs.slice(0, MAX_DEPTH).join("/"));
   }
 
+  // Worst hygiene level over all files in each dir's SUBTREE — so a dir circle's
+  // stroke can carry the worst-level tint (unhealthy modules read at dir level,
+  // per the pack design "Rendering"). Severity order: error > warning > info > clean.
+  const SEV = { error: 3, warning: 2, info: 1 };
+  const dirWorst = new Map();
+  for (const f of fileNodes) {
+    if (!f.worst) continue;
+    for (let d = f.dir; d !== null; d = parentDir(d)) {
+      const cur = dirWorst.get(d);
+      if (!cur || SEV[f.worst] > SEV[cur]) dirWorst.set(d, f.worst);
+    }
+  }
+
   const hubNodes = [...allDirs].filter(dir => dir != null).map(dir => {
     const branch = dir === "" ? "(root)" : dir.split("/")[0];
     const canDrill = drillable.has(dir);
     return { id: "dir:" + dir, kind: "dir", dir, branch, color: dirColor(scope + "/" + branch),
              label: dir === "" ? (scope.split("/").pop() || folder) : dir.split("/").pop(),
              depth: dir === "" ? 0 : dir.split("/").length,
+             worst: dirWorst.get(dir) || null,
              drillTo: (subpath ? subpath + "/" : "") + dir, canDrill,
              size: 10 + Math.min(28, Math.sqrt(subtreeCount.get(dir) || 1) * 2.4),
              file_count: subtreeCount.get(dir) };
