@@ -283,8 +283,14 @@ async def test_layering_violations(store: SQLiteGraphStore) -> None:
 
 
 async def test_violation_rule_pure() -> None:
-    """Unit-level truth table for the predicate itself (no DB)."""
-    v = queries._is_violation
+    """Unit-level truth table for the predicate itself (no DB).
+
+    The predicate now lives in core.architecture (single source of truth for the
+    deep-import rule, shared by the persisted analysis and this edge paint).
+    """
+    from ariadne_graph.core.architecture import is_deep_import
+
+    v = is_deep_import
     assert v("src/core", "src/other") is False   # same organ, cousin
     assert v("src/core", "src") is False         # same organ, own ancestor
     assert v("src", "tests") is False            # organ -> organ front door

@@ -14,6 +14,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from ariadne_graph.core.architecture import (
+    PERIPHERAL_ORGANS,
+    is_deep_import,
+)
 from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
 
 # Diagnostic levels ordered worst-first, for "worst_level" aggregation.
@@ -76,47 +80,15 @@ def _dir_of(rel_path: str) -> str:
     return head if sep else ""
 
 
-# Peripheral organs (tests, scripts, and kin) are entry-point / glue code that
-# legitimately reaches into everything it exercises or wires together. Dep edges
-# ORIGINATING from these organs are omitted entirely, so the graph focuses on the
-# core wiring rather than being swamped by test/script fan-in.
-_PERIPHERAL_ORGANS = {
-    "tests", "test", "__tests__", "spec", "specs", "e2e",
-    "scripts", "script",
-}
-
-
 def _is_peripheral_source(dir_path: str) -> bool:
-    """True if a file in ``dir_path`` belongs to a peripheral organ (test/script)."""
-    organ = dir_path.split("/", 1)[0] if dir_path else ""
-    return organ in _PERIPHERAL_ORGANS
+    """True if a file in ``dir_path`` belongs to a peripheral organ (test/script).
 
-
-def _is_violation(dir_a: str, dir_b: str) -> bool:
-    """Layering rule for an import from a file in ``dir_a`` to one in ``dir_b``.
-
-    Only ever called for NON-peripheral sources (peripheral-source edges are
-    dropped upstream). ``dir_*`` are repo-relative directory paths; the top-level
-    *organ* is the first path segment. An import is ALLOWED when either:
-
-      1. Same organ — A and B share the first segment. Any direction within your
-         own organ is fine (organ is the unit of encapsulation).
-      2. Organ front door — B sits directly at another organ's top level (its dir
-         IS a top-level organ, no deeper), e.g. ``src/x -> tests``.
-
-    A VIOLATION is reaching into a *different* organ's internals (B one or more
-    levels below its organ root), e.g. ``src/x -> tests/unit/y``. Root-level files
-    (empty dir) belong to no organ and never violate.
+    Dep edges originating from these organs are omitted from the view — they are
+    entry-point glue and swamp the core wiring otherwise. The organ set is the
+    single one defined in :mod:`ariadne_graph.core.architecture`.
     """
-    if dir_a == dir_b:
-        return False
-    organ_a = dir_a.split("/", 1)[0] if dir_a else ""
-    organ_b = dir_b.split("/", 1)[0] if dir_b else ""
-    if organ_a == organ_b:
-        return False               # same organ — always fine
-    # Different organ: OK only if B is that organ's top-level front door (no "/"),
-    # a violation if it reaches into the organ's internals.
-    return "/" in dir_b
+    organ = dir_path.split("/", 1)[0] if dir_path else ""
+    return organ in PERIPHERAL_ORGANS
 
 
 async def full_graph(store: SQLiteGraphStore, graph_id: str, *, repo_root: str) -> dict[str, Any]:
@@ -232,7 +204,7 @@ async def full_graph(store: SQLiteGraphStore, graph_id: str, *, repo_root: str) 
     dep_edges = [
         {
             "source": s, "target": t, "weight": w, "kind": "dep",
-            "violation": _is_violation(files[s]["dir"], files[t]["dir"]),
+            "violation": is_deep_import(files[s]["dir"], files[t]["dir"]),
         }
         for (s, t), w in weights.items()
     ]
