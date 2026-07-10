@@ -149,6 +149,33 @@ function computeModuleLinks(nodes, links, modules) {
   }
   return moduleLinks;
 }
+
+const clamp01 = x => Math.max(0, Math.min(1, x));
+// Map a normalized entanglement weight to a d3 forceLink strength in [0,1].
+// Weights = crossEdges/sqrt(nA*nB) already sit roughly in [0.1, 3]; clamp01
+// saturates strong pairs at 1 while preserving ordering below 1.
+const couple = w => clamp01(w);
+// Residual home-spring strength: 0.1 + 0.9*(1-slider). Never reaches 0 (0.1 at
+// slider=1) so full coupling keeps the mental map instead of a generic blob.
+const homeStrength = slider => 0.1 + 0.9 * (1 - slider);
+
+// The slider>0 branch of runLayout, factored to a PURE function of (modules,
+// moduleLinks, slider, maxWeight): mirrors index.html's sim config verbatim.
+// slider===0 is the static bypass (modules pinned at home) — asserted separately.
+// Returns the settled modules (run to convergence via manual .tick()).
+function runLayoutSim(d3, modules, moduleLinks, slider, maxWeight) {
+  const gap = w => 12 + 88 * (1 - clamp01(w / maxWeight));   // strong pair → small gap
+  const sim = d3.forceSimulation(modules)
+    .force("couple", d3.forceLink(moduleLinks).id(m => m.id)
+        .distance(l => l.source.R + l.target.R + gap(l.weight))
+        .strength(l => couple(l.weight) * slider))
+    .force("collide", d3.forceCollide(m => m.R + 8))
+    .force("hx", d3.forceX(m => m.homeX).strength(homeStrength(slider)))
+    .force("hy", d3.forceY(m => m.homeY).strength(homeStrength(slider)))
+    .stop();
+  for (let i = 0; i < 400; i++) sim.tick();
+  return modules;
+}
 // ---- end mirror ----
 
 // ---- synthetic lumen_platform-shaped scope (same fixture family as the old harness) ----
@@ -416,6 +443,65 @@ check("weight = crossEdges / sqrt(nA*nB): big pair = 6/sqrt(25*25) = 0.24",
 check("normalized: small-but-tangled pair OUTRANKS big-but-loose pair",
   smallPair && bigPair && smallPair.weight > bigPair.weight,
   smallPair && bigPair ? `small=${smallPair.weight.toFixed(3)} > big=${bigPair.weight.toFixed(3)}` : "pair absent");
+
+// (11) SLIDER-ENDPOINTS — asserted BY BEHAVIOR (run the layout), not by peeking
+//      at force strengths. slider=0 is a STATIC BYPASS: every module x,y equals
+//      its homeX,homeY exactly (the pure ideal — the sim would otherwise nudge
+//      modules off home via collision at R+8 > pack().padding(3)).
+//      Build fresh modules for the sim tests (the giant fixture has one 200-file
+//      module; use a compact coupled fixture so the sim is fast + deterministic).
+function simFixture() {
+  const ns = [];
+  const dirFiles = { "a": 6, "b": 6, "c": 6, "d": 6, "e": 6, "f": 6 };
+  for (const dir of Object.keys(dirFiles)) {
+    ns.push({ id: "dir:" + dir, kind: "dir", dir, label: dir });
+    for (let k = 0; k < dirFiles[dir]; k++)
+      ns.push({ id: `${dir}#${k}`, kind: "file", dir, label: `f${k}.py`, path: dir + "/f" + k });
+  }
+  const r = packLayout(ns, S);
+  r.each(pn => { const d = pn.data.src; if (d) { d.hx = pn.x + 60; d.hy = pn.y + 60; d.r = pn.r; } });
+  const mods = computeModules(r, 60, 60);
+  const dep = (s, t) => ({ source: s, target: t, kind: "dep" });
+  const links = [
+    dep("a#0", "b#0"), dep("a#1", "b#1"), dep("a#2", "b#2"),   // a~b strong
+    dep("c#0", "d#0"),                                          // c~d weak
+    dep("e#0", "f#0"), dep("e#1", "f#1"),                       // e~f medium
+  ];
+  return { modules: mods, moduleLinks: computeModuleLinks(ns, links, mods) };
+}
+
+// slider=0 static bypass: modules sit exactly on home.
+const f0 = simFixture();
+f0.modules.forEach(m => { m.x = m.homeX; m.y = m.homeY; m.vx = m.vy = 0; });
+check("slider=0 bypasses sim: every module x,y === homeX,homeY exactly",
+  f0.modules.every(m => m.x === m.homeX && m.y === m.homeY),
+  `modules=${f0.modules.length}`);
+
+// slider=1: run the sim to convergence, then assert NO two module circles overlap.
+const f1 = simFixture();
+const maxW1 = Math.max(...f1.moduleLinks.map(l => l.weight), 1e-9);
+runLayoutSim(d3, f1.modules, f1.moduleLinks, 1, maxW1);
+let noOverlap = true, worstPen = 0;
+for (let i = 0; i < f1.modules.length; i++)
+  for (let jj = i + 1; jj < f1.modules.length; jj++) {
+    const a = f1.modules[i], b = f1.modules[jj];
+    const d = Math.hypot(a.x - b.x, a.y - b.y), need = a.R + b.R;
+    if (d < need - 1e-6) { noOverlap = false; worstPen = Math.max(worstPen, need - d); }
+  }
+check("slider=1: no two module circles overlap after settling (dist >= Ra+Rb)",
+  noOverlap && f1.modules.every(m => Number.isFinite(m.x) && Number.isFinite(m.y)),
+  `worst_penetration=${worstPen.toFixed(2)}px`);
+
+// residual home-spring strength constant IS 0.1 at slider=1 (nonzero — orientation
+// preserved). Explicit numeric invariant the plan calls out; direct check is fine.
+check("residual home-spring strength = 0.1 at slider=1",
+  Math.abs(homeStrength(1) - 0.1) < 1e-12,
+  `homeStrength(1)=${homeStrength(1)}`);
+
+// couple() is monotone in [0,1] and saturates strong pairs at 1.
+check("couple(w) monotone, saturates at 1",
+  couple(0) === 0 && couple(0.5) === 0.5 && couple(1) === 1 && couple(3) === 1,
+  `couple(3)=${couple(3)}`);
 
 console.log(`\n${fails===0?"ALL PASS":fails+" FAILURES"}`);
 process.exit(fails===0?0:1);

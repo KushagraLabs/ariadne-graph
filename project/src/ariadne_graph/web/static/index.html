@@ -240,7 +240,14 @@ function computeModuleLinks(nodes, links, modules) {
 const state = { graph: null, repoRoot: null, folder: null, subpath: "",
                 fileData: null, sim: null, mode: "soft",      // "soft" | "rigid"
                 modules: [], moduleLinks: [],                 // pack rigid bodies + cross-module coupling
+                slider: 0.35,                                 // coupling strength 0..1 (0 = pure pack home)
                 labelMode: "auto" };                          // "auto" | "on" | "off"
+
+const clamp01 = x => Math.max(0, Math.min(1, x));
+// Map a normalized entanglement weight (crossEdges/sqrt(nA*nB), roughly [0.1,3])
+// to a d3 forceLink strength in [0,1]: clamp01 saturates strong pairs at 1 while
+// preserving ordering below 1.
+const couple = w => clamp01(w);
 
 function colorFor(worst) { return LEVEL_COLOR[worst] || "#3fb27f"; }
 function sizeFor(count) { return 10 + Math.min(24, Math.sqrt(count || 0) * 3.5); }
@@ -277,6 +284,7 @@ function ensureDefs() {
 
 function render(nodes, links) {
   if (state.sim) { state.sim.stop(); state.sim = null; }
+  if (state.moduleSim) { state.moduleSim.stop(); state.moduleSim = null; }
   svg.selectAll("*").remove();
   const empty = document.getElementById("empty");
   if (empty) empty.remove();
@@ -308,10 +316,13 @@ function render(nodes, links) {
   // Fit all nodes into view (with padding). Called once the sim settles so the
   // whole arrangement is visible instead of landing zoomed into one cluster.
   function fitView(dur = 500) {
-    const xs = nodes.map(d => d.x), ys = nodes.map(d => d.y);
-    if (!xs.length || xs.some(v => v == null)) return;
-    const minX = Math.min(...xs), maxX = Math.max(...xs);
-    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    if (!nodes.length || nodes.some(d => d.x == null || d.y == null)) return;
+    // Bound by circle EXTENT (center ± radius), not centers — pack radii reach
+    // hundreds of px, so center-only bounds would clip the biggest modules.
+    const minX = Math.min(...nodes.map(d => d.x - (d.r || d.size || 0)));
+    const maxX = Math.max(...nodes.map(d => d.x + (d.r || d.size || 0)));
+    const minY = Math.min(...nodes.map(d => d.y - (d.r || d.size || 0)));
+    const maxY = Math.max(...nodes.map(d => d.y + (d.r || d.size || 0)));
     const gw = maxX - minX || 1, gh = maxY - minY || 1;
     const pad = 80;
     const k = Math.min((w - pad) / gw, (h - pad) / gh, 2);
@@ -354,18 +365,18 @@ function render(nodes, links) {
     });
 
     // Collect top-level modules (depth-1 dir circles + a synthetic root-files
-    // module) and freeze each descendant's offset from its module center. Later
-    // tasks move a module as one rigid body via (module.x+ox, module.y+oy); this
-    // task only computes the offsets — modules sit at their home position.
+    // module) and freeze each descendant's offset from its module center. A
+    // module moves as one rigid body via (module.x+ox, module.y+oy).
     state.modules = computeModules(root, offX, offY);
+    state.modules.forEach(m => { m.x = m.homeX; m.y = m.homeY; });
 
-    // Roll dep edges up into normalized cross-module coupling links (nothing
-    // consumes these yet — the module force sim is a later task).
+    // Roll dep edges up into normalized cross-module coupling links.
     state.moduleLinks = computeModuleLinks(nodes, links, state.modules);
 
-    // No forces yet (modules + coupling are later tasks): an alpha-0 sim just
-    // carries the pinned nodes through the existing tick handler unchanged.
-    sim = d3.forceSimulation(nodes).alpha(0).alphaTarget(0).stop();
+    // The 8-body coupling sim runs on ONLY the module centers; every file/sub-dir
+    // is placed rigidly from its module's offset. Not stored on `sim` (that var
+    // drives the flat view) — runLayout owns the module sim lifecycle instead.
+    sim = null;
   } else {
     // Flat force layout for the folder (top-level) view.
     state.modules = [];   // no pack modules in a flat scope — clear any stale ones
@@ -462,21 +473,59 @@ function render(nodes, links) {
         .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
     node.attr("transform", d => `translate(${d.x},${d.y})`);
   }
-  sim.on("tick", drawPositions);
-  // Pack view seeds every node at its pinned home and runs an inert sim, so no
-  // tick ever fires — paint the initial positions once. (The folder/flat view's
-  // live sim ticks on its own.)
-  if (hasHubs) drawPositions();
-  // Frame the whole arrangement once the layout has taken shape. Large graphs
-  // decay alpha slowly, so "end" is unreliable — fit on a fixed settle timer
-  // (scaled to node count), which is deterministic. The user can re-fit anytime
-  // via Reset view.
-  clearTimeout(state.fitTimer);
-  state.fitTimer = setTimeout(() => fitView(700), n > 400 ? 4500 : n > 50 ? 2000 : 900);
 
-  function dragStart(e, d) { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; }
+  if (hasHubs) {
+    // Rigid-body render: place every module descendant from its module center +
+    // frozen offset, then draw. The pack root carries no moduleId (never tagged
+    // by computeModules) so it is skipped — the forest has no enclosing circle.
+    const placeRigid = () => {
+      for (const d of nodes) {
+        const m = state.moduleById && state.moduleById.get(d.moduleId);
+        if (m) { d.x = m.x + d.ox; d.y = m.y + d.oy; }
+      }
+      drawPositions();
+    };
+    state.moduleById = new Map(state.modules.map(m => [m.id, m]));
+
+    // runLayout(slider): slider=0 is an EXPLICIT STATIC BYPASS (modules pinned at
+    // home — collision at R+8 would otherwise nudge them off the pure pack ideal).
+    // slider>0 runs an 8-body sim: radius-aware coupling distance, size-collision,
+    // and a RESIDUAL home spring (0.1 + 0.9*(1-slider), never 0 → orientation kept).
+    const maxWeight = Math.max(...state.moduleLinks.map(l => l.weight), 1e-9);
+    const gap = w => 12 + 88 * (1 - clamp01(w / maxWeight));   // strong pair → small gap
+    function runLayout(slider) {
+      if (state.moduleSim) { state.moduleSim.stop(); state.moduleSim = null; }
+      if (slider === 0) {
+        state.modules.forEach(m => { m.x = m.homeX; m.y = m.homeY; m.vx = m.vy = 0; });
+        placeRigid(); fitView(); return;
+      }
+      const hs = 0.1 + 0.9 * (1 - slider);
+      state.moduleSim = d3.forceSimulation(state.modules)
+        .force("couple", d3.forceLink(state.moduleLinks).id(m => m.id)
+            .distance(l => l.source.R + l.target.R + gap(l.weight))
+            .strength(l => couple(l.weight) * slider))
+        .force("collide", d3.forceCollide(m => m.R + 8))
+        .force("hx", d3.forceX(m => m.homeX).strength(hs))
+        .force("hy", d3.forceY(m => m.homeY).strength(hs))
+        .on("tick", placeRigid);
+    }
+    state.runLayout = runLayout;
+    runLayout(state.slider);
+    clearTimeout(state.fitTimer);
+    state.fitTimer = setTimeout(() => fitView(700), 900);
+  } else {
+    sim.on("tick", drawPositions);
+    // Frame the whole arrangement once the layout has taken shape. Large graphs
+    // decay alpha slowly, so "end" is unreliable — fit on a fixed settle timer
+    // (scaled to node count), which is deterministic. The user can re-fit anytime
+    // via Reset view.
+    clearTimeout(state.fitTimer);
+    state.fitTimer = setTimeout(() => fitView(700), n > 400 ? 4500 : n > 50 ? 2000 : 900);
+  }
+
+  function dragStart(e, d) { if (!e.active && sim) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; }
   function dragMove(e, d) { d.fx = e.x; d.fy = e.y; }
-  function dragEnd(e, d) { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }
+  function dragEnd(e, d) { if (!e.active && sim) sim.alphaTarget(0); d.fx = null; d.fy = null; }
 }
 
 // ---- data loading + drill-down (unchanged API contract) ----------------------
