@@ -65,7 +65,7 @@
     </div>
     <p class="stat" style="margin-top:10px">Node color = top-level module; ring = hygiene.
       Red edges import outside their own subtree (up/cross) — each must justify its cost.
-      Drag to rearrange; hover an edge to trace it.</p>
+      Drag to rearrange; hover or click a node to trace its imports.</p>
     <div id="detail"></div>
     <div id="note"></div>
   </aside>
@@ -416,11 +416,14 @@ function render(nodes, links) {
   }
   state.sim = sim;
 
-  // Draw order (bottom→top): hub spokes, allowed deps, then VIOLATION deps on
-  // top so layering violations (upward/cross-tree imports) are the loudest thing.
-  const rank = d => d.kind === "hub" ? 0 : d.violation ? 2 : 1;
-  const ordered = links.slice().sort((a, b) => rank(a) - rank(b));
   const DEP_OK = "#5b6b8f", VIOL = "#f7768e";
+  // Pack view: dep edges are HIDDEN by default (drawing all at once buries the
+  // pack). They're traced on hover/select instead (see the trace layer below), so
+  // the permanent line layer here only carries the flat/folder view's edges. In
+  // the pack view `link` binds nothing — drawPositions becomes a no-op on it.
+  // Draw order (bottom→top): hub spokes, allowed deps, then VIOLATION deps on top.
+  const rank = d => d.kind === "hub" ? 0 : d.violation ? 2 : 1;
+  const ordered = hasHubs ? [] : links.slice().sort((a, b) => rank(a) - rank(b));
   const link = gRoot.append("g").selectAll("line").data(ordered).enter().append("line")
     .attr("stroke", d => d.kind === "hub" ? "#2c3444" : d.violation ? VIOL : DEP_OK)
     .attr("stroke-opacity", d => d.kind === "hub" ? 0.3 : d.violation ? 0.85 : 0.5)
@@ -442,6 +445,64 @@ function render(nodes, links) {
     .style("cursor", "pointer")
     .call(d3.drag().on("start", dragStart).on("drag", dragMove).on("end", dragEnd));
 
+  // ---- pack view: trace a node's dep edges on hover/select ------------------
+  // Edges are hidden by default; hovering (or clicking to pin) a file/dir draws
+  // ONLY that node's own dep edges as arcs to their partners. A dir owns every
+  // dep touching a file in its (collapsed) subtree. Arcs paint red for layering
+  // violations (reuse each dep's precomputed `.violation`), else neutral DEP_OK.
+  const nodeById = new Map(nodes.map(d => [d.id, d]));
+  // id → [{other, violation}] over dep edges (both directions) touching that file.
+  const depsByFile = new Map();
+  const addDep = (from, other, violation) => {
+    if (!depsByFile.has(from)) depsByFile.set(from, []);
+    depsByFile.get(from).push({ other, violation });
+  };
+  if (hasHubs) {
+    for (const l of links) {
+      if (l.kind !== "dep") continue;
+      const s = nodeById.get(l.source), t = nodeById.get(l.target);
+      if (!s || !t) continue;
+      addDep(s.id, t, l.violation);
+      addDep(t.id, s, l.violation);
+    }
+  }
+  // The arcs to draw for a node: files trace their own deps (arc starts at the
+  // file); a dir traces every dep touching a file in its collapsed subtree (arc
+  // starts at that file). Each item is {from, other, violation}.
+  function edgesFor(d) {
+    if (d.kind === "file") return (depsByFile.get(d.id) || []).map(e => ({ from: d, ...e }));
+    if (d.kind !== "dir") return [];
+    const prefix = d.dir === "" ? "" : d.dir + "/";
+    const out = [];
+    for (const f of nodes) {
+      if (f.kind !== "file" || !(f.dir === d.dir || f.dir.startsWith(prefix))) continue;
+      for (const e of (depsByFile.get(f.id) || [])) out.push({ from: f, ...e });
+    }
+    return out;
+  }
+  const gTrace = gRoot.append("g").attr("class", "trace-layer").style("pointer-events", "none");
+  let pinned = null;   // selected node whose trace persists past mouseleave
+  function traceArc(a, b) {
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const off = Math.hypot(dx, dy) * 0.15;   // bow perpendicular to the chord
+    const cx = mx - dy / (Math.hypot(dx, dy) || 1) * off;
+    const cy = my + dx / (Math.hypot(dx, dy) || 1) * off;
+    return `M${a.x},${a.y}Q${cx},${cy} ${b.x},${b.y}`;
+  }
+  function drawTrace(d) {
+    gTrace.selectAll("path").data(edgesFor(d)).enter().append("path")
+      .attr("fill", "none")
+      .attr("stroke", e => e.violation ? VIOL : DEP_OK)
+      .attr("stroke-opacity", e => e.violation ? 0.9 : 0.6)
+      .attr("stroke-width", e => e.violation ? 2 : 1.3)
+      .attr("marker-end", "url(#arrow)")
+      .attr("d", e => traceArc(e.from, e.other));
+  }
+  function clearTrace() { gTrace.selectAll("*").remove(); }
+  // Clicking empty stage space (no node) deselects the pinned trace.
+  if (hasHubs) svg.on("click.trace", (e) => { if (e.target === svg.node()) { pinned = null; clearTrace(); } });
+
   // Pack view: FILE leaves fill by hygiene color (green/blue/amber/red — the health
   // signal is the leaf itself); DIR circles get a faint module-hue fill (fainter the
   // deeper they nest) with a worst-level-tinted thin stroke — nested territories that
@@ -458,6 +519,12 @@ function render(nodes, links) {
     .attr("stroke-width", d => d.kind === "dir" ? (hasHubs ? 1.2 : 3) : hasHubs ? 2 : 1.5)
     .attr("filter", d => hasHubs && d.kind === "dir" ? null : "url(#nshadow)")
     .on("click", (e, d) => {
+      if (hasHubs) {
+        e.stopPropagation();                 // don't let the stage-click handler clear
+        pinned = pinned === d ? null : d;    // toggle: re-clicking the same node deselects
+        clearTrace();
+        if (pinned) drawTrace(pinned);
+      }
       showDetail(d);
       if (d.kind === "folder") showFiles(d.label);           // top level → into a folder
       else if (d.kind === "dir" && d.canDrill) drillTo(d.drillTo);  // dir hub → descend
@@ -466,6 +533,7 @@ function render(nodes, links) {
       d3.select(this).transition().duration(150)
         .attr("r", d.size + 4).attr("stroke", "#c7d2fe").attr("stroke-width", d.kind === "dir" ? 4 : 3);
       d3.select(this.parentNode).select(".node-label").style("display", null);
+      if (hasHubs && !pinned) { clearTrace(); drawTrace(d); }   // transient trace unless one is pinned
     })
     .on("mouseleave", function (e, d) {
       d3.select(this).transition().duration(150)
@@ -475,6 +543,7 @@ function render(nodes, links) {
         .attr("stroke-width", d.kind === "dir" ? (hasHubs ? 1.2 : 3) : hasHubs ? 2 : 1.5);
       if (denseLabels && !labelsForced && !isModuleDir(d))
         d3.select(this.parentNode).select(".node-label").style("display", "none");
+      if (hasHubs && !pinned) clearTrace();   // clear transient trace (keep a pinned one)
     });
 
   // Drillable dir hubs (collapsed subtree) get a dashed outer ring cueing "click
@@ -513,6 +582,8 @@ function render(nodes, links) {
     link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
         .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
     node.attr("transform", d => `translate(${d.x},${d.y})`);
+    // keep a pinned trace glued to its (possibly still-moving) nodes
+    if (hasHubs && pinned) gTrace.selectAll("path").attr("d", e => traceArc(e.from, e.other));
   }
 
   if (hasHubs) {
