@@ -207,8 +207,39 @@ function computeModules(root, offX, offY) {
   return modules;
 }
 
+// Aggregate cross-module COUPLING into module-level links. Each dep edge (kind
+// "dep") maps its file endpoints → their owning module (node.moduleId, tagged by
+// computeModules). Same-module edges contribute nothing — only cross-module wiring
+// counts. Per unordered module pair we accumulate crossEdges, then NORMALIZE by
+// module size: weight = crossEdges / sqrt(nA*nB) (nX = module leaf count). This
+// surfaces modules DISPROPORTIONATELY entangled for their size — a small module
+// tightly bound to a big one outranks two big modules loosely linked — instead of
+// raw volume where big modules always dominate. Pure — mirrored VERBATIM in
+// tests/test_web/pack_layout_invariants.mjs (keep both in sync).
+function computeModuleLinks(nodes, links, modules) {
+  const modById = new Map(nodes.map(d => [d.id, d.moduleId]));
+  const nById = new Map(modules.map(m => [m.id, m.n]));
+  const cross = new Map();   // "a\x00b" (a<b) → crossEdges
+  for (const e of links) {
+    if (e.kind !== "dep") continue;
+    const a = modById.get(e.source), b = modById.get(e.target);
+    if (!a || !b || a === b) continue;   // unmapped endpoint or same module
+    const key = a < b ? a + "\x00" + b : b + "\x00" + a;
+    cross.set(key, (cross.get(key) || 0) + 1);
+  }
+  const moduleLinks = [];
+  for (const [key, crossEdges] of cross) {
+    const [a, b] = key.split("\x00");
+    const nA = nById.get(a), nB = nById.get(b);
+    if (!(nA > 0) || !(nB > 0)) continue;   // guard: module with no leaf count
+    moduleLinks.push({ source: a, target: b, weight: crossEdges / Math.sqrt(nA * nB) });
+  }
+  return moduleLinks;
+}
+
 const state = { graph: null, repoRoot: null, folder: null, subpath: "",
                 fileData: null, sim: null, mode: "soft",      // "soft" | "rigid"
+                modules: [], moduleLinks: [],                 // pack rigid bodies + cross-module coupling
                 labelMode: "auto" };                          // "auto" | "on" | "off"
 
 function colorFor(worst) { return LEVEL_COLOR[worst] || "#3fb27f"; }
@@ -328,12 +359,17 @@ function render(nodes, links) {
     // task only computes the offsets — modules sit at their home position.
     state.modules = computeModules(root, offX, offY);
 
+    // Roll dep edges up into normalized cross-module coupling links (nothing
+    // consumes these yet — the module force sim is a later task).
+    state.moduleLinks = computeModuleLinks(nodes, links, state.modules);
+
     // No forces yet (modules + coupling are later tasks): an alpha-0 sim just
     // carries the pinned nodes through the existing tick handler unchanged.
     sim = d3.forceSimulation(nodes).alpha(0).alphaTarget(0).stop();
   } else {
     // Flat force layout for the folder (top-level) view.
     state.modules = [];   // no pack modules in a flat scope — clear any stale ones
+    state.moduleLinks = [];   // and no cross-module coupling to aggregate
     const linkDist = n > 50 ? 70 : 110;
     sim = d3.forceSimulation(nodes)
       .force("link", d3.forceLink(links).id(d => d.id).distance(linkDist))

@@ -24,8 +24,11 @@
 //   5. RIGID BODY — every descendant carries a frozen (ox,oy) from its module
 //      center, so moving the module by (dx,dy) moves every descendant by exactly
 //      (dx,dy). We verify the offset math (no force sim in this task).
-// If you edit buildPackTree / computeModules in index.html, update the mirrors
-// below and keep green. Proven RED when the builder/module logic is absent.
+//   6. COUPLING — cross-module dep edges roll up to `moduleLinks` with weight =
+//      crossEdges / sqrt(nA*nB); same-module edges contribute 0. Normalizing lets
+//      a small-but-tangled pair OUTRANK a big-but-loosely-linked pair.
+// If you edit buildPackTree / computeModules / computeModuleLinks in index.html,
+// update the mirrors below and keep green. Proven RED when that logic is absent.
 
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
@@ -116,6 +119,35 @@ function computeModules(root, offX, offY) {
     modules.push({ id, homeX: hx, homeY: hy, R, n: rootFiles.length });
   }
   return modules;
+}
+// Aggregate cross-module COUPLING into module-level links. Each dep edge (kind
+// "dep") maps its file endpoints → their owning module (node.moduleId, tagged by
+// computeModules). Same-module edges contribute nothing — only cross-module wiring
+// counts. Per unordered module pair we accumulate crossEdges, then NORMALIZE by
+// module size: weight = crossEdges / sqrt(nA*nB) (nX = module leaf count). This
+// surfaces modules DISPROPORTIONATELY entangled for their size — a small module
+// tightly bound to a big one outranks two big modules loosely linked — instead of
+// raw volume where big modules always dominate. Pure — mirrored VERBATIM in
+// web/static/index.html (keep both in sync).
+function computeModuleLinks(nodes, links, modules) {
+  const modById = new Map(nodes.map(d => [d.id, d.moduleId]));
+  const nById = new Map(modules.map(m => [m.id, m.n]));
+  const cross = new Map();   // "a\x00b" (a<b) → crossEdges
+  for (const e of links) {
+    if (e.kind !== "dep") continue;
+    const a = modById.get(e.source), b = modById.get(e.target);
+    if (!a || !b || a === b) continue;   // unmapped endpoint or same module
+    const key = a < b ? a + "\x00" + b : b + "\x00" + a;
+    cross.set(key, (cross.get(key) || 0) + 1);
+  }
+  const moduleLinks = [];
+  for (const [key, crossEdges] of cross) {
+    const [a, b] = key.split("\x00");
+    const nA = nById.get(a), nB = nById.get(b);
+    if (!(nA > 0) || !(nB > 0)) continue;   // guard: module with no leaf count
+    moduleLinks.push({ source: a, target: b, weight: crossEdges / Math.sqrt(nA * nB) });
+  }
+  return moduleLinks;
 }
 // ---- end mirror ----
 
@@ -327,6 +359,63 @@ const zeroFileIds = zeroFileRun.modules.map(m => m.id);
 check("zero-file depth-1 dir is excluded from modules",
   !zeroFileIds.includes("mod:empty") && zeroFileIds.includes("mod:full"),
   `ids=[${zeroFileIds.join(", ")}]`);
+
+// (10) COUPLING-AGGREGATION (normalized entanglement): dep edges roll up to
+//     module-level `moduleLinks` with weight = crossEdges / sqrt(nA*nB); same-module
+//     edges contribute 0. The POINT of normalizing: a SMALL tightly-bound pair must
+//     outrank a BIG loosely-linked pair even though the big pair has more edges in
+//     absolute terms. Fixture: four depth-1 dir modules —
+//       small "sa","sb": 2 files each, 4 cross-edges  → 4/sqrt(2*2)      = 2.000
+//       big   "ba","bb": 25 files each, 6 cross-edges → 6/sqrt(25*25)    = 0.240
+//     plus same-module (intra "sa") edges that MUST NOT appear in moduleLinks.
+function couplingFixture() {
+  const ns = [];
+  const dirFiles = { "sa": 2, "sb": 2, "ba": 25, "bb": 25 };
+  for (const dir of Object.keys(dirFiles)) {
+    ns.push({ id: "dir:" + dir, kind: "dir", dir, label: dir });
+    for (let k = 0; k < dirFiles[dir]; k++)
+      ns.push({ id: `${dir}#${k}`, kind: "file", dir, label: `f${k}.py`, path: dir + "/f" + k });
+  }
+  const r = packLayout(ns, S);
+  r.each(pn => { const d = pn.data.src; if (d) { d.hx = pn.x + 50; d.hy = pn.y + 50; d.r = pn.r; } });
+  const mods = computeModules(r, 50, 50);   // tags node.moduleId
+  const dep = (s, t) => ({ source: s, target: t, kind: "dep" });
+  const links = [
+    // small-but-tangled: 4 cross-edges between sa and sb
+    dep("sa#0", "sb#0"), dep("sa#1", "sb#1"), dep("sb#0", "sa#0"), dep("sa#0", "sb#1"),
+    // big-but-loose: 6 cross-edges between ba and bb (more edges, far bigger modules)
+    dep("ba#0", "bb#0"), dep("ba#1", "bb#1"), dep("ba#2", "bb#2"),
+    dep("ba#3", "bb#3"), dep("ba#4", "bb#4"), dep("ba#5", "bb#5"),
+    // same-module noise (intra sa) — must contribute NOTHING to moduleLinks
+    dep("sa#0", "sa#1"), dep("sa#1", "sa#0"),
+    // a hub tree link — must be ignored (only kind:"dep" counts)
+    { source: "dir:sa", target: "sa#0", kind: "hub" },
+  ];
+  return { moduleLinks: computeModuleLinks(ns, links, mods), nodes: ns };
+}
+const cpl = couplingFixture();
+const pair = (ml, a, b) => ml.find(l =>
+  (l.source === "mod:" + a && l.target === "mod:" + b) ||
+  (l.source === "mod:" + b && l.target === "mod:" + a));
+const smallPair = pair(cpl.moduleLinks, "sa", "sb");
+const bigPair = pair(cpl.moduleLinks, "ba", "bb");
+check("cross-module dep edges roll up to a moduleLink per pair",
+  !!smallPair && !!bigPair && cpl.moduleLinks.length === 2,
+  `links=[${cpl.moduleLinks.map(l=>`${l.source}~${l.target}:${l.weight.toFixed(3)}`).join(", ")}]`);
+check("same-module edges contribute 0 (no self-pair moduleLink)",
+  !cpl.moduleLinks.some(l => l.source === l.target),
+  `links=[${cpl.moduleLinks.map(l=>`${l.source}~${l.target}`).join(", ")}]`);
+check("weight = crossEdges / sqrt(nA*nB): small pair = 4/sqrt(2*2) = 2.0",
+  smallPair && Math.abs(smallPair.weight - 4 / Math.sqrt(2 * 2)) < 1e-9,
+  smallPair ? `weight=${smallPair.weight}` : "absent");
+check("weight = crossEdges / sqrt(nA*nB): big pair = 6/sqrt(25*25) = 0.24",
+  bigPair && Math.abs(bigPair.weight - 6 / Math.sqrt(25 * 25)) < 1e-9,
+  bigPair ? `weight=${bigPair.weight}` : "absent");
+// THE point of normalizing: small-but-tangled OUTRANKS big-but-loose, even though
+// the big pair has MORE cross-edges (6 > 4) in absolute terms.
+check("normalized: small-but-tangled pair OUTRANKS big-but-loose pair",
+  smallPair && bigPair && smallPair.weight > bigPair.weight,
+  smallPair && bigPair ? `small=${smallPair.weight.toFixed(3)} > big=${bigPair.weight.toFixed(3)}` : "pair absent");
 
 console.log(`\n${fails===0?"ALL PASS":fails+" FAILURES"}`);
 process.exit(fails===0?0:1);
