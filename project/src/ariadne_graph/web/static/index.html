@@ -227,8 +227,9 @@ function render(data) {
   node.filter(d => d.kind === "dir" && d.id !== SCOPE)
     .on("click", (ev, d) => { ev.stopPropagation(); drillTo(d.id); });
 
-  // Label all dirs + stubs; label files only for smaller graphs (avoid a wall of text).
-  const labelData = data.nodes.filter(d => d.kind !== "file" || nFiles <= 250);
+  // Standing labels for dirs + stubs only; file names appear on hover (consistent
+  // across scopes — a drilled subtree must not switch file labels on).
+  const labelData = data.nodes.filter(d => d.kind !== "file");
   const label = g.append("g").selectAll("text").data(labelData)
     .join("text").attr("class","label")
     .classed("dir", d => d.kind === "dir").text(d => d.name);
