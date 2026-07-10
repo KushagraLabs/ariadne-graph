@@ -46,6 +46,8 @@
     <select id="repo"></select>
     <span id="crumbs"></span>
     <span style="flex:1"></span>
+    <button id="mode" title="Rigid shows the ideal clean structure; Soft lets coupling distort it to reveal incoherence">Soft coupling</button>
+    <button id="labels" title="Show or hide file name labels">Names: auto</button>
     <button id="reset">Reset view</button>
   </header>
   <div id="stage"><svg id="graph"></svg></div>
@@ -57,8 +59,13 @@
       <div><span class="dot" style="background:var(--warn)"></span> warning</div>
       <div><span class="dot" style="background:var(--error)"></span> error</div>
     </div>
-    <p class="stat" style="margin-top:10px">Node size = diagnostic count. Drag nodes
-      to rearrange; click a folder to drill into its files.</p>
+    <div class="legend" id="edge-legend">
+      <div><span class="dot" style="width:16px;height:3px;border-radius:1px;background:#5b6b8f"></span> import (downward, ok)</div>
+      <div><span class="dot" style="width:16px;height:3px;border-radius:1px;background:#f7768e"></span> layering violation</div>
+    </div>
+    <p class="stat" style="margin-top:10px">Node color = top-level module; ring = hygiene.
+      Red edges import outside their own subtree (up/cross) — each must justify its cost.
+      Drag to rearrange; hover an edge to trace it.</p>
     <div id="detail"></div>
     <div id="note"></div>
   </aside>
@@ -79,17 +86,51 @@ function dirColor(dir) {
     _dirColor.set(dir, DIR_PALETTE[_dirColor.size % DIR_PALETTE.length]);
   return _dirColor.get(dir);
 }
-// First path segment of a file relative to the open folder → its "department".
-function subdirOf(filePath, repoRoot, folder) {
+// File path relative to the open folder, e.g. "organs/knowledge/svc.py".
+function relOf(filePath, repoRoot, folder) {
   const base = `${repoRoot.replace(/\/$/, "")}/${folder}/`;
-  let rel = filePath.startsWith(base) ? filePath.slice(base.length)
-          : filePath.startsWith(`${folder}/`) ? filePath.slice(folder.length + 1)
-          : filePath;
-  const i = rel.indexOf("/");
-  return i > 0 ? rel.slice(0, i) : "(root)";
+  return filePath.startsWith(base) ? filePath.slice(base.length)
+       : filePath.startsWith(`${folder}/`) ? filePath.slice(folder.length + 1)
+       : filePath;
+}
+// Directory portion of a relative path ("organs/knowledge/svc.py" → "organs/knowledge");
+// a file directly under the folder root → "" (the synthetic root dir).
+function dirOf(rel) {
+  const i = rel.lastIndexOf("/");
+  return i > 0 ? rel.slice(0, i) : "";
+}
+// Parent directory id ("organs/knowledge" → "organs"; "organs" → ""; "" → null root).
+function parentDir(dir) {
+  if (dir === "") return null;
+  const i = dir.lastIndexOf("/");
+  return i > 0 ? dir.slice(0, i) : "";
+}
+// Layering rule: an import A→B is ALLOWED iff B's dir is A's dir or a descendant
+// of it (compose lower/same). Ancestors, cousins, other branches = VIOLATION
+// ("import only from your own subtree; upward/cross coupling must justify cost").
+function isViolation(dirA, dirB) {
+  if (dirA === dirB) return false;
+  const prefix = dirA === "" ? "" : dirA + "/";
+  return !dirB.startsWith(prefix);  // B not inside A's subtree
 }
 
-const state = { graph: null, repoRoot: null, folder: null, sim: null };
+// Hierarchical (tree) distance between two directory paths = steps from each up
+// to their lowest common ancestor, summed. Same dir → 0; sibling files' dirs
+// differ only in the last segment → 2; cross-organ → large. Drives coupling
+// force falloff: pull ∝ 1/(1+dist)² so distant (cross-tree) couplings pull
+// weakly and settle FAR, keeping organs from balling into the center.
+function treeDistance(dirA, dirB) {
+  if (dirA === dirB) return 0;
+  const a = dirA === "" ? [] : dirA.split("/");
+  const b = dirB === "" ? [] : dirB.split("/");
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return (a.length - i) + (b.length - i);  // steps up from A + steps up from B
+}
+
+const state = { graph: null, repoRoot: null, folder: null, subpath: "",
+                fileData: null, sim: null, mode: "soft",      // "soft" | "rigid"
+                labelMode: "auto" };                          // "auto" | "on" | "off"
 
 function colorFor(worst) { return LEVEL_COLOR[worst] || "#3fb27f"; }
 function sizeFor(count) { return 10 + Math.min(24, Math.sqrt(count || 0) * 3.5); }
@@ -132,10 +173,12 @@ function render(nodes, links) {
   ensureDefs();
 
   const n = nodes.length;
-  // Dense graphs (many nodes) hide always-on labels — they collide into noise.
-  // Initials stay inside the node; the full label appears on hover and when
-  // zoomed in past LABEL_ZOOM. Sparse graphs (folder view) always label.
-  const denseLabels = n > 200;
+  // Label visibility: "auto" hides file labels on dense graphs (>200) to avoid
+  // collision (reveal on hover/zoom); "on" forces all; "off" hides all files.
+  // Directory-hub labels always show (they name the modules).
+  const denseLabels = state.labelMode === "off" ? true
+                    : state.labelMode === "on" ? false
+                    : n > 200;
 
   const { w, h } = stageSize();
   gRoot = svg.append("g");
@@ -174,32 +217,72 @@ function render(nodes, links) {
 
   let sim;
   if (hasHubs) {
-    // Hierarchical (department) layout: directory hubs claim separated territory
-    // on a ring; each file is pulled hard toward its own hub so directories form
-    // distinct fans. Dependency edges are kept WEAK so cross-file coupling bends
-    // the fans (visible intermingling) without collapsing them into one ball.
-    const hubs = nodes.filter(d => d.kind === "dir");
+    // Radial "outward-drive" layout: every node is pushed OUTWARD from the center
+    // to a ring set by its depth (root pinned center, top dirs inner ring, files
+    // at the rim) — nodes "want to fly out", held back only by their relations.
+    // Tree springs keep children in their parent's wedge; dependency edges (weak)
+    // pull coupled nodes together, bending the rings inward where real coupling
+    // lives — so tight modules knot up and cross-tree imports visibly drag nodes
+    // out of place. No center gravity; the radial force replaces it.
+    const cx = w / 2, cy = h / 2;
+    const ring = Math.max(70, Math.min(w, h) / 9);   // px between depth rings
+    const maxDepth = Math.max(1, ...nodes.map(d => d.depth || 0));
+    const rigid = state.mode === "rigid";
     const byId = new Map(nodes.map(d => [d.id, d]));
-    // Seed hubs evenly on a ring so they don't start stacked.
-    const R = Math.min(w, h) * 0.36;
-    hubs.forEach((hb, i) => {
-      const a = (i / hubs.length) * 2 * Math.PI;
-      hb.x = w / 2 + R * Math.cos(a); hb.y = h / 2 + R * Math.sin(a);
-    });
-    const hubOf = d => d.kind === "file" ? byId.get("dir:" + d.dir) : d;
 
+    // Pin the synthetic root at dead center so the whole tree hangs off it.
+    const root = nodes.find(d => d.kind === "dir" && d.depth === 0);
+    if (root) { root.fx = cx; root.fy = cy; }
+
+    // SHELL placement: give every file a stable angle around its hub so siblings
+    // sit on one equidistant arc (a directory reads as a coherent petal-shell).
+    // Group files by their hub, then fan them across an angular slice.
+    const filesByHub = new Map();
+    nodes.forEach(d => { if (d.kind === "file") {
+      const h = "dir:" + d.dir; (filesByHub.get(h) || filesByHub.set(h, []).get(h)).push(d);
+    }});
+    filesByHub.forEach(arr => arr.forEach((d, k) => {
+      d.shellAngle = (k + 0.5) / arr.length * 2 * Math.PI;   // even spread
+      d.shellR = ring * 0.7;                                  // files ride just outside their hub
+    }));
+    // Seed positions on depth rings (golden-angle) so it starts unfolded.
+    nodes.forEach((d, i) => {
+      if (d.fx != null) return;
+      const a = (i * 2.399963);
+      const r = (d.depth || 0) * ring;
+      d.x = cx + r * Math.cos(a); d.y = cy + r * Math.sin(a);
+    });
+
+    const tgtKind = d => (typeof d.target === "object" ? d.target.kind : null);
     sim = d3.forceSimulation(nodes)
+      // Tree spring: stiff & short — files hug their hub, dirs hug their parent.
       .force("link", d3.forceLink(links).id(d => d.id)
-        .distance(d => d.kind === "hub" ? 28 : 60)
-        .strength(d => d.kind === "hub" ? 0.7 : 0.02))   // dep pull deliberately faint
-      .force("charge", d3.forceManyBody().strength(d => d.kind === "dir" ? -1400 : -24))
-      .force("collision", d3.forceCollide().radius(d => d.size + (d.kind === "dir" ? 14 : 3)))
-      // Pull each file toward ITS hub — this is what forms the fans.
-      .force("cx", d3.forceX(d => hubOf(d) ? hubOf(d).x : w / 2).strength(d => d.kind === "file" ? 0.35 : 0))
-      .force("cy", d3.forceY(d => hubOf(d) ? hubOf(d).y : h / 2).strength(d => d.kind === "file" ? 0.35 : 0))
-      // Keep hubs spread around the center.
-      .force("hubX", d3.forceX(w / 2).strength(d => d.kind === "dir" ? 0.02 : 0))
-      .force("hubY", d3.forceY(h / 2).strength(d => d.kind === "dir" ? 0.02 : 0));
+        .distance(d => d.kind === "hub" ? (tgtKind(d) === "file" ? ring * 0.7 : 40) : 70)
+        // KEY: dependency pull ∝ 1/(1+treeDistance)² — same-dir couples pull hard,
+        // cross-organ couples pull ~weakly so they settle FAR (no ball-up). In
+        // rigid mode coupling contributes NO positioning force (edges only).
+        .strength(d => d.kind === "hub" ? 0.9
+          : rigid ? 0 : 0.9 / Math.pow(1 + (d.dist || 0), 2)))
+      // Repulsion spreads siblings; hubs push harder to claim separate wedges.
+      .force("charge", d3.forceManyBody().strength(d =>
+        d.kind === "dir" ? -240 - 900 / (d.depth || 1) : -16).distanceMax(700))
+      .force("collision", d3.forceCollide().radius(d => d.size + (d.kind === "dir" ? 10 : 2.5)))
+      // Outward drive: dirs pulled to their depth ring (firm → crisp hierarchy).
+      .force("radial", d3.forceRadial(d => (d.depth || 0) * ring, cx, cy)
+        .strength(d => d.kind === "dir" ? 0.5 + 0.35 * ((d.depth || 1) / maxDepth) : 0))
+      // SHELL force: place each file at its hub's position + (shellR, shellAngle).
+      // Rigid → strong (files locked on a clean arc). Soft → gentler, so LCA-
+      // weighted coupling can bulge a file off-shell = visible incoherence cue.
+      .force("shellX", d3.forceX(d => {
+        if (d.kind !== "file") return cx;
+        const h = byId.get("dir:" + d.dir); if (!h) return cx;
+        return (h.x ?? cx) + d.shellR * Math.cos(d.shellAngle);
+      }).strength(d => d.kind === "file" ? (rigid ? 0.9 : 0.5) : 0))
+      .force("shellY", d3.forceY(d => {
+        if (d.kind !== "file") return cy;
+        const h = byId.get("dir:" + d.dir); if (!h) return cy;
+        return (h.y ?? cy) + d.shellR * Math.sin(d.shellAngle);
+      }).strength(d => d.kind === "file" ? (rigid ? 0.9 : 0.5) : 0));
   } else {
     // Flat force layout for the folder (top-level) view.
     const linkDist = n > 50 ? 70 : 110;
@@ -211,17 +294,22 @@ function render(nodes, links) {
   }
   state.sim = sim;
 
-  // Two link layers: faint hub spokes (no arrow) UNDER bright dependency edges.
-  const link = gRoot.append("g").selectAll("line").data(links).enter().append("line")
-    .attr("stroke", d => d.kind === "hub" ? "#2c3444" : "#5b6b8f")
-    .attr("stroke-opacity", d => d.kind === "hub" ? 0.35 : 0.7)
-    .attr("stroke-width", d => d.kind === "hub" ? 0.6 : Math.min(5, 1 + Math.log2((d.weight || 1) + 1)))
+  // Draw order (bottom→top): hub spokes, allowed deps, then VIOLATION deps on
+  // top so layering violations (upward/cross-tree imports) are the loudest thing.
+  const rank = d => d.kind === "hub" ? 0 : d.violation ? 2 : 1;
+  const ordered = links.slice().sort((a, b) => rank(a) - rank(b));
+  const DEP_OK = "#5b6b8f", VIOL = "#f7768e";
+  const link = gRoot.append("g").selectAll("line").data(ordered).enter().append("line")
+    .attr("stroke", d => d.kind === "hub" ? "#2c3444" : d.violation ? VIOL : DEP_OK)
+    .attr("stroke-opacity", d => d.kind === "hub" ? 0.3 : d.violation ? 0.85 : 0.5)
+    .attr("stroke-width", d => d.kind === "hub" ? 0.6
+      : (d.violation ? 1.5 : 1) * Math.min(5, 1 + Math.log2((d.weight || 1) + 1)))
     .attr("marker-end", d => d.kind === "hub" ? null : "url(#arrow)")
     .style("pointer-events", d => d.kind === "hub" ? "none" : null)
     .on("mouseenter", function (e, d) { if (d.kind !== "hub") d3.select(this).transition().duration(150)
-      .attr("stroke-opacity", 1).attr("stroke", "#89b4fa"); })
+      .attr("stroke-opacity", 1).attr("stroke", d.violation ? "#ff9eae" : "#89b4fa"); })
     .on("mouseleave", function (e, d) { if (d.kind !== "hub") d3.select(this).transition().duration(150)
-      .attr("stroke-opacity", 0.7).attr("stroke", "#5b6b8f"); });
+      .attr("stroke-opacity", d.violation ? 0.85 : 0.5).attr("stroke", d.violation ? VIOL : DEP_OK); });
 
   const node = gRoot.append("g").selectAll("g").data(nodes).enter().append("g")
     .style("cursor", "pointer")
@@ -236,7 +324,11 @@ function render(nodes, links) {
     .attr("stroke", d => hasHubs ? colorFor(d.worst) : "#0b0d11")
     .attr("stroke-width", d => d.kind === "dir" ? 3 : hasHubs ? 2 : 1.5)
     .attr("filter", "url(#nshadow)")
-    .on("click", (e, d) => { showDetail(d); if (d.kind === "folder") showFiles(d.label); })
+    .on("click", (e, d) => {
+      showDetail(d);
+      if (d.kind === "folder") showFiles(d.label);           // top level → into a folder
+      else if (d.kind === "dir" && d.canDrill) drillTo(d.drillTo);  // dir hub → descend
+    })
     .on("mouseenter", function (e, d) {
       d3.select(this).transition().duration(150)
         .attr("r", d.size + 4).attr("stroke", "#c7d2fe").attr("stroke-width", d.kind === "dir" ? 4 : 3);
@@ -249,6 +341,14 @@ function render(nodes, links) {
       if (denseLabels && !labelsForced && d.kind !== "dir")
         d3.select(this.parentNode).select(".node-label").style("display", "none");
     });
+
+  // Drillable dir hubs (collapsed subtree) get a dashed outer ring cueing "click
+  // to descend" — the visible affordance for progressive disclosure.
+  node.filter(d => d.kind === "dir" && d.canDrill).append("circle")
+    .attr("r", d => d.size + 5).attr("fill", "none")
+    .attr("stroke", d => d.color).attr("stroke-width", 1.5)
+    .attr("stroke-dasharray", "3 3").attr("stroke-opacity", 0.8)
+    .style("pointer-events", "none");
 
   // initials inside file/folder nodes; dir hubs get no initials (labelled below).
   node.filter(d => d.kind !== "dir").append("text").attr("class", "node-initials")
@@ -326,43 +426,119 @@ async function showFolders() {
   document.getElementById("note").textContent = "";
 }
 
+// How many directory levels below the current scope to expand at once. Deeper
+// dirs collapse into a hub you click to descend — keeps every view readable.
+const MAX_DEPTH = 2;
+
+// Fetch a folder's files once, cache, then render scoped to the folder root.
 async function showFiles(folder) {
   state.folder = folder;
-  crumbs();
+  state.subpath = "";
   const data = await j(`/api/graph/files?graph=${state.graph}&repo_root=${encodeURIComponent(state.repoRoot)}&folder=${encodeURIComponent(folder)}`);
-  const byPath = new Map(data.files.map(f => [f.file_path, f.id]));
+  state.fileData = data;
+  renderScope();
+}
 
-  // Bucket files by sub-directory ("department") and synthesize one hub per dir.
-  const dirCounts = new Map();
-  const fileNodes = data.files.map(f => {
-    const dir = subdirOf(f.file_path, state.repoRoot, folder);
-    dirCounts.set(dir, (dirCounts.get(dir) || 0) + 1);
-    return { id: f.id, label: f.name, kind: "file", path: f.file_path, dir,
-             color: dirColor(dir), worst: f.worst_level,
-             size: sizeFor(f.diagnostic_count), diag: f.diagnostic_count };
+// Descend into / jump to a sub-directory within the current folder.
+function drillTo(subpath) {
+  state.subpath = subpath;
+  renderScope();
+}
+
+// Build the radial view for the current (folder, subpath) scope. Files outside
+// the scope are excluded; dirs deeper than MAX_DEPTH collapse into a clickable
+// hub. Depths/violations are computed RELATIVE to the scope root.
+function renderScope() {
+  crumbs();
+  const { folder, subpath, fileData: data } = state;
+  const scope = subpath ? `${folder}/${subpath}` : folder;   // path we're rooted at
+  const scopePrefix = subpath ? subpath + "/" : "";
+
+  // relPath within the SCOPE (organs/knowledge/db/pg.py, scoped at organs → knowledge/db/pg.py)
+  const inScope = [];
+  for (const f of data.files) {
+    const rel = relOf(f.file_path, state.repoRoot, folder);
+    if (subpath && !rel.startsWith(scopePrefix)) continue;   // outside the drilled subtree
+    inScope.push({ f, srel: subpath ? rel.slice(scopePrefix.length) : rel });
+  }
+
+  const fileDir = new Map();          // file id → full dir (for violation test, absolute within folder)
+  const dirFileCount = new Map();     // collapsed dir (relative, ≤MAX_DEPTH) → direct file count
+  const allDirs = new Set([""]);
+  const collapsedInto = new Map();    // file id → the (possibly collapsed) dir hub it hangs from
+
+  const fileNodes = inScope.map(({ f, srel }) => {
+    const fullDir = dirOf(relOf(f.file_path, state.repoRoot, folder));  // absolute-in-folder, for isViolation
+    fileDir.set(f.id, fullDir);
+    const relDir = dirOf(srel);                     // dir relative to scope
+    // Collapse anything deeper than MAX_DEPTH into its MAX_DEPTH-level ancestor.
+    const segs = relDir === "" ? [] : relDir.split("/");
+    const shown = segs.slice(0, MAX_DEPTH).join("/");
+    dirFileCount.set(shown, (dirFileCount.get(shown) || 0) + 1);
+    for (let d = shown; d !== null; d = parentDir(d)) allDirs.add(d);
+    collapsedInto.set(f.id, shown);
+    const branch = srel.indexOf("/") > 0 ? srel.slice(0, srel.indexOf("/")) : "(root)";
+    const depth = (shown === "" ? 0 : shown.split("/").length) + 1;
+    return { id: f.id, label: f.name, kind: "file", path: f.file_path,
+             dir: shown, branch, depth, color: dirColor(scope + "/" + branch),
+             worst: f.worst_level, size: sizeFor(f.diagnostic_count), diag: f.diagnostic_count };
   });
-  const hubNodes = [...dirCounts].map(([dir, count]) => ({
-    id: "dir:" + dir, label: dir, kind: "dir", dir, color: dirColor(dir),
-    size: 14 + Math.min(30, Math.sqrt(count) * 3), file_count: count }));
+
+  // Subtree file counts for hub sizing + "is this hub collapsible?" (has deeper dirs).
+  const subtreeCount = new Map();
+  for (const dir of allDirs) {
+    let c = 0;
+    for (const [d, n] of dirFileCount) if (d === dir || d.startsWith(dir === "" ? "" : dir + "/")) c += n;
+    subtreeCount.set(dir, c);
+  }
+  // A shown-dir is "collapsed" (drillable) if any file under it lives deeper than shown.
+  const drillable = new Set();
+  for (const { f, srel } of inScope) {
+    const relDir = dirOf(srel);
+    const segs = relDir === "" ? [] : relDir.split("/");
+    if (segs.length > MAX_DEPTH) drillable.add(segs.slice(0, MAX_DEPTH).join("/"));
+  }
+
+  const hubNodes = [...allDirs].filter(dir => dir != null).map(dir => {
+    const branch = dir === "" ? "(root)" : dir.split("/")[0];
+    const canDrill = drillable.has(dir);
+    return { id: "dir:" + dir, kind: "dir", dir, branch, color: dirColor(scope + "/" + branch),
+             label: dir === "" ? (scope.split("/").pop() || folder) : dir.split("/").pop(),
+             depth: dir === "" ? 0 : dir.split("/").length,
+             drillTo: (subpath ? subpath + "/" : "") + dir, canDrill,
+             size: 10 + Math.min(28, Math.sqrt(subtreeCount.get(dir) || 1) * 2.4),
+             file_count: subtreeCount.get(dir) };
+  });
   const nodes = hubNodes.concat(fileNodes);
 
-  // Hub links: every file ties to its directory hub → nothing floats; a file
-  // linked ONLY to its hub is a visible orphan (not wired into any other file).
-  const hubLinks = fileNodes.map(f => ({
-    source: "dir:" + f.dir, target: f.id, weight: 1, kind: "hub" }));
-  // Real file→file dependency edges (the coupling / intermingling signal).
-  const depLinks = (data.edges || [])
-    .filter(e => byPath.has(e.source) && byPath.has(e.target))
-    .map(e => ({ source: byPath.get(e.source), target: byPath.get(e.target),
-                 weight: e.weight, kind: "dep" }));
-  render(nodes, hubLinks.concat(depLinks));
+  const treeLinks = [];
+  for (const dir of allDirs) {
+    const p = parentDir(dir);
+    if (p !== null) treeLinks.push({ source: "dir:" + p, target: "dir:" + dir, weight: 1, kind: "hub" });
+  }
+  fileNodes.forEach(f => treeLinks.push({ source: "dir:" + collapsedInto.get(f.id), target: f.id, weight: 1, kind: "hub" }));
 
-  const orphans = fileNodes.length - new Set(
-    depLinks.flatMap(e => [e.source, e.target])).size;
-  const note = document.getElementById("note");
-  note.textContent =
-    (data.truncated ? `Showing top ${data.files.length} of ${data.total} files (${data.truncated} hidden). ` : "") +
-    `${dirCounts.size} directories · ${orphans} files with no cross-file dependency.`;
+  const shown = new Set(fileNodes.map(f => f.id));
+  let violations = 0;
+  // Dependency edges reference file_path; map to node ids, keep only in-scope,
+  // classify each as a layering violation (import outside its own subtree).
+  const byPath = new Map(data.files.map(f => [f.file_path, f.id]));
+  const deps = (data.edges || [])
+    .map(e => ({ s: byPath.get(e.source), t: byPath.get(e.target), w: e.weight }))
+    .filter(e => shown.has(e.s) && shown.has(e.t))
+    .map(e => {
+      const dA = fileDir.get(e.s), dB = fileDir.get(e.t);
+      const viol = isViolation(dA, dB);
+      if (viol) violations++;
+      return { source: e.s, target: e.t, weight: e.w, kind: "dep",
+               violation: viol, dist: treeDistance(dA, dB) };
+    });
+  render(nodes, treeLinks.concat(deps));
+
+  const orphans = fileNodes.length - new Set(deps.flatMap(e => [e.source, e.target])).size;
+  const deeper = drillable.size ? ` · ${drillable.size} dirs collapsed (click to drill)` : "";
+  document.getElementById("note").textContent =
+    `${fileNodes.length} files · ${allDirs.size - 1} directories · ${violations} layering violations · ${orphans} unwired${deeper}.`;
 }
 
 function row(cls, text) { const d = document.createElement("div"); d.className = cls; d.textContent = text; return d; }
@@ -383,11 +559,28 @@ function showDetail(d) {
 function crumbs() {
   const c = document.getElementById("crumbs");
   c.replaceChildren();
+  const crumb = (text, onclick) => {
+    const a = document.createElement("a");
+    a.textContent = text; a.onclick = onclick; return a;
+  };
+  const sep = () => document.createTextNode(" ▸ ");
   const repo = state.repoRoot ? (state.repoRoot.split("/").pop() || state.repoRoot) : "";
-  const link = document.createElement("a");
-  link.textContent = repo; link.onclick = showFolders;
-  c.appendChild(link);
-  if (state.folder) c.appendChild(document.createTextNode(` ▸ ${state.folder}`));
+  c.appendChild(crumb(repo, showFolders));
+  if (state.folder) {
+    c.appendChild(sep());
+    c.appendChild(crumb(state.folder, () => drillTo("")));   // folder root
+    // each drilled sub-directory segment is its own clickable crumb
+    if (state.subpath) {
+      const segs = state.subpath.split("/");
+      let acc = "";
+      segs.forEach(seg => {
+        acc = acc ? acc + "/" + seg : seg;
+        const path = acc;
+        c.appendChild(sep());
+        c.appendChild(crumb(seg, () => drillTo(path)));
+      });
+    }
+  }
 }
 
 function showEmpty(msg) {
@@ -404,7 +597,21 @@ function resetView() {
   else if (state.zoom) svg.transition().duration(300).call(state.zoom.transform, d3.zoomIdentity);
 }
 
+// Re-render whatever view is active (after a mode/label toggle).
+function refresh() { state.folder ? renderScope() : showFolders(); }
+
 document.getElementById("reset").onclick = resetView;
+document.getElementById("mode").onclick = (e) => {
+  state.mode = state.mode === "soft" ? "rigid" : "soft";
+  e.target.textContent = state.mode === "soft" ? "Soft coupling" : "Rigid structure";
+  refresh();
+};
+document.getElementById("labels").onclick = (e) => {
+  state.labelMode = state.labelMode === "auto" ? "on"
+                  : state.labelMode === "on" ? "off" : "auto";
+  e.target.textContent = "Names: " + state.labelMode;
+  refresh();
+};
 loadRepos().catch(e => showEmpty(e.message));
 </script>
 </body>
