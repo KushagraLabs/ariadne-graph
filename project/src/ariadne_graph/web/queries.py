@@ -20,25 +20,6 @@ from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
 _LEVEL_RANK = {"error": 3, "warning": 2, "info": 1}
 
 
-def _folder_of(file_path: str, repo_root: str) -> str | None:
-    """Top-level folder of ``file_path`` relative to ``repo_root``.
-
-    Handles the graph's mixed path formats: some CodeFile paths are absolute
-    (under ``repo_root``), others are already repo-relative (``server/x.ts``).
-    A file directly under the root (no subfolder) returns ``None`` so it's
-    grouped as a root-level file, not a folder.
-    """
-    root = repo_root.rstrip("/") + "/"
-    if file_path.startswith(root):
-        rel = file_path[len(root):]
-    elif file_path.startswith("/"):
-        return None  # absolute but outside this repo root — not ours
-    else:
-        rel = file_path  # already repo-relative
-    head, sep, _ = rel.partition("/")
-    return head if sep else None
-
-
 async def _rows(store: SQLiteGraphStore, sql: str, params: tuple[Any, ...]) -> list[Any]:
     db = await store._connect()
     try:
@@ -74,73 +55,82 @@ WHERE e.graph_id = ?
 """
 
 
-async def folder_edges(
-    store: SQLiteGraphStore, graph_id: str, *, repo_root: str
-) -> list[dict[str, Any]]:
-    """Altitude 1 edges: folder→folder dependency, weighted by cross-file refs.
+def _rel(file_path: str, repo_root: str) -> str:
+    """Repo-relative path, handling the graph's mixed absolute/relative formats.
 
-    A reference from a file in folder A to a file in folder B contributes to an
-    A→B edge. Self-edges (within one folder) are dropped.
+    Mirrors ``_folder_of``'s prefix logic: strip ``repo_root`` from absolute paths
+    under it, leave already-relative paths as-is. Paths absolute but outside the
+    root keep their leading slash and land under a synthetic ``(external)`` root.
     """
-    rows = await _rows(store, _XREF_SQL, (graph_id,))
-    weights: dict[tuple[str, str], int] = {}
-    for r in rows:
-        src = _folder_of(r["sf"], repo_root)
-        tgt = _folder_of(r["tf"], repo_root)
-        if src is None or tgt is None or src == tgt:
-            continue
-        weights[(src, tgt)] = weights.get((src, tgt), 0) + 1
-    return [
-        {"source": s, "target": t, "weight": w} for (s, t), w in weights.items()
-    ]
+    root = repo_root.rstrip("/") + "/"
+    if file_path.startswith(root):
+        return file_path[len(root):]
+    if file_path.startswith("/"):
+        return "(external)" + file_path
+    return file_path
 
 
-async def file_edges(
-    store: SQLiteGraphStore, graph_id: str, *, repo_root: str, folder: str
-) -> list[dict[str, Any]]:
-    """Altitude 2 edges: file→file dependency within a folder's subtree.
+def _dir_of(rel_path: str) -> str:
+    """Directory portion of a repo-relative file path ('' for a root-level file)."""
+    head, sep, _ = rel_path.rpartition("/")
+    return head if sep else ""
 
-    Only edges where BOTH endpoints are files inside ``folder`` are returned, so
-    the edge set matches the file nodes shown at this altitude.
+
+# Test organs are exempt as IMPORTERS: a test reaching into the code it exercises
+# is expected, not a layering smell. (A non-test file reaching into a test organ's
+# internals is still a violation — the exemption is one-directional.)
+_TEST_ORGANS = {"tests", "test", "__tests__", "spec", "specs", "e2e"}
+
+
+def _is_violation(dir_a: str, dir_b: str) -> bool:
+    """Layering rule for an import from a file in ``dir_a`` to one in ``dir_b``.
+
+    ``dir_*`` are repo-relative directory paths. The top-level *organ* is the
+    first path segment. An import is ALLOWED (not a violation) when any of:
+
+      1. Same organ — A and B share the first segment. Any direction within your
+         own organ is fine (organ is the unit of encapsulation).
+      2. Organ front door — B sits directly at another organ's top level (its dir
+         IS a top-level organ, no deeper), e.g. ``src/x -> tests``.
+      3. Test importer — A is inside a test organ (``tests/``, ``spec/``, …). Tests
+         are meant to reach into the code they exercise, so they never violate.
+
+    A VIOLATION is a NON-test file reaching into a *different* organ's internals
+    (B one or more levels below its organ root), e.g. ``src/x -> tests/unit/y``.
+    Root-level files (empty dir) belong to no organ and never violate.
     """
-    abs_prefix = f"{repo_root.rstrip('/')}/{folder}/"
-    rel_prefix = f"{folder}/"
-
-    def _in_folder(path: str) -> bool:
-        return path.startswith(abs_prefix) or path.startswith(rel_prefix)
-
-    rows = await _rows(store, _XREF_SQL, (graph_id,))
-    weights: dict[tuple[str, str], int] = {}
-    for r in rows:
-        sf, tf = r["sf"], r["tf"]
-        if not _in_folder(sf) or not _in_folder(tf):
-            continue
-        weights[(sf, tf)] = weights.get((sf, tf), 0) + 1
-    return [
-        {"source": s, "target": t, "weight": w} for (s, t), w in weights.items()
-    ]
+    if dir_a == dir_b:
+        return False
+    organ_a = dir_a.split("/", 1)[0] if dir_a else ""
+    organ_b = dir_b.split("/", 1)[0] if dir_b else ""
+    if organ_a == organ_b:
+        return False               # same organ — always fine
+    if organ_a in _TEST_ORGANS:
+        return False               # test importer — exempt (one-directional)
+    # Different organ: OK only if B is that organ's top-level front door (no "/"),
+    # a violation if it reaches into the organ's internals.
+    return "/" in dir_b
 
 
-async def list_folders(
-    store: SQLiteGraphStore, graph_id: str, *, repo_root: str
-) -> list[dict[str, Any]]:
-    """Altitude 1: top-level folders as nodes, with file count + hygiene rollup.
+async def full_graph(store: SQLiteGraphStore, graph_id: str, *, repo_root: str) -> dict[str, Any]:
+    """Directory-driven node-link view: directory hubs + file leaves + real deps.
 
-    Returns one entry per top-level folder under ``repo_root`` for this graph,
-    each carrying ``file_count``, ``diagnostic_count`` and ``worst_level``.
+    Two node kinds:
+      * ``dir``  — one per directory path segment (full nesting), a containment
+        hub. Carries ``depth`` and a subtree hygiene rollup (worst of its files).
+      * ``file`` — a leaf, carrying ``module`` (top-level ancestor, for color) and
+        its own hygiene rollup.
+
+    Two edge kinds:
+      * ``tree`` — file→parent-dir and dir→parent-dir containment (the skeleton;
+        the link force pulls each directory's files into a cluster around its hub).
+      * ``dep``  — the SCIP-resolved file→file references from ``_XREF_SQL``.
+
+    Every file is kept (its tree edge is its reason to exist — a dependency-free
+    file is still an "employee" of its directory), unlike the flat view which
+    dropped isolates.
     """
-    # Diagnostics attach to SYMBOLS (function/method/import), not to CodeFile
-    # nodes, and every CodeDiagnostic node carries properties.file_path. So we
-    # aggregate diagnostics by file_path (a plain node scan), independent of the
-    # file-node scan, then bucket both into folders in Python.
-    file_rows = await _rows(
-        store,
-        """
-        SELECT file_path FROM nodes
-        WHERE graph_id = ? AND labels LIKE '%CodeFile%' AND file_path IS NOT NULL
-        """,
-        (graph_id,),
-    )
+    # file_path -> hygiene rollup (diagnostics attach to symbols, keyed by file_path).
     diag_rows = await _rows(
         store,
         """
@@ -150,82 +140,6 @@ async def list_folders(
         WHERE graph_id = ? AND labels LIKE '%CodeDiagnostic%'
         """,
         (graph_id,),
-    )
-
-    folders: dict[str, dict[str, Any]] = {}
-    for r in file_rows:
-        folder = _folder_of(r["file_path"], repo_root)
-        if folder is None:
-            continue  # root-level file; not a folder node in v1
-        bucket = folders.setdefault(
-            folder, {"folder": folder, "file_count": 0, "diagnostic_count": 0, "worst_level": None}
-        )
-        bucket["file_count"] += 1
-
-    for r in diag_rows:
-        if not r["file_path"]:
-            continue
-        folder = _folder_of(r["file_path"], repo_root)
-        if folder is None or folder not in folders:
-            continue
-        bucket = folders[folder]
-        bucket["diagnostic_count"] += 1
-        level = r["level"]
-        if level in _LEVEL_RANK:
-            cur = bucket["worst_level"]
-            if cur is None or _LEVEL_RANK[level] > _LEVEL_RANK[cur]:
-                bucket["worst_level"] = level
-
-    return sorted(folders.values(), key=lambda f: f["file_count"], reverse=True)
-
-
-async def count_files(
-    store: SQLiteGraphStore, graph_id: str, *, repo_root: str, folder: str
-) -> int:
-    """Total CodeFiles in ``folder``'s subtree for this graph (for truncation)."""
-    abs_prefix = f"{repo_root.rstrip('/')}/{folder}/%"
-    rel_prefix = f"{folder}/%"
-    rows = await _rows(
-        store,
-        """
-        SELECT COUNT(*) AS c FROM nodes
-        WHERE graph_id = ? AND labels LIKE '%CodeFile%'
-          AND file_path IS NOT NULL AND (file_path LIKE ? OR file_path LIKE ?)
-        """,
-        (graph_id, abs_prefix, rel_prefix),
-    )
-    return int(rows[0]["c"])
-
-
-async def list_files(
-    store: SQLiteGraphStore,
-    graph_id: str,
-    *,
-    repo_root: str,
-    folder: str,
-    limit: int = 2000,
-) -> list[dict[str, Any]]:
-    """Altitude 2: CodeFiles in ``folder``'s subtree, with hygiene paint.
-
-    Scoped by graph AND folder prefix. Each file carries ``diagnostic_count`` and
-    ``worst_level``. Capped at ``limit`` (pair with ``count_files`` for the
-    truncated total).
-    """
-    abs_prefix = f"{repo_root.rstrip('/')}/{folder}/%"
-    rel_prefix = f"{folder}/%"
-    # Per-file diagnostic rollup, keyed by the diagnostic node's file_path
-    # (diagnostics attach to symbols, not files — see list_folders).
-    diag_rows = await _rows(
-        store,
-        """
-        SELECT json_extract(properties, '$.file_path') AS file_path,
-               json_extract(properties, '$.level') AS level
-        FROM nodes
-        WHERE graph_id = ? AND labels LIKE '%CodeDiagnostic%'
-          AND (json_extract(properties, '$.file_path') LIKE ?
-               OR json_extract(properties, '$.file_path') LIKE ?)
-        """,
-        (graph_id, abs_prefix, rel_prefix),
     )
     diag_by_file: dict[str, dict[str, Any]] = {}
     for r in diag_rows:
@@ -243,31 +157,75 @@ async def list_files(
     file_rows = await _rows(
         store,
         """
-        SELECT id, file_path, json_extract(properties, '$.name') AS name
+        SELECT file_path, json_extract(properties, '$.name') AS name
         FROM nodes
-        WHERE graph_id = ? AND labels LIKE '%CodeFile%'
-          AND file_path IS NOT NULL AND (file_path LIKE ? OR file_path LIKE ?)
-        ORDER BY file_path
-        LIMIT ?
+        WHERE graph_id = ? AND labels LIKE '%CodeFile%' AND file_path IS NOT NULL
         """,
-        (graph_id, abs_prefix, rel_prefix, limit),
+        (graph_id,),
     )
 
-    files: list[dict[str, Any]] = []
+    nodes: dict[str, dict[str, Any]] = {}   # id -> node
+    tree_edges: list[dict[str, Any]] = []
+    files: dict[str, dict[str, Any]] = {}   # abs file_path -> file node (for dep join)
+
+    def _worse(a: str | None, b: str | None) -> str | None:
+        ra, rb = _LEVEL_RANK.get(a or "", 0), _LEVEL_RANK.get(b or "", 0)
+        return a if ra >= rb else b
+
     for r in file_rows:
-        diag = diag_by_file.get(r["file_path"], {"count": 0, "worst": None})
-        files.append(
-            {
-                "id": r["id"],
-                "file_path": r["file_path"],
-                "name": r["name"],
-                "diagnostic_count": diag["count"],
-                "worst_level": diag["worst"],
-            }
-        )
-    # Show the most-diagnosed files first (the hygiene focus).
-    files.sort(key=lambda f: f["diagnostic_count"], reverse=True)
-    return files
+        fp = r["file_path"]
+        rel = _rel(fp, repo_root)
+        parts = rel.split("/")
+        segments, leaf = parts[:-1], parts[-1]
+        module = segments[0] if segments else "(root)"
+
+        # Walk the directory chain, creating each hub once and linking it to its parent.
+        parent_id = None
+        for depth, seg in enumerate(segments):
+            dir_id = "/".join(segments[: depth + 1])
+            hub = nodes.get(dir_id)
+            if hub is None:
+                hub = nodes[dir_id] = {
+                    "id": dir_id, "kind": "dir", "name": seg,
+                    "module": module, "depth": depth, "worst_level": None,
+                }
+                if parent_id is not None:
+                    tree_edges.append({"source": dir_id, "target": parent_id, "kind": "tree"})
+            parent_id = dir_id
+
+        diag = diag_by_file.get(fp, {"count": 0, "worst": None})
+        node = nodes[fp] = {
+            "id": fp, "kind": "file", "name": r["name"] or leaf,
+            "module": module, "worst_level": diag["worst"],
+            "diagnostic_count": diag["count"],
+            # Repo-relative parent dir: drives the layering rule AND client-side
+            # subtree drill-down (a dir hub's id is the same rel-path form).
+            "dir": _dir_of(rel),
+        }
+        files[fp] = node
+        if parent_id is not None:
+            tree_edges.append({"source": fp, "target": parent_id, "kind": "tree"})
+
+        # Roll the file's hygiene up every ancestor directory (dept shows worst employee).
+        for depth in range(len(segments)):
+            dir_id = "/".join(segments[: depth + 1])
+            nodes[dir_id]["worst_level"] = _worse(nodes[dir_id]["worst_level"], diag["worst"])
+
+    xref = await _rows(store, _XREF_SQL, (graph_id,))
+    weights: dict[tuple[str, str], int] = {}
+    for r in xref:
+        sf, tf = r["sf"], r["tf"]
+        if sf in files and tf in files:
+            weights[(sf, tf)] = weights.get((sf, tf), 0) + 1
+    dep_edges = [
+        {
+            "source": s, "target": t, "weight": w, "kind": "dep",
+            "violation": _is_violation(files[s]["dir"], files[t]["dir"]),
+        }
+        for (s, t), w in weights.items()
+    ]
+
+    return {"nodes": list(nodes.values()), "edges": tree_edges + dep_edges}
 
 
 async def list_graphs(store: SQLiteGraphStore) -> list[dict[str, Any]]:

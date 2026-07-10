@@ -1,873 +1,327 @@
 <!doctype html>
-<html lang="en">
+<html>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ariadne — code graph</title>
-<script src="/graph/d3.min.js"></script>
+<title>Ariadne — dependency graph</title>
 <style>
   :root {
-    --bg: #0f1115; --panel: #171a21; --ink: #e6e9ef; --muted: #8b94a7;
-    --line: #262b36; --accent: #6ea8fe;
-    --ok: #3fb27f; --info: #6ea8fe; --warn: #e0a44a; --error: #e05a5a;
+    --bg: #0b0c10; --panel: #12141a; --ink: #e6e8ee; --dim: #8a90a0; --line: #232733;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  #app { display: grid; grid-template-columns: 1fr 320px; grid-template-rows: auto 1fr; height: 100%; }
-  header { grid-column: 1 / 3; display: flex; gap: 12px; align-items: center;
-    padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
-  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
-  select, button { background: #10131a; color: var(--ink); border: 1px solid var(--line);
-    border-radius: 6px; padding: 5px 9px; font-size: 13px; }
-  button { cursor: pointer; } button:hover { border-color: var(--accent); }
-  #couple-ctl { display: flex; align-items: center; gap: 8px; color: var(--muted);
-    font-size: 13px; cursor: pointer; }
-  #couple-ctl input[type=range] { accent-color: var(--accent); width: 120px; cursor: pointer; }
-  #coupling-val { min-width: 2ch; text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; }
-  #crumbs { color: var(--muted); font-size: 13px; }
-  #crumbs a { color: var(--accent); cursor: pointer; text-decoration: none; }
-  #stage { position: relative; width: 100%; height: 100%; overflow: hidden; }
-  #graph { width: 100%; height: 100%; display: block; cursor: grab; }
-  #graph:active { cursor: grabbing; }
-  #side { border-left: 1px solid var(--line); background: var(--panel); padding: 14px; overflow-y: auto; }
-  #side h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em;
-    color: var(--muted); margin: 0 0 8px; }
-  .legend div { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
-  .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
-  .sel-title { font-weight: 600; margin: 14px 0 4px; word-break: break-all; }
-  .stat { color: var(--muted); font-size: 13px; }
-  #note { color: var(--warn); font-size: 12px; margin-top: 10px; }
-  #empty { color: var(--muted); padding: 30px; position: absolute; }
-  .node-label { fill: #c7ccd6; font-size: 10px; pointer-events: none; }
-  .node-initials { fill: #fff; font-weight: 600; pointer-events: none; }
+    font: 13px/1.4 -apple-system, system-ui, sans-serif; overflow: hidden; }
+  #top { position: fixed; inset: 0 0 auto 0; height: 46px; display: flex; align-items: center;
+    gap: 16px; padding: 0 16px; background: rgba(11,12,16,.85); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line); z-index: 5; }
+  #top b { letter-spacing: .3px; }
+  #top select { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 7px; padding: 5px 8px; font: inherit; }
+  #top .stat { color: var(--dim); font-variant-numeric: tabular-nums; }
+  #crumbs { display: flex; align-items: center; gap: 4px; font-size: 12px; }
+  #crumbs a { color: var(--ink); cursor: pointer; text-decoration: none; padding: 2px 6px;
+    border-radius: 6px; background: var(--panel); border: 1px solid var(--line); }
+  #crumbs a:hover { border-color: #3a4152; background: #1a1d26; }
+  #crumbs .sep { color: var(--dim); }
+  #crumbs .cur { color: var(--dim); }
+  #graph { position: fixed; inset: 46px 0 0 0; }
+  .label { fill: var(--dim); font-size: 9px; pointer-events: none;
+    paint-order: stroke; stroke: var(--bg); stroke-width: 2.5px; }
+  .label.dir { fill: var(--ink); font-size: 11px; font-weight: 600; }
+  #legend { position: fixed; right: 14px; top: 60px; width: 210px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; z-index: 5; }
+  #legend h4 { margin: 0 0 8px; font-size: 11px; letter-spacing: .8px; color: var(--dim); text-transform: uppercase; }
+  #legend .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  #legend .sw { width: 11px; height: 11px; border-radius: 50%; }
+  #legend .ring { width: 11px; height: 11px; border-radius: 50%; background: transparent; }
+  #legend .dot { display: inline-block; }
+  #tip { position: fixed; pointer-events: none; background: #000; border: 1px solid var(--line);
+    padding: 6px 9px; border-radius: 7px; font-size: 12px; opacity: 0; transition: opacity .1s; z-index: 9; max-width: 340px; }
+  #tip .n { color: var(--ink); font-weight: 600; } #tip .p { color: var(--dim); font-size: 11px; }
+  #msg { position: fixed; inset: 46px 0 0 0; display: flex; align-items: center; justify-content: center;
+    color: var(--dim); z-index: 4; }
+  .node circle { cursor: pointer; }
 </style>
 </head>
 <body>
-<div id="app">
-  <header>
-    <h1>Ariadne</h1>
-    <select id="repo"></select>
-    <span id="crumbs"></span>
-    <span style="flex:1"></span>
-    <label id="couple-ctl" title="Ideal pack ↔ strong coupling: how far modules drift by cross-module entanglement">
-      Coupling
-      <input id="coupling" type="range" min="0" max="100" value="35">
-      <span id="coupling-val">35</span>
-    </label>
-    <button id="labels" title="Show or hide file name labels">Names: auto</button>
-    <button id="reset">Reset view</button>
-  </header>
-  <div id="stage"><svg id="graph"></svg></div>
-  <aside id="side">
-    <h2>Hygiene legend</h2>
-    <div class="legend">
-      <div><span class="dot" style="background:var(--ok)"></span> clean</div>
-      <div><span class="dot" style="background:var(--info)"></span> info</div>
-      <div><span class="dot" style="background:var(--warn)"></span> warning</div>
-      <div><span class="dot" style="background:var(--error)"></span> error</div>
-    </div>
-    <div class="legend" id="edge-legend">
-      <div><span class="dot" style="width:16px;height:3px;border-radius:1px;background:#5b6b8f"></span> import (downward, ok)</div>
-      <div><span class="dot" style="width:16px;height:3px;border-radius:1px;background:#f7768e"></span> layering violation</div>
-    </div>
-    <p class="stat" style="margin-top:10px">Node color = top-level module; ring = hygiene.
-      Red edges import outside their own subtree (up/cross) — each must justify its cost.
-      Drag to rearrange; hover or click a node to trace its imports.</p>
-    <div id="detail"></div>
-    <div id="note"></div>
-  </aside>
+<div id="top">
+  <b>Ariadne</b>
+  <select id="repo"></select>
+  <span id="crumbs"></span>
+  <span class="stat" id="counts"></span>
+  <span class="stat">click a directory to drill in · hover to trace · scroll to zoom · drag to pin</span>
 </div>
+<div id="legend">
+  <h4>Module (color)</h4>
+  <div id="mods"></div>
+  <h4 style="margin-top:12px">Hygiene (ring)</h4>
+  <div class="row"><span class="ring" style="border:2px solid #ef4444"></span> error</div>
+  <div class="row"><span class="ring" style="border:2px solid #f5a623"></span> warning</div>
+  <div class="row"><span class="ring" style="border:2px solid #4a90e2"></span> info</div>
+  <div class="row"><span class="ring" style="border:2px solid #3ecf8e"></span> clean</div>
+  <h4 style="margin-top:12px">Imports (→ points at the imported file)</h4>
+  <div class="row"><span class="dot" style="width:16px;height:0;border-top:2px solid #4a5a34"></span> allowed</div>
+  <div class="row"><span class="dot" style="width:16px;height:0;border-top:2px solid #f7768e"></span> layering violation</div>
+  <div style="margin-top:6px;color:var(--dim);font-size:11px;line-height:1.35">
+    Red = importing into another organ's internals. Same-organ or another organ's
+    top-level entry is fine.
+  </div>
+</div>
+<svg id="graph"></svg>
+<div id="msg">loading…</div>
+<script src="/graph/d3.min.js"></script>
 <script>
-const LEVEL_COLOR = { error: "#e05a5a", warning: "#e0a44a", info: "#6ea8fe", null: "#3fb27f" };
-// Categorical hues for directory groups — jewel-toned so distinct on dark bg
-// without turning neon. Files inherit their directory's hue; hygiene rides as a
-// thin ring so both "which module" and "how healthy" read at once.
-const DIR_PALETTE = [
-  "#7aa2f7", "#bb9af7", "#7dcfff", "#9ece6a", "#e0af68", "#f7768e",
-  "#2ac3de", "#c0caf5", "#ff9e64", "#41a6b5", "#b4f9f8", "#e69ac0",
-  "#89ddff", "#a6da95", "#eed49f", "#f5a97f", "#8aadf4", "#c6a0f6",
-];
-const _dirColor = new Map();
-function dirColor(dir) {
-  if (!_dirColor.has(dir))
-    _dirColor.set(dir, DIR_PALETTE[_dirColor.size % DIR_PALETTE.length]);
-  return _dirColor.get(dir);
-}
-// File path relative to the open folder, e.g. "organs/knowledge/svc.py".
-function relOf(filePath, repoRoot, folder) {
-  const base = `${repoRoot.replace(/\/$/, "")}/${folder}/`;
-  return filePath.startsWith(base) ? filePath.slice(base.length)
-       : filePath.startsWith(`${folder}/`) ? filePath.slice(folder.length + 1)
-       : filePath;
-}
-// Directory portion of a relative path ("organs/knowledge/svc.py" → "organs/knowledge");
-// a file directly under the folder root → "" (the synthetic root dir).
-function dirOf(rel) {
-  const i = rel.lastIndexOf("/");
-  return i > 0 ? rel.slice(0, i) : "";
-}
-// Parent directory id ("organs/knowledge" → "organs"; "organs" → ""; "" → null root).
-function parentDir(dir) {
-  if (dir === "") return null;
-  const i = dir.lastIndexOf("/");
-  return i > 0 ? dir.slice(0, i) : "";
-}
-// Layering rule: an import A→B is ALLOWED iff B's dir is A's dir or a descendant
-// of it (compose lower/same). Ancestors, cousins, other branches = VIOLATION
-// ("import only from your own subtree; upward/cross coupling must justify cost").
-function isViolation(dirA, dirB) {
-  if (dirA === dirB) return false;
-  const prefix = dirA === "" ? "" : dirA + "/";
-  return !dirB.startsWith(prefix);  // B not inside A's subtree
-}
+const HYGIENE = { error:"#ef4444", warning:"#f5a623", info:"#4a90e2", null:"#3ecf8e" };
+// Distinct hues per top-level module — the "which organ" color channel.
+const PALETTE = ["#7c9cff","#f78fb3","#63d2b1","#f6c453","#c78fff","#5ad1e6","#ff9f6e",
+                 "#9fd356","#e57373","#b0bec5","#ba8fff","#4dd0e1","#ffb74d","#81c784"];
 
-// Hierarchical (tree) distance between two directory paths = steps from each up
-// to their lowest common ancestor, summed. Same dir → 0; sibling files' dirs
-// differ only in the last segment → 2; cross-organ → large. Drives coupling
-// force falloff: pull ∝ 1/(1+dist)² so distant (cross-tree) couplings pull
-// weakly and settle FAR, keeping organs from balling into the center.
-function treeDistance(dirA, dirB) {
-  if (dirA === dirB) return 0;
-  const a = dirA === "" ? [] : dirA.split("/");
-  const b = dirB === "" ? [] : dirB.split("/");
-  let i = 0;
-  while (i < a.length && i < b.length && a[i] === b[i]) i++;
-  return (a.length - i) + (b.length - i);  // steps up from A + steps up from B
-}
-
-// Build a nested {name, dir, kind, src, children, value} tree from the flat scope
-// nodes (dir hubs + file leaves, each carrying `dir`). Directories nest by
-// parentDir; files attach as value:1 leaves under their (collapsed) dir. This is
-// the input to d3.hierarchy().sum(leaf=1) → d3.pack(): the pack's ENCLOSURE
-// mirrors this nesting, so containment (file inside its dir, child dir inside
-// parent) is guaranteed by construction. Pure — no d3, no DOM (mirrored verbatim
-// in tests/test_web/pack_layout_invariants.mjs).
-function buildPackTree(nodes) {
-  const treeByDir = new Map();
-  const mk = (dir, src) => ({ name: dir === "" ? "" : dir.split("/").pop(),
-    dir, kind: "dir", src, children: [], value: 0 });
-  for (const d of nodes) if (d.kind === "dir") treeByDir.set(d.dir, mk(d.dir, d));
-  if (!treeByDir.has("")) treeByDir.set("", mk("", null));
-  for (const d of nodes) {
-    if (d.kind !== "dir" || d.dir === "") continue;
-    (treeByDir.get(parentDir(d.dir)) || treeByDir.get("")).children.push(treeByDir.get(d.dir));
-  }
-  for (const d of nodes) {
-    if (d.kind !== "file") continue;
-    (treeByDir.get(d.dir) || treeByDir.get("")).children.push(
-      { name: d.label, dir: d.dir, kind: "file", src: d, value: 1 });
-  }
-  return treeByDir.get("");
-}
-
-// Identify TOP-LEVEL MODULES (rigid bodies) from a packed hierarchy `root`.
-// A module is a depth-1 DIRECTORY pack node, PLUS one synthetic "(root files)"
-// module holding any depth-1 leaf files (files directly under the scope root,
-// with no owning directory circle). The synthetic pack root is NOT a module and
-// is skipped when rendering. For every descendant of a module we FREEZE an offset
-// (ox,oy) = (node.hx − module.hx, node.hy − module.hy) onto its flat src node and
-// tag node.moduleId — so later a module can move as one body (module.x+ox, +oy).
-// Home positions (hx,hy) are pack coords shifted by (offX,offY). Pure — mirrored
-// VERBATIM in tests/test_web/pack_layout_invariants.mjs (keep both in sync).
-function computeModules(root, offX, offY) {
-  const modules = [];
-  const rootFiles = [];
-  for (const child of (root.children || [])) {
-    if (child.data.kind === "dir") {
-      const hx = child.x + offX, hy = child.y + offY;
-      const id = "mod:" + child.data.dir;
-      let n = 0;
-      child.each(pn => {
-        const d = pn.data.src; if (!d) return;
-        d.moduleId = id;
-        d.ox = (pn.x + offX) - hx;
-        d.oy = (pn.y + offY) - hy;
-        if (pn.data.kind === "file") n++;
-      });
-      // Drop degenerate empty dirs (no files anywhere in subtree): d3.pack gives
-      // them r=0, a degenerate rigid body for the later force sim (Task 4).
-      if (n > 0) modules.push({ id, homeX: hx, homeY: hy, R: child.r, n });
-    } else if (child.data.kind === "file") {
-      rootFiles.push(child);
-    }
-  }
-  if (rootFiles.length) {
-    // "synthetic:" prefix (not "mod:") so a real dir literally named "(root files)"
-    // — whose id is "mod:(root files)" — can never collide with this module.
-    const id = "synthetic:root-files";
-    // n = root-files array length here; for real dirs above n = full-subtree file
-    // count. Coincidentally both are "file count", but semantics differ. R is an
-    // ad-hoc bounding circle over the scattered root files, unlike real dirs which
-    // reuse child.r from d3.pack.
-    const hx = rootFiles.reduce((s, f) => s + f.x + offX, 0) / rootFiles.length;
-    const hy = rootFiles.reduce((s, f) => s + f.y + offY, 0) / rootFiles.length;
-    let R = 0;
-    for (const f of rootFiles) {
-      const d = f.data.src; if (!d) continue;
-      d.moduleId = id;
-      d.ox = (f.x + offX) - hx;
-      d.oy = (f.y + offY) - hy;
-      R = Math.max(R, Math.hypot(f.x + offX - hx, f.y + offY - hy) + f.r);
-    }
-    modules.push({ id, homeX: hx, homeY: hy, R, n: rootFiles.length });
-  }
-  return modules;
-}
-
-// Aggregate cross-module COUPLING into module-level links. Each dep edge (kind
-// "dep") maps its file endpoints → their owning module (node.moduleId, tagged by
-// computeModules). Same-module edges contribute nothing — only cross-module wiring
-// counts. Per unordered module pair we accumulate crossEdges, then NORMALIZE by
-// module size: weight = crossEdges / sqrt(nA*nB) (nX = module leaf count). This
-// surfaces modules DISPROPORTIONATELY entangled for their size — a small module
-// tightly bound to a big one outranks two big modules loosely linked — instead of
-// raw volume where big modules always dominate. Pure — mirrored VERBATIM in
-// tests/test_web/pack_layout_invariants.mjs (keep both in sync).
-function computeModuleLinks(nodes, links, modules) {
-  const modById = new Map(nodes.map(d => [d.id, d.moduleId]));
-  const nById = new Map(modules.map(m => [m.id, m.n]));
-  const cross = new Map();   // "a\x00b" (a<b) → crossEdges
-  for (const e of links) {
-    if (e.kind !== "dep") continue;
-    const a = modById.get(e.source), b = modById.get(e.target);
-    if (!a || !b || a === b) continue;   // unmapped endpoint or same module
-    const key = a < b ? a + "\x00" + b : b + "\x00" + a;
-    cross.set(key, (cross.get(key) || 0) + 1);
-  }
-  const moduleLinks = [];
-  for (const [key, crossEdges] of cross) {
-    const [a, b] = key.split("\x00");
-    const nA = nById.get(a), nB = nById.get(b);
-    if (!(nA > 0) || !(nB > 0)) continue;   // guard: module with no leaf count
-    moduleLinks.push({ source: a, target: b, weight: crossEdges / Math.sqrt(nA * nB) });
-  }
-  return moduleLinks;
-}
-
-const state = { graph: null, repoRoot: null, folder: null,
-                fileData: null, sim: null,
-                modules: [], moduleLinks: [],                 // pack rigid bodies + cross-module coupling
-                slider: 0.35,                                 // coupling strength 0..1 (0 = pure pack home)
-                labelMode: "auto" };                          // "auto" | "on" | "off"
-
-const clamp01 = x => Math.max(0, Math.min(1, x));
-// Map a normalized entanglement weight (crossEdges/sqrt(nA*nB), roughly [0.1,3])
-// to a d3 forceLink strength in [0,1]: clamp01 saturates strong pairs at 1 while
-// preserving ordering below 1.
-const couple = w => clamp01(w);
-
-function colorFor(worst) { return LEVEL_COLOR[worst] || "#3fb27f"; }
-
-// --- Pack dir-circle tinting (Task 5) ----------------------------------------
-// Directory territories read as nested boxes: a FAINT module-hue fill (fainter
-// the deeper the nesting, so containment reads visually) plus a thin stroke that
-// carries the dir's worst-hygiene tint (unhealthy modules glow even before you
-// drill in). Two independent color channels on one circle: hue = which module,
-// stroke = how healthy.
-const DIR_STROKE = "#3a4256";                 // base neutral dir outline
-// depth-1 ~12% opacity, deeper progressively fainter, floored so deep dirs don't
-// vanish. depth is the pack depth (1 = top-level module dir).
-function dirFillOpacity(depth) { return Math.max(0.03, 0.12 / Math.max(1, depth)); }
-// Blend the neutral stroke toward the worst-level hygiene color (0 = clean →
-// stays neutral; error/warn/info → tinted). d3.rgb interpolation, 55% toward hue.
-function dirStroke(worst) {
-  if (!worst) return DIR_STROKE;              // no diagnostics anywhere → plain outline
-  return d3.interpolateRgb(DIR_STROKE, colorFor(worst))(0.55);
-}
-function sizeFor(count) { return 10 + Math.min(24, Math.sqrt(count || 0) * 3.5); }
+const svg = d3.select("#graph"), tip = d3.select("#tip"), msg = d3.select("#msg");
+let sim = null;
+let FULL = null;      // the whole-graph payload (nodes + edges), unfiltered
+let SCOPE = null;     // current drill root: a dir id (rel-path), or null = full graph
 
 async function j(url) { const r = await fetch(url); if (!r.ok) throw new Error(await r.text()); return r.json(); }
 
-// ---- D3 force graph (live simulation; matches Lumen_Ai's KG tab feel) --------
-const svg = d3.select("#graph");
-let gRoot = null;  // zoom/pan container
-
-function stageSize() {
-  const s = document.getElementById("stage");
-  return { w: s.clientWidth, h: s.clientHeight };
+// True if a repo-relative path `p` is inside the scope subtree (or scope is root).
+function inScope(p, scope) {
+  return scope === null || p === scope || p.startsWith(scope + "/");
 }
 
-function ensureDefs() {
-  // One-time <defs>: gradients per hygiene level, drop shadow, arrowhead.
-  if (svg.select("defs").size()) return;
-  const defs = svg.append("defs");
-  Object.entries(LEVEL_COLOR).forEach(([k, c]) => {
-    const grad = defs.append("radialGradient").attr("id", "grad-" + k)
-      .attr("cx", "35%").attr("cy", "35%").attr("r", "65%");
-    grad.append("stop").attr("offset", "0%").attr("stop-color", d3.rgb(c).brighter(0.9));
-    grad.append("stop").attr("offset", "100%").attr("stop-color", c);
+// Filter the full graph to the current SCOPE subtree. Dep edges that cross the
+// boundary are redirected to a synthetic "external" stub node (one per outside
+// top-level organ) so coupling — and violations — to the rest stay visible.
+function subtree(full, scope) {
+  const nodes = full.nodes.filter(n =>
+    n.kind === "dir" ? inScope(n.id, scope) : inScope(n.dir, scope));
+  const kept = new Set(nodes.map(n => n.id));
+  const stubs = new Map();   // organ -> stub node
+  const edges = [];
+  // Emit FRESH edge objects with string endpoints — a prior forceLink pass may
+  // have mutated full.edges' source/target into (now-stale) node object refs.
+  for (const e of full.edges) {
+    const s = idOf(e.source), t = idOf(e.target);
+    if (e.kind === "tree") {
+      if (kept.has(s) && kept.has(t)) edges.push({ source: s, target: t, kind: "tree" });
+      continue;
+    }
+    const sIn = kept.has(s), tIn = kept.has(t);
+    if (sIn && tIn) {
+      edges.push({ source: s, target: t, weight: e.weight, kind: "dep", violation: e.violation });
+      continue;
+    }
+    if (!sIn && !tIn) continue;                 // wholly outside the subtree
+    // One endpoint outside: redirect it to an external stub for its organ.
+    const outsideNode = FILE_BY_ID.get(sIn ? t : s);
+    const organ = outsideNode ? outsideNode.module : "external";
+    const stubId = "→ " + organ;
+    if (!stubs.has(stubId))
+      stubs.set(stubId, { id: stubId, kind: "stub", name: stubId, module: organ, worst_level: null });
+    edges.push({ source: sIn ? s : stubId, target: sIn ? stubId : t,
+                 weight: e.weight, kind: "dep", violation: e.violation });
+  }
+  return { nodes: nodes.concat([...stubs.values()]), edges };
+}
+
+const idOf = n => typeof n === "object" ? n.id : n;
+let FILE_BY_ID = new Map();
+
+function drillTo(scope) { SCOPE = scope; renderScope(); }
+
+function renderCrumbs() {
+  const c = d3.select("#crumbs"); c.html("");
+  const segs = SCOPE ? SCOPE.split("/") : [];
+  const mk = (label, scope) => c.append("a").text(label).on("click", () => drillTo(scope));
+  mk("root", null);
+  let acc = "";
+  segs.forEach((seg, i) => {
+    acc = acc ? acc + "/" + seg : seg;
+    c.append("span").attr("class", "sep").text("›");
+    if (i === segs.length - 1) c.append("span").attr("class", "cur").text(seg);
+    else { const s = acc; mk(seg, s); }
   });
-  const sh = defs.append("filter").attr("id", "nshadow")
-    .attr("x", "-50%").attr("y", "-50%").attr("width", "200%").attr("height", "200%");
-  sh.append("feDropShadow").attr("dx", 0).attr("dy", 1).attr("stdDeviation", 2)
-    .attr("flood-color", "#000").attr("flood-opacity", 0.45);
-  defs.append("marker").attr("id", "arrow").attr("viewBox", "0 -5 10 10")
-    .attr("refX", 18).attr("refY", 0).attr("markerWidth", 6).attr("markerHeight", 6)
-    .attr("orient", "auto").append("path").attr("d", "M0,-5L10,0L0,5").attr("fill", "#4a5570");
 }
 
-function render(nodes, links) {
-  if (state.sim) { state.sim.stop(); state.sim = null; }
-  if (state.moduleSim) { state.moduleSim.stop(); state.moduleSim = null; }
-  svg.selectAll("*").remove();
-  const empty = document.getElementById("empty");
-  if (empty) empty.remove();
-  ensureDefs();
-
-  const n = nodes.length;
-  // Label visibility: "auto" hides file labels on dense graphs (>200) to avoid
-  // collision (reveal on hover/zoom); "on" forces all; "off" hides all files.
-  // Directory-hub labels always show (they name the modules).
-  const denseLabels = state.labelMode === "off" ? true
-                    : state.labelMode === "on" ? false
-                    : n > 200;
-
-  // A top-level MODULE dir = a depth-1 dir circle in the pack view (the ~8 organs).
-  // Its label is pinned on regardless of density/zoom; sub-dirs (depth>1) and files
-  // obey the dense rule. Folder-view items are kind "folder"/"file", never depth-1
-  // "dir", so this is inert there. Hoisted (function decl) — the zoom handler below
-  // closes over it before it fires.
-  function isModuleDir(d) { return d.kind === "dir" && d.depth === 1; }
-
-  const { w, h } = stageSize();
-  gRoot = svg.append("g");
-  let labelsForced = false;
-  const LABEL_ZOOM = 1.8;  // zoomed in past this → reveal all labels even when dense
-  const zoom = d3.zoom().scaleExtent([0.05, 4]).on("zoom", (e) => {
-    gRoot.attr("transform", e.transform);
-    const shouldForce = e.transform.k >= LABEL_ZOOM;
-    if (denseLabels && shouldForce !== labelsForced) {
-      labelsForced = shouldForce;
-      // Module labels stay pinned on; only sub-dir/file labels toggle with zoom.
-      gRoot.selectAll(".node-label")
-        .style("display", d => (labelsForced || isModuleDir(d)) ? null : "none");
-    }
-  });
-  svg.call(zoom);
-  state.zoom = zoom;  // Reset-view + auto-fit use this to reframe.
-
-  // Fit all nodes into view (with padding). Called once the sim settles so the
-  // whole arrangement is visible instead of landing zoomed into one cluster.
-  function fitView(dur = 500) {
-    if (!nodes.length || nodes.some(d => d.x == null || d.y == null)) return;
-    // Bound by circle EXTENT (center ± radius), not centers — pack radii reach
-    // hundreds of px, so center-only bounds would clip the biggest modules.
-    const minX = Math.min(...nodes.map(d => d.x - (d.r || d.size || 0)));
-    const maxX = Math.max(...nodes.map(d => d.x + (d.r || d.size || 0)));
-    const minY = Math.min(...nodes.map(d => d.y - (d.r || d.size || 0)));
-    const maxY = Math.max(...nodes.map(d => d.y + (d.r || d.size || 0)));
-    const gw = maxX - minX || 1, gh = maxY - minY || 1;
-    const pad = 80;
-    const k = Math.min((w - pad) / gw, (h - pad) / gh, 2);
-    const tx = w / 2 - k * (minX + maxX) / 2;
-    const ty = h / 2 - k * (minY + maxY) / 2;
-    const target = d3.zoomIdentity.translate(tx, ty).scale(k);
-    // Hidden tabs throttle requestAnimationFrame → a d3 zoom transition never
-    // advances; apply the transform directly so the fit still lands.
-    if (document.hidden) svg.call(zoom.transform, target);
-    else svg.transition().duration(dur).call(zoom.transform, target);
-  }
-  state.fitView = fitView;
-
-  // Drill = camera move. Zoom so a single circle (its current rendered position +
-  // radius; coupling offset already baked into d.x/d.y) fills the viewport. The
-  // whole tree is always laid out, so drilling never re-fetches or re-lays-out —
-  // it is pure zoom. The design calls this INSTANT camera movement, and applying
-  // the transform directly (not via a d3 transition) is also robust: d3 zoom
-  // transitions rely on requestAnimationFrame, which browsers throttle to ~0 in
-  // background/hidden tabs, so a transitioned zoom can silently never advance.
-  function zoomToNode(d, dur = 350) {
-    if (d == null || d.x == null || d.y == null) return;
-    const r = (d.r || d.size || 20) + 8;         // pad past the circle edge
-    const k = Math.min((w - 60) / (2 * r), (h - 60) / (2 * r), 4);
-    const tx = w / 2 - k * d.x, ty = h / 2 - k * d.y;
-    const target = d3.zoomIdentity.translate(tx, ty).scale(k);
-    if (document.hidden) svg.call(zoom.transform, target);              // no rAF → jump
-    else svg.transition().duration(dur).call(zoom.transform, target);  // smooth in a live tab
-  }
-  state.zoomToNode = zoomToNode;
-
-  const hasHubs = nodes.some(d => d.kind === "dir");
-  const charge = n > 200 ? -70 : n > 50 ? -200 : -340;
-
-  let sim;
-  if (hasHubs) {
-    // CIRCLE-PACK layout (rest state). d3.pack() on the directory tree: every
-    // directory is a circle enclosing its child dirs and file leaves, nested by
-    // hierarchy, area ∝ file count (relaxed — packing shape inflates enclosing
-    // radii; see the pack design "promise correction"). Each node keeps a frozen
-    // HOME (hx,hy) + pack radius r — the ideal position later tasks perturb with
-    // module-level coupling forces. This task only computes the home layout; the
-    // sim below is inert (every node pinned at home), so the existing tick/render
-    // pipeline draws the pack directly.
-    const S = Math.min(w, h) - 40;          // pack fills a centered square
-    const offX = (w - S) / 2, offY = (h - S) / 2;
-    const root = d3.hierarchy(buildPackTree(nodes))
-      .sum(d => d.value || 0)
-      .sort((a, b) => (b.value || 0) - (a.value || 0));
-    if (!(root.value > 0)) root.value = 1;   // empty scope: floor root so d3.pack doesn't divide by 0 → NaN
-    d3.pack().size([S, S]).padding(3)(root);
-
-    // Write the pack geometry back onto the flat scope nodes (keyed via `src`).
-    // Home = pack (x,y) shifted into stage coords; render radius = pack r. Pin
-    // every node at home (fx,fy) so the inert sim holds the exact pack shape.
-    root.each(pn => {
-      const d = pn.data.src; if (!d) return;   // skip the synthetic root wrapper
-      d.hx = pn.x + offX; d.hy = pn.y + offY; d.r = pn.r;
-      d.size = pn.r;                            // downstream circle/label sizing reads d.size
-      d.x = d.hx; d.y = d.hy; d.fx = d.hx; d.fy = d.hy;
-    });
-
-    // Collect top-level modules (depth-1 dir circles + a synthetic root-files
-    // module) and freeze each descendant's offset from its module center. A
-    // module moves as one rigid body via (module.x+ox, module.y+oy).
-    state.modules = computeModules(root, offX, offY);
-    state.modules.forEach(m => { m.x = m.homeX; m.y = m.homeY; });
-
-    // Roll dep edges up into normalized cross-module coupling links.
-    state.moduleLinks = computeModuleLinks(nodes, links, state.modules);
-
-    // The 8-body coupling sim runs on ONLY the module centers; every file/sub-dir
-    // is placed rigidly from its module's offset. Not stored on `sim` (that var
-    // drives the flat view) — runLayout owns the module sim lifecycle instead.
-    sim = null;
-  } else {
-    // Flat force layout for the folder (top-level) view.
-    state.modules = [];   // no pack modules in a flat scope — clear any stale ones
-    state.moduleLinks = [];   // and no cross-module coupling to aggregate
-    state.runLayout = null;   // stale pack sim runner must not fire on slider drag here
-    const linkDist = n > 50 ? 70 : 110;
-    sim = d3.forceSimulation(nodes)
-      .force("link", d3.forceLink(links).id(d => d.id).distance(linkDist))
-      .force("charge", d3.forceManyBody().strength(charge))
-      .force("center", d3.forceCenter(w / 2, h / 2))
-      .force("collision", d3.forceCollide().radius(d => d.size + 5));
-  }
-  state.sim = sim;
-
-  const DEP_OK = "#5b6b8f", VIOL = "#f7768e";
-  // Pack view: dep edges are HIDDEN by default (drawing all at once buries the
-  // pack). They're traced on hover/select instead (see the trace layer below), so
-  // the permanent line layer here only carries the flat/folder view's edges. In
-  // the pack view `link` binds nothing — drawPositions becomes a no-op on it.
-  // Draw order (bottom→top): hub spokes, allowed deps, then VIOLATION deps on top.
-  const rank = d => d.kind === "hub" ? 0 : d.violation ? 2 : 1;
-  const ordered = hasHubs ? [] : links.slice().sort((a, b) => rank(a) - rank(b));
-  const link = gRoot.append("g").selectAll("line").data(ordered).enter().append("line")
-    .attr("stroke", d => d.kind === "hub" ? "#2c3444" : d.violation ? VIOL : DEP_OK)
-    .attr("stroke-opacity", d => d.kind === "hub" ? 0.3 : d.violation ? 0.85 : 0.5)
-    .attr("stroke-width", d => d.kind === "hub" ? 0.6
-      : (d.violation ? 1.5 : 1) * Math.min(5, 1 + Math.log2((d.weight || 1) + 1)))
-    .attr("marker-end", d => d.kind === "hub" ? null : "url(#arrow)")
-    .style("pointer-events", d => d.kind === "hub" ? "none" : null)
-    .on("mouseenter", function (e, d) { if (d.kind !== "hub") d3.select(this).transition().duration(150)
-      .attr("stroke-opacity", 1).attr("stroke", d.violation ? "#ff9eae" : "#89b4fa"); })
-    .on("mouseleave", function (e, d) { if (d.kind !== "hub") d3.select(this).transition().duration(150)
-      .attr("stroke-opacity", d.violation ? 0.85 : 0.5).attr("stroke", d.violation ? VIOL : DEP_OK); });
-
-  // Draw order = pack DEPTH ascending, so parent dir circles render before (under)
-  // their children/descendants — otherwise a later-drawn parent would cover the
-  // leaves inside it. Flat/folder view has no meaningful depth nesting; the sort
-  // is stable and harmless there. `.data` keeps its own order for tick updates.
-  // Pack view: DROP the scope-root dir (depth 0) from the render — the model is a
-  // forest of top-level module territories, not one enclosing repository-root
-  // circle (once modules drift apart under coupling, an enclosing root circle is
-  // geometrically impossible). It still lives in `nodes` (carries the fit
-  // bounds); it just isn't drawn as a circle.
-  const drawNodes = hasHubs
-    ? nodes.filter(d => !(d.kind === "dir" && d.depth === 0))
-           .sort((a, b) => (a.depth || 0) - (b.depth || 0))
-    : nodes;
-  const node = gRoot.append("g").selectAll("g").data(drawNodes).enter().append("g")
-    .style("cursor", "pointer")
-    .call(d3.drag().on("start", dragStart).on("drag", dragMove).on("end", dragEnd));
-
-  // ---- pack view: trace a node's dep edges on hover/select ------------------
-  // Edges are hidden by default; hovering (or clicking to pin) a file/dir draws
-  // ONLY that node's own dep edges as arcs to their partners. A dir owns every
-  // dep touching a file in its (collapsed) subtree. Arcs paint red for layering
-  // violations (reuse each dep's precomputed `.violation`), else neutral DEP_OK.
-  const nodeById = new Map(nodes.map(d => [d.id, d]));
-  // id → [{other, violation}] over dep edges (both directions) touching that file.
-  const depsByFile = new Map();
-  const addDep = (from, other, violation) => {
-    if (!depsByFile.has(from)) depsByFile.set(from, []);
-    depsByFile.get(from).push({ other, violation });
-  };
-  if (hasHubs) {
-    for (const l of links) {
-      if (l.kind !== "dep") continue;
-      const s = nodeById.get(l.source), t = nodeById.get(l.target);
-      if (!s || !t) continue;
-      addDep(s.id, t, l.violation);
-      addDep(t.id, s, l.violation);
-    }
-  }
-  // The arcs to draw for a node: files trace their own deps (arc starts at the
-  // file); a dir traces every dep touching a file in its collapsed subtree (arc
-  // starts at that file). Each item is {from, other, violation}.
-  function edgesFor(d) {
-    if (d.kind === "file") return (depsByFile.get(d.id) || []).map(e => ({ from: d, ...e }));
-    if (d.kind !== "dir") return [];
-    const prefix = d.dir === "" ? "" : d.dir + "/";
-    const out = [];
-    for (const f of nodes) {
-      if (f.kind !== "file" || !(f.dir === d.dir || f.dir.startsWith(prefix))) continue;
-      for (const e of (depsByFile.get(f.id) || [])) out.push({ from: f, ...e });
-    }
-    return out;
-  }
-  const gTrace = gRoot.append("g").attr("class", "trace-layer").style("pointer-events", "none");
-  let pinned = null;   // selected node whose trace persists past mouseleave
-  function traceArc(a, b) {
-    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-    const dx = b.x - a.x, dy = b.y - a.y;
-    const off = Math.hypot(dx, dy) * 0.15;   // bow perpendicular to the chord
-    const cx = mx - dy / (Math.hypot(dx, dy) || 1) * off;
-    const cy = my + dx / (Math.hypot(dx, dy) || 1) * off;
-    return `M${a.x},${a.y}Q${cx},${cy} ${b.x},${b.y}`;
-  }
-  function drawTrace(d) {
-    gTrace.selectAll("path").data(edgesFor(d)).enter().append("path")
-      .attr("fill", "none")
-      .attr("stroke", e => e.violation ? VIOL : DEP_OK)
-      .attr("stroke-opacity", e => e.violation ? 0.9 : 0.6)
-      .attr("stroke-width", e => e.violation ? 2 : 1.3)
-      .attr("marker-end", "url(#arrow)")
-      .attr("d", e => traceArc(e.from, e.other));
-  }
-  function clearTrace() { gTrace.selectAll("*").remove(); }
-  // Clicking empty stage space (no node) deselects the pinned trace.
-  if (hasHubs) svg.on("click.trace", (e) => { if (e.target === svg.node()) { pinned = null; clearTrace(); } });
-
-  // Pack view: FILE leaves fill by hygiene color (green/blue/amber/red — the health
-  // signal is the leaf itself); DIR circles get a faint module-hue fill (fainter the
-  // deeper they nest) with a worst-level-tinted thin stroke — nested territories that
-  // glow when unhealthy. Folder view (no hubs) keeps the hygiene radial gradient.
-  const packFill = d => d.kind === "file" ? colorFor(d.worst) : d.color;
-  node.append("circle")
-    .attr("r", d => d.size)
-    .attr("fill", d => hasHubs ? packFill(d) : `url(#grad-${d.worst || "null"})`)
-    .attr("fill-opacity", d => hasHubs
-      ? (d.kind === "dir" ? dirFillOpacity(d.depth) : 0.92)
-      : (d.kind === "file" ? 0.92 : 1))
-    .attr("stroke", d => !hasHubs ? "#0b0d11"
-      : d.kind === "dir" ? dirStroke(d.worst) : colorFor(d.worst))
-    .attr("stroke-width", d => d.kind === "dir" ? (hasHubs ? 1.2 : 3) : hasHubs ? 2 : 1.5)
-    .attr("filter", d => hasHubs && d.kind === "dir" ? null : "url(#nshadow)")
-    .on("click", (e, d) => {
-      if (hasHubs) {
-        e.stopPropagation();                 // don't let the stage-click handler clear
-        pinned = pinned === d ? null : d;    // toggle: re-clicking the same node deselects
-        clearTrace();
-        if (pinned) drawTrace(pinned);
-      }
-      showDetail(d);
-      if (d.kind === "folder") showFiles(d.label);           // top level → into a folder
-      else if (hasHubs && d.kind === "dir") zoomToNode(d);    // dir circle → zoom in to fill view
-    })
-    .on("mouseenter", function (e, d) {
-      d3.select(this).transition().duration(150)
-        .attr("r", d.size + 4).attr("stroke", "#c7d2fe").attr("stroke-width", d.kind === "dir" ? 4 : 3);
-      d3.select(this.parentNode).select(".node-label").style("display", null);
-      if (hasHubs && !pinned) { clearTrace(); drawTrace(d); }   // transient trace unless one is pinned
-    })
-    .on("mouseleave", function (e, d) {
-      d3.select(this).transition().duration(150)
-        .attr("r", d.size)
-        .attr("stroke", !hasHubs ? "#0b0d11"
-          : d.kind === "dir" ? dirStroke(d.worst) : colorFor(d.worst))
-        .attr("stroke-width", d.kind === "dir" ? (hasHubs ? 1.2 : 3) : hasHubs ? 2 : 1.5);
-      if (denseLabels && !labelsForced && !isModuleDir(d))
-        d3.select(this.parentNode).select(".node-label").style("display", "none");
-      if (hasHubs && !pinned) clearTrace();   // clear transient trace (keep a pinned one)
-    });
-
-  // initials inside file/folder nodes; dir hubs get no initials (labelled below).
-  node.filter(d => d.kind !== "dir").append("text").attr("class", "node-initials")
-    .attr("dy", ".35em").attr("text-anchor", "middle")
-    .attr("font-size", d => Math.max(8, d.size * 0.7)).attr("fill", "#0b0d11")
-    .attr("font-weight", 700)
-    .text(d => (d.label || "").substring(0, 3).toUpperCase());
-  // full label below. TOP-LEVEL MODULE dirs (pack depth 1) ALWAYS show their name
-  // (the "organs" — never hidden by density/zoom). Sub-dir + file labels follow the
-  // dense rule (hidden when crowded, revealed on hover/zoom). Module labels sit a
-  // touch larger so the ~8 territory names anchor the view.
-  node.append("text").attr("class", "node-label").attr("text-anchor", "middle")
-    .attr("dy", d => d.size + 12)
-    .attr("font-size", d => isModuleDir(d) ? 14 : d.kind === "dir" ? 12 : 10)
-    .attr("font-weight", d => d.kind === "dir" ? 700 : 400)
-    .attr("fill", d => d.kind === "dir" ? d.color : "#c7ccd6")
-    .text(d => d.label)
-    .style("display", d => (denseLabels && !isModuleDir(d)) ? "none" : null);
-  // native tooltip; textContent-safe (d.label from disk file names)
-  node.append("title").text(d => d.kind === "folder"
-    ? `${d.label}\n${d.file_count} files · ${d.diag || 0} diagnostics`
-    : d.kind === "dir"
-    ? `${d.label}/\n${d.file_count} files`
-    : `${d.path || d.label}\n${d.dir ? d.dir + "/ · " : ""}${d.diag || 0} diagnostics${d.worst ? " · worst: " + d.worst : ""}`);
-
-  function drawPositions() {
-    link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
-        .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-    node.attr("transform", d => `translate(${d.x},${d.y})`);
-    // keep a pinned trace glued to its (possibly still-moving) nodes
-    if (hasHubs && pinned) gTrace.selectAll("path").attr("d", e => traceArc(e.from, e.other));
-  }
-
-  if (hasHubs) {
-    // Rigid-body render: place every module descendant from its module center +
-    // frozen offset, then draw. The pack root carries no moduleId (never tagged
-    // by computeModules) so it is skipped — the forest has no enclosing circle.
-    const placeRigid = () => {
-      for (const d of nodes) {
-        const m = state.moduleById && state.moduleById.get(d.moduleId);
-        if (m) { d.x = m.x + d.ox; d.y = m.y + d.oy; }
-      }
-      drawPositions();
-    };
-    state.moduleById = new Map(state.modules.map(m => [m.id, m]));
-
-    // runLayout(slider): slider=0 is an EXPLICIT STATIC BYPASS (modules pinned at
-    // home — collision at R+8 would otherwise nudge them off the pure pack ideal).
-    // slider>0 runs an 8-body sim: radius-aware coupling distance, size-collision,
-    // and a RESIDUAL home spring (0.1 + 0.9*(1-slider), never 0 → orientation kept).
-    const maxWeight = Math.max(...state.moduleLinks.map(l => l.weight), 1e-9);
-    const gap = w => 12 + 88 * (1 - clamp01(w / maxWeight));   // strong pair → small gap
-    function runLayout(slider) {
-      if (state.moduleSim) { state.moduleSim.stop(); state.moduleSim = null; }
-      if (slider === 0) {
-        state.modules.forEach(m => { m.x = m.homeX; m.y = m.homeY; m.vx = m.vy = 0; });
-        placeRigid(); fitView(); return;
-      }
-      const hs = 0.1 + 0.9 * (1 - slider);
-      state.moduleSim = d3.forceSimulation(state.modules)
-        .force("couple", d3.forceLink(state.moduleLinks).id(m => m.id)
-            .distance(l => l.source.R + l.target.R + gap(l.weight))
-            .strength(l => couple(l.weight) * slider))
-        .force("collide", d3.forceCollide(m => m.R + 8))
-        .force("hx", d3.forceX(m => m.homeX).strength(hs))
-        .force("hy", d3.forceY(m => m.homeY).strength(hs))
-        .on("tick", placeRigid);
-    }
-    state.runLayout = runLayout;
-    runLayout(state.slider);
-    clearTimeout(state.fitTimer);
-    state.fitTimer = setTimeout(() => fitView(700), 900);
-  } else {
-    sim.on("tick", drawPositions);
-    // Frame the whole arrangement once the layout has taken shape. Large graphs
-    // decay alpha slowly, so "end" is unreliable — fit on a fixed settle timer
-    // (scaled to node count), which is deterministic. The user can re-fit anytime
-    // via Reset view.
-    clearTimeout(state.fitTimer);
-    state.fitTimer = setTimeout(() => fitView(700), n > 400 ? 4500 : n > 50 ? 2000 : 900);
-  }
-
-  function dragStart(e, d) { if (!e.active && sim) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; }
-  function dragMove(e, d) { d.fx = e.x; d.fy = e.y; }
-  function dragEnd(e, d) { if (!e.active && sim) sim.alphaTarget(0); d.fx = null; d.fy = null; }
-}
-
-// ---- data loading + drill-down (unchanged API contract) ----------------------
-async function loadRepos() {
-  const { repos } = await j("/api/graph/repos");
-  const sel = document.getElementById("repo");
-  sel.innerHTML = "";
-  repos.filter(r => r.file_count > 0).forEach(r => {
-    const o = document.createElement("option");
-    o.value = r.graph_id; o.dataset.root = r.repo_root;
-    o.textContent = `${r.repo_root.split("/").pop() || r.repo_root} (${r.file_count} files)`;
-    sel.appendChild(o);
-  });
-  sel.onchange = () => selectRepo(sel.value, sel.selectedOptions[0].dataset.root);
-  if (sel.options.length) selectRepo(sel.value, sel.selectedOptions[0].dataset.root);
-  else showEmpty("No indexed repos with data.");
-}
-
-async function selectRepo(graph, root) {
-  state.graph = graph; state.repoRoot = root; state.folder = null;
-  await showFolders();
-}
-
-async function showFolders() {
-  state.folder = null;
-  crumbs();
-  const { folders, edges } = await j(`/api/graph/folders?graph=${state.graph}&repo_root=${encodeURIComponent(state.repoRoot)}`);
-  const ids = new Set(folders.map(f => "folder:" + f.folder));
-  const nodes = folders.map(f => ({
-    id: "folder:" + f.folder, label: f.folder, kind: "folder",
-    worst: f.worst_level, size: sizeFor(f.diagnostic_count),
-    file_count: f.file_count, diag: f.diagnostic_count }));
-  const links = (edges || [])
-    .filter(e => ids.has("folder:" + e.source) && ids.has("folder:" + e.target))
-    .map(e => ({ source: "folder:" + e.source, target: "folder:" + e.target, weight: e.weight }));
-  render(nodes, links);
-  document.getElementById("note").textContent = "";
-}
-
-// Fetch a folder's files once, cache, then render the folder's whole tree.
-async function showFiles(folder) {
-  state.folder = folder;
-  const data = await j(`/api/graph/files?graph=${state.graph}&repo_root=${encodeURIComponent(state.repoRoot)}&folder=${encodeURIComponent(folder)}`);
-  state.fileData = data;
-  renderScope();
-}
-
-// Build the pack view for the whole folder. Every directory level gets its own
-// circle (no depth collapse — d3.pack lays out the full tree, zoom handles
-// density; drilling is camera movement, not re-scoping). Depths/violations are
-// computed relative to the folder root.
 function renderScope() {
-  crumbs();
-  const { folder, fileData: data } = state;
-
-  const fileDir = new Map();          // file id → full dir (relative to folder; drives layering test)
-  const allDirs = new Set([""]);      // every directory level present, incl. the folder root ""
-  const subtreeCount = new Map();     // dir → file count in its whole subtree (for sizing)
-
-  const fileNodes = data.files.map(f => {
-    const rel = relOf(f.file_path, state.repoRoot, folder);
-    const relDir = dirOf(rel);                      // dir relative to folder root
-    fileDir.set(f.id, relDir);
-    for (let d = relDir; d !== null; d = parentDir(d)) {
-      allDirs.add(d);
-      subtreeCount.set(d, (subtreeCount.get(d) || 0) + 1);
-    }
-    const branch = rel.indexOf("/") > 0 ? rel.slice(0, rel.indexOf("/")) : "(root)";
-    const depth = (relDir === "" ? 0 : relDir.split("/").length) + 1;
-    return { id: f.id, label: f.name, kind: "file", path: f.file_path,
-             dir: relDir, branch, depth, color: dirColor(folder + "/" + branch),
-             worst: f.worst_level, size: sizeFor(f.diagnostic_count), diag: f.diagnostic_count };
-  });
-
-  // Worst hygiene level over all files in each dir's SUBTREE — so a dir circle's
-  // stroke can carry the worst-level tint (unhealthy modules read at dir level,
-  // per the pack design "Rendering"). Severity order: error > warning > info > clean.
-  const SEV = { error: 3, warning: 2, info: 1 };
-  const dirWorst = new Map();
-  for (const f of fileNodes) {
-    if (!f.worst) continue;
-    for (let d = f.dir; d !== null; d = parentDir(d)) {
-      const cur = dirWorst.get(d);
-      if (!cur || SEV[f.worst] > SEV[cur]) dirWorst.set(d, f.worst);
-    }
-  }
-
-  const hubNodes = [...allDirs].filter(dir => dir != null).map(dir => {
-    const branch = dir === "" ? "(root)" : dir.split("/")[0];
-    return { id: "dir:" + dir, kind: "dir", dir, branch, color: dirColor(folder + "/" + branch),
-             label: dir === "" ? (folder.split("/").pop() || folder) : dir.split("/").pop(),
-             depth: dir === "" ? 0 : dir.split("/").length,
-             worst: dirWorst.get(dir) || null,
-             size: 10 + Math.min(28, Math.sqrt(subtreeCount.get(dir) || 1) * 2.4),
-             file_count: subtreeCount.get(dir) };
-  });
-  const nodes = hubNodes.concat(fileNodes);
-
-  const treeLinks = [];
-  for (const dir of allDirs) {
-    const p = parentDir(dir);
-    if (p !== null) treeLinks.push({ source: "dir:" + p, target: "dir:" + dir, weight: 1, kind: "hub" });
-  }
-  fileNodes.forEach(f => treeLinks.push({ source: "dir:" + f.dir, target: f.id, weight: 1, kind: "hub" }));
-
-  const shown = new Set(fileNodes.map(f => f.id));
-  let violations = 0;
-  // Dependency edges reference file_path; map to node ids, keep only in-scope,
-  // classify each as a layering violation (import outside its own subtree).
-  const byPath = new Map(data.files.map(f => [f.file_path, f.id]));
-  const deps = (data.edges || [])
-    .map(e => ({ s: byPath.get(e.source), t: byPath.get(e.target), w: e.weight }))
-    .filter(e => shown.has(e.s) && shown.has(e.t))
-    .map(e => {
-      const dA = fileDir.get(e.s), dB = fileDir.get(e.t);
-      const viol = isViolation(dA, dB);
-      if (viol) violations++;
-      return { source: e.s, target: e.t, weight: e.w, kind: "dep",
-               violation: viol, dist: treeDistance(dA, dB) };
-    });
-  render(nodes, treeLinks.concat(deps));
-
-  const orphans = fileNodes.length - new Set(deps.flatMap(e => [e.source, e.target])).size;
-  document.getElementById("note").textContent =
-    `${fileNodes.length} files · ${allDirs.size - 1} directories · ${violations} layering violations · ${orphans} unwired.`;
+  renderCrumbs();
+  render(subtree(FULL, SCOPE));
 }
 
-function row(cls, text) { const d = document.createElement("div"); d.className = cls; d.textContent = text; return d; }
-
-function showDetail(d) {
-  // textContent everywhere: labels/paths come from on-disk file names — treat as untrusted.
-  const el = document.getElementById("detail");
-  el.replaceChildren();
-  el.appendChild(row("sel-title", d.kind === "dir" ? d.label + "/" : d.label));
-  if (d.kind === "dir") {
-    el.appendChild(row("stat", `${d.file_count} files in this directory`));
-  } else {
-    el.appendChild(row("stat", d.kind === "folder" ? `${d.file_count} files` : (d.path || "")));
-    el.appendChild(row("stat", `${d.diag || 0} diagnostics${d.worst ? " · worst: " + d.worst : ""}`));
-  }
-}
-
-function crumbs() {
-  const c = document.getElementById("crumbs");
-  c.replaceChildren();
-  const crumb = (text, onclick) => {
-    const a = document.createElement("a");
-    a.textContent = text; a.onclick = onclick; return a;
-  };
-  const sep = () => document.createTextNode(" ▸ ");
-  const repo = state.repoRoot ? (state.repoRoot.split("/").pop() || state.repoRoot) : "";
-  c.appendChild(crumb(repo, showFolders));   // ← up to the folder grid (re-fetch)
-  if (state.folder) {
-    c.appendChild(sep());
-    // The whole folder is always laid out; the folder crumb is a zoom-out target
-    // (fit all), not a re-scope. Drilling into sub-dirs is pure camera zoom.
-    c.appendChild(crumb(state.folder, () => resetView()));
-  }
-}
-
-function showEmpty(msg) {
+function render(data) {
+  if (sim) sim.stop();
   svg.selectAll("*").remove();
-  const s = document.getElementById("stage");
-  let e = document.getElementById("empty");
-  if (!e) { e = document.createElement("div"); e.id = "empty"; s.appendChild(e); }
-  e.textContent = msg;
+  const W = window.innerWidth, H = window.innerHeight - 46;
+  svg.attr("viewBox", [0,0,W,H]);
+
+  const mods = [...new Set(data.nodes.filter(n => n.kind !== "stub").map(n => n.module))].sort();
+  const color = d3.scaleOrdinal().domain(mods).range(PALETTE);
+  d3.select("#mods").selectAll("div").data(mods).join("div").attr("class","row")
+    .html(m => `<span class="sw" style="background:${color(m)}"></span>${m}`);
+  const nFiles = data.nodes.filter(n => n.kind === "file").length;
+  const nDirs = data.nodes.filter(n => n.kind === "dir").length;
+  const nDeps = data.edges.filter(e => e.kind === "dep").length;
+  d3.select("#counts").text(`${nFiles} files · ${nDirs} dirs · ${nDeps} deps · ${mods.length} modules`);
+
+  // childCount per dir (its subtree size) sizes the hub; file leaves are fixed-small.
+  const kids = new Map(data.nodes.map(n => [n.id, 0]));
+  data.edges.forEach(e => { if (e.kind === "tree") kids.set(e.target, (kids.get(e.target)||0)+1); });
+  const R = d => d.kind === "dir" ? 5 + Math.sqrt(kids.get(d.id)||0) * 2.2 : 3.5;
+
+  // Neighbor index (over BOTH edge kinds) for hover-trace.
+  const nbr = new Map(data.nodes.map(n => [n.id, new Set()]));
+  data.edges.forEach(e => { nbr.get(e.source)?.add(e.target); nbr.get(e.target)?.add(e.source); });
+
+  const g = svg.append("g");
+  svg.call(d3.zoom().scaleExtent([0.05, 6]).on("zoom", ev => g.attr("transform", ev.transform)));
+
+  // Tree edges are the rigid skeleton (short, strong) so files orbit their dir hub;
+  // dep edges are a soft overlay (longer, weak) that only nudges cross-file coupling.
+  sim = d3.forceSimulation(data.nodes)
+    .force("link", d3.forceLink(data.edges).id(d => d.id)
+      .distance(e => e.kind === "tree" ? 22 : 60)
+      .strength(e => e.kind === "tree" ? 0.7 : 0.05))
+    .force("charge", d3.forceManyBody().strength(d => d.kind === "dir" ? -220 : -30).distanceMax(500))
+    .force("center", d3.forceCenter(W/2, H/2))
+    .force("x", d3.forceX(W/2).strength(0.05))
+    .force("y", d3.forceY(H/2).strength(0.05))
+    .force("collide", d3.forceCollide(d => R(d) + 2))
+    // Cool to a hard stop so the layout settles and hover-targeting is stable
+    // (a warm sim drifts nodes out from under the cursor).
+    .alphaDecay(0.035).alphaMin(0.004);
+
+  // Arrowhead markers so dep edges show import DIRECTION (source -> target).
+  // One per color state (ok / violation / highlighted) since a marker's fill is fixed.
+  const defs = svg.append("defs");
+  const arrow = (id, fill) => defs.append("marker")
+    .attr("id", id).attr("viewBox", "0 -3 6 6").attr("refX", 6).attr("refY", 0)
+    .attr("markerWidth", 5).attr("markerHeight", 5).attr("orient", "auto")
+    .append("path").attr("d", "M0,-3L6,0L0,3").attr("fill", fill);
+  arrow("arr-ok", "#6b7a52"); arrow("arr-vio", "#f7768e"); arrow("arr-hi", "#f5a623");
+
+  const DEP_OK = "#4a5a34", DEP_VIO = "#f7768e";   // olive = allowed, red = layering violation
+  // Draw dep edges first (under), tree edges over them.
+  const dep = g.append("g").selectAll("line")
+    .data(data.edges.filter(e => e.kind === "dep")).join("line")
+    .attr("stroke", e => e.violation ? DEP_VIO : DEP_OK)
+    .attr("stroke-width", e => e.violation ? 0.9 : 0.5)
+    .attr("stroke-opacity", e => e.violation ? 0.75 : 0.4)
+    .attr("marker-end", e => e.violation ? "url(#arr-vio)" : "url(#arr-ok)");
+  const tree = g.append("g").selectAll("line")
+    .data(data.edges.filter(e => e.kind === "tree")).join("line")
+    .attr("stroke", "#2f3546").attr("stroke-width", 0.8);
+
+  const node = g.append("g").selectAll("g.node").data(data.nodes).join("g").attr("class","node");
+  node.append("circle")
+    .attr("r", R)
+    // Dir hubs read as containers (darkened module hue + bright hygiene ring);
+    // stubs are hollow grey markers for "the outside world".
+    .attr("fill", d => d.kind === "stub" ? "none"
+                     : d.kind === "dir" ? d3.rgb(color(d.module)).darker(1.1) : color(d.module))
+    .attr("stroke", d => d.kind === "stub" ? "#6b7280" : HYGIENE[d.worst_level])
+    .attr("stroke-width", d => d.kind === "dir" ? 2.2 : d.kind === "stub" ? 1.4 : 1.4)
+    .attr("stroke-dasharray", d => d.kind === "stub" ? "2,2" : null)
+    .attr("fill-opacity", d => d.kind === "dir" ? 0.85 : 1)
+    // A dir hub is drillable — cursor + click filters to its subtree.
+    .style("cursor", d => d.kind === "dir" ? "pointer" : "default");
+
+  // Directory hubs (except the current scope root itself) drill into their subtree.
+  node.filter(d => d.kind === "dir" && d.id !== SCOPE)
+    .on("click", (ev, d) => { ev.stopPropagation(); drillTo(d.id); });
+
+  // Label all dirs + stubs; label files only for smaller graphs (avoid a wall of text).
+  const labelData = data.nodes.filter(d => d.kind !== "file" || nFiles <= 250);
+  const label = g.append("g").selectAll("text").data(labelData)
+    .join("text").attr("class","label")
+    .classed("dir", d => d.kind === "dir").text(d => d.name);
+
+  node.filter(d => d.kind !== "stub").call(d3.drag()
+    .on("start", (ev,d) => { if(!ev.active) sim.alphaTarget(.3).restart(); d.fx=d.x; d.fy=d.y; })
+    .on("drag", (ev,d) => { d.fx=ev.x; d.fy=ev.y; })
+    .on("end", (ev,d) => { if(!ev.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }));
+
+  const touches = (e, id) => e.source.id === id || e.target.id === id;
+  // On-demand labels for the hovered node + its neighbors (so a file's name shows
+  // on hover even in big graphs where standing file labels are suppressed).
+  let hoverLabel = g.append("g").selectAll("text");
+
+  // Hover-to-trace: dim all but the node, its direct neighbors, and connecting edges.
+  // Directional: an edge is OUTGOING (this file imports it) vs INCOMING (imported by).
+  node.on("mouseenter", (ev,d) => {
+    const keep = new Set(nbr.get(d.id)); keep.add(d.id);
+    node.style("opacity", n => keep.has(n.id) ? 1 : 0.07);
+    tree.style("stroke", e => touches(e,d.id) ? "#f5a623" : "#2f3546")
+        .style("stroke-opacity", e => touches(e,d.id) ? 0.95 : 0.05);
+    dep.style("stroke", e => touches(e,d.id) ? (e.violation ? DEP_VIO : "#f5a623")
+                                             : (e.violation ? DEP_VIO : DEP_OK))
+       .style("stroke-opacity", e => touches(e,d.id) ? 0.95 : 0.04)
+       .attr("marker-end", e => !touches(e,d.id) ? (e.violation ? "url(#arr-vio)" : "url(#arr-ok)")
+                                : (e.violation ? "url(#arr-vio)" : "url(#arr-hi)"));
+    label.style("opacity", n => keep.has(n.id) ? 1 : 0.05);
+
+    // Render names for the hovered node + neighbors on top.
+    const named = data.nodes.filter(n => keep.has(n.id));
+    hoverLabel = hoverLabel.data(named, n => n.id).join("text")
+      .attr("class", "label").classed("dir", n => n.kind === "dir")
+      .style("opacity", 1).text(n => n.name)
+      .attr("x", n => n.x + 6).attr("y", n => n.y + 3);
+
+    const out = data.edges.filter(e => e.kind==="dep" && idOf(e.source)===d.id).length;
+    const inc = data.edges.filter(e => e.kind==="dep" && idOf(e.target)===d.id).length;
+    const kind = d.kind === "dir" ? `dir · ${kids.get(d.id)||0} children`
+      : `${d.module} · imports ${out} · imported by ${inc}`;
+    tip.style("opacity",1).html(`<div class="n">${d.name}</div>`+
+      `<div class="p">${kind} · ${d.worst_level||"clean"}</div>`);
+  }).on("mousemove", ev => tip.style("left",(ev.clientX+14)+"px").style("top",(ev.clientY+14)+"px"))
+    .on("mouseleave", () => {
+      node.style("opacity",1); label.style("opacity",1);
+      tree.style("stroke","#2f3546").style("stroke-opacity",1);
+      dep.style("stroke", e => e.violation ? DEP_VIO : DEP_OK)
+         .style("stroke-opacity", e => e.violation ? 0.75 : 0.4)
+         .attr("marker-end", e => e.violation ? "url(#arr-vio)" : "url(#arr-ok)");
+      hoverLabel = hoverLabel.data([], n => n.id).join("text");   // clear
+      tip.style("opacity",0);
+    });
+
+  // Stop a dep line just short of the target circle so its arrowhead is visible.
+  const shorten = (e, axis) => {
+    const dx = e.target.x - e.source.x, dy = e.target.y - e.source.y;
+    const len = Math.hypot(dx, dy) || 1, back = R(e.target) + 3;
+    const t = Math.max(0, (len - back) / len);
+    return axis === "x" ? e.source.x + dx * t : e.source.y + dy * t;
+  };
+
+  sim.on("tick", () => {
+    dep.attr("x1",e=>e.source.x).attr("y1",e=>e.source.y)
+       .attr("x2",e=>shorten(e,"x")).attr("y2",e=>shorten(e,"y"));
+    tree.attr("x1",e=>e.source.x).attr("y1",e=>e.source.y).attr("x2",e=>e.target.x).attr("y2",e=>e.target.y);
+    node.attr("transform", d => `translate(${d.x},${d.y})`);
+    label.attr("x", d=>d.x+6).attr("y", d=>d.y+3);
+    hoverLabel.attr("x", d=>d.x+6).attr("y", d=>d.y+3);
+  });
 }
 
-function resetView() {
-  // Re-frame the current view (fit all nodes); does NOT navigate away.
-  if (state.fitView) state.fitView(400);
-  else if (state.zoom) svg.transition().duration(300).call(state.zoom.transform, d3.zoomIdentity);
+async function loadRepo(repo) {
+  msg.style("display","flex").text("loading…");
+  try {
+    const data = await j(`/api/graph/full?graph=${repo.graph_id}&repo_root=${encodeURIComponent(repo.repo_root)}`);
+    if (!data.nodes.length) { msg.text("no dependency edges in this graph yet"); return; }
+    msg.style("display","none");
+    FULL = data;
+    FILE_BY_ID = new Map(data.nodes.filter(n => n.kind === "file").map(n => [n.id, n]));
+    SCOPE = null;                 // new repo resets to the full graph
+    renderScope();
+  } catch (e) { msg.text("error: " + e.message); }
 }
 
-// Re-render whatever view is active (after a label toggle).
-function refresh() { state.folder ? renderScope() : showFolders(); }
-
-document.getElementById("reset").onclick = resetView;
-// Coupling slider (0–100 → 0..1): re-runs ONLY the 8-body module sim in place
-// (no re-render), then re-fits once it settles. Drives state.slider, the single
-// source of truth. Re-fit is debounced so a fast drag doesn't fight the sim.
-const couplingInput = document.getElementById("coupling");
-const couplingVal = document.getElementById("coupling-val");
-couplingInput.oninput = (e) => {
-  const pct = +e.target.value;
-  couplingVal.textContent = pct;
-  state.slider = pct / 100;
-  if (!state.runLayout) return;                 // flat folder view: no module sim
-  state.runLayout(state.slider);                // slider=0 fits immediately; slider>0 starts the sim
-  clearTimeout(state.slideFitTimer);
-  if (state.slider > 0)                          // let the sim settle, then frame the new spread
-    state.slideFitTimer = setTimeout(() => state.fitView && state.fitView(400), 700);
-};
-document.getElementById("labels").onclick = (e) => {
-  state.labelMode = state.labelMode === "auto" ? "on"
-                  : state.labelMode === "on" ? "off" : "auto";
-  e.target.textContent = "Names: " + state.labelMode;
-  refresh();
-};
-loadRepos().catch(e => showEmpty(e.message));
+(async () => {
+  try {
+    const { repos } = await j("/api/graph/repos");
+    if (!repos.length) { msg.text("no indexed repos"); return; }
+    d3.select("#repo").selectAll("option").data(repos).join("option")
+      .attr("value", (_,i) => i).text(r => `${r.repo_root.split("/").pop()} (${r.file_count} files)`);
+    d3.select("#repo").on("change", function(){ loadRepo(repos[this.value]); });
+    loadRepo(repos[0]);
+  } catch (e) { msg.text("error: " + e.message); }
+})();
 </script>
 </body>
 </html>

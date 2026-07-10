@@ -1,13 +1,14 @@
 """Unit tests for the browser-view query layer (``web/queries.py``).
 
 Hard case first (per verification-first workflow): two graphs share one physical
-``graph.db``. Every viewer query MUST scope by ``graph_id`` — a folder/file query
-for graph A must never leak graph B's nodes. A fuzzy implementation that forgets
-the ``graph_id`` predicate gets this wrong.
+``graph.db``. ``full_graph`` MUST scope by ``graph_id`` — the node/edge set for
+graph A must never leak graph B's nodes. A fuzzy implementation that forgets the
+``graph_id`` predicate gets this wrong.
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ from ariadne_graph.web import queries
 
 
 @pytest.fixture
-async def store(tmp_path: Path) -> SQLiteGraphStore:
+async def store(tmp_path: Path) -> AsyncGenerator[SQLiteGraphStore, None]:
     db_path = tmp_path / "graph.db"
     store = SQLiteGraphStore(str(db_path))
     try:
@@ -36,114 +37,6 @@ def _file(node_id: str, graph_id: str, path: str) -> CodeNode:
     )
 
 
-async def test_folders_scoped_by_graph_id(store: SQLiteGraphStore) -> None:
-    """The hard case: graph A's folder list must exclude graph B's files."""
-    repo_a = "/Users/x/Documents/repo_a"
-    repo_b = "/Users/x/Documents/repo_b"
-    await store.add_nodes_batch(
-        "graphA",
-        [
-            _file("a1", "graphA", f"{repo_a}/src/one.py"),
-            _file("a2", "graphA", f"{repo_a}/src/two.py"),
-            _file("a3", "graphA", f"{repo_a}/tests/test_one.py"),
-        ],
-    )
-    await store.add_nodes_batch(
-        "graphB",
-        [
-            _file("b1", "graphB", f"{repo_b}/lib/other.py"),
-            _file("b2", "graphB", f"{repo_b}/lib/more.py"),
-        ],
-    )
-
-    folders_a = await queries.list_folders(store, "graphA", repo_root=repo_a)
-    names = {f["folder"] for f in folders_a}
-
-    # graphA has exactly src/ (2 files) and tests/ (1 file)
-    assert names == {"src", "tests"}
-    # graphB's lib/ must NOT appear
-    assert "lib" not in names
-    counts = {f["folder"]: f["file_count"] for f in folders_a}
-    assert counts["src"] == 2
-    assert counts["tests"] == 1
-
-
-async def test_files_in_folder_scoped(store: SQLiteGraphStore) -> None:
-    """File-altitude query is scoped to the folder subtree AND the graph."""
-    repo_a = "/Users/x/Documents/repo_a"
-    repo_b = "/Users/x/Documents/repo_b"
-    await store.add_nodes_batch(
-        "graphA",
-        [
-            _file("a1", "graphA", f"{repo_a}/src/one.py"),
-            _file("a2", "graphA", f"{repo_a}/src/sub/two.py"),
-            _file("a3", "graphA", f"{repo_a}/tests/t.py"),
-        ],
-    )
-    await store.add_nodes_batch(
-        "graphB",
-        [_file("b1", "graphB", f"{repo_b}/src/leak.py")],
-    )
-
-    files = await queries.list_files(store, "graphA", repo_root=repo_a, folder="src")
-    paths = {f["file_path"] for f in files}
-    # src/ subtree of graphA only (both one.py and sub/two.py), never graphB's src/leak.py
-    assert paths == {f"{repo_a}/src/one.py", f"{repo_a}/src/sub/two.py"}
-
-
-async def test_files_carry_diagnostic_level(store: SQLiteGraphStore) -> None:
-    """Hygiene paint: diagnostics attach to SYMBOLS carrying file_path (the real
-    schema — HAS_DIAGNOSTIC never targets a CodeFile), aggregated to the file by
-    path. A file with a warning + info reports worst_level=warning, count=2.
-    """
-    repo = "/Users/x/Documents/repo_a"
-    await store.add_nodes_batch(
-        "g",
-        [
-            _file("f1", "g", f"{repo}/src/one.py"),
-            # two CodeDiagnostic nodes, both pointing at one.py via file_path
-            CodeNode(
-                id="d1", graph_id="g", labels=["KnowledgeNode", "CodeDiagnostic"],
-                properties={"level": "warning", "rule": "complex_function",
-                            "file_path": f"{repo}/src/one.py"},
-            ),
-            CodeNode(
-                id="d2", graph_id="g", labels=["KnowledgeNode", "CodeDiagnostic"],
-                properties={"level": "info", "rule": "long_line",
-                            "file_path": f"{repo}/src/one.py"},
-            ),
-        ],
-    )
-
-    files = await queries.list_files(store, "g", repo_root=repo, folder="src")
-    one = next(f for f in files if f["file_path"] == f"{repo}/src/one.py")
-    assert one["diagnostic_count"] == 2
-    assert one["worst_level"] == "warning"
-
-
-async def test_mixed_absolute_and_relative_paths(store: SQLiteGraphStore) -> None:
-    """Real-world trap: one graph stores some file_paths absolute, some relative
-    (different languages/indexers). Both must bucket into the same folder.
-    """
-    repo = "/Users/x/Documents/repo_a"
-    await store.add_nodes_batch(
-        "g",
-        [
-            _file("f1", "g", f"{repo}/server/index.ts"),   # absolute
-            _file("f2", "g", "server/routes.ts"),          # relative
-            _file("f3", "g", "web/app.tsx"),               # relative, other folder
-        ],
-    )
-    folders = await queries.list_folders(store, "g", repo_root=repo)
-    counts = {f["folder"]: f["file_count"] for f in folders}
-    assert counts.get("server") == 2  # absolute + relative both counted
-    assert counts.get("web") == 1
-
-    files = await queries.list_files(store, "g", repo_root=repo, folder="server")
-    paths = {f["file_path"] for f in files}
-    assert paths == {f"{repo}/server/index.ts", "server/routes.ts"}
-
-
 def _sym(node_id: str, graph_id: str, path: str) -> CodeNode:
     """A code symbol node carrying its file_path (source/target of REFERENCES)."""
     return CodeNode(
@@ -153,144 +46,234 @@ def _sym(node_id: str, graph_id: str, path: str) -> CodeNode:
     )
 
 
-async def test_folder_edges_from_references(store: SQLiteGraphStore) -> None:
-    """Folder→folder edges come from cross-file REFERENCES; same-folder and
-    intra-file references are dropped.
+def _diag(node_id: str, graph_id: str, path: str, level: str) -> CodeNode:
+    return CodeNode(
+        id=node_id, graph_id=graph_id, labels=["KnowledgeNode", "CodeDiagnostic"],
+        properties={"level": level, "rule": "x", "file_path": path},
+    )
+
+
+
+def _nodes_by_id(result: dict) -> dict:
+    return {n["id"]: n for n in result["nodes"]}
+
+
+def _edge_kinds(result: dict, kind: str) -> list:
+    return [e for e in result["edges"] if e["kind"] == kind]
+
+
+async def test_full_graph_scoped_by_graph_id(store: SQLiteGraphStore) -> None:
+    """The hard case: graph A's node/edge set must exclude graph B entirely."""
+    repo_a = "/Users/x/Documents/repo_a"
+    repo_b = "/Users/x/Documents/repo_b"
+    await store.add_nodes_batch("graphA", [
+        _sym("a1", "graphA", f"{repo_a}/src/one.py"),
+        _sym("a2", "graphA", f"{repo_a}/src/two.py"),
+        _file("a1", "graphA", f"{repo_a}/src/one.py"),
+        _file("a2", "graphA", f"{repo_a}/src/two.py"),
+    ])
+    await store.add_edges_batch("graphA", [
+        CodeEdge(source="a1", target="a2", graph_id="graphA", rel_type="REFERENCES", properties={})])
+    await store.add_nodes_batch("graphB", [
+        _file("b1", "graphB", f"{repo_b}/lib/other.py"),
+    ])
+
+    g = await queries.full_graph(store, "graphA", repo_root=repo_a)
+    file_ids = {n["id"] for n in g["nodes"] if n["kind"] == "file"}
+    assert file_ids == {f"{repo_a}/src/one.py", f"{repo_a}/src/two.py"}
+    assert all("repo_b" not in n["id"] for n in g["nodes"])  # no graphB leak
+    # dep edge present between the two files (same dir -> not a violation)
+    assert _edge_kinds(g, "dep") == [
+        {"source": f"{repo_a}/src/one.py", "target": f"{repo_a}/src/two.py",
+         "weight": 1, "kind": "dep", "violation": False}]
+
+
+async def test_directory_hubs_and_tree_edges(store: SQLiteGraphStore) -> None:
+    """Full nesting: every path segment becomes a ``dir`` hub, linked to its parent
+    dir; each file links to its immediate parent dir. src/core/models/user.py yields
+    dirs src, src/core, src/core/models plus the file, chained by tree edges.
     """
     repo = "/Users/x/Documents/repo_a"
     await store.add_nodes_batch("g", [
-        _sym("a", "g", f"{repo}/server/index.ts"),
-        _sym("b", "g", f"{repo}/shared/util.ts"),
-        _sym("c", "g", f"{repo}/server/other.ts"),
+        _file("f1", "g", f"{repo}/src/core/models/user.py"),
     ])
-    await store.add_edges_batch("g", [
-        # server -> shared (counts)
-        CodeEdge(source="a", target="b", graph_id="g", rel_type="REFERENCES", properties={}),
-        # server -> server (same folder, dropped)
-        CodeEdge(source="a", target="c", graph_id="g", rel_type="REFERENCES", properties={}),
-    ])
+    g = await queries.full_graph(store, "g", repo_root=repo)
+    by = _nodes_by_id(g)
 
-    edges = await queries.folder_edges(store, "g", repo_root=repo)
-    assert edges == [{"source": "server", "target": "shared", "weight": 1}]
+    # dir hubs at every level, with correct depth
+    assert by["src"]["kind"] == "dir" and by["src"]["depth"] == 0
+    assert by["src/core"]["kind"] == "dir" and by["src/core"]["depth"] == 1
+    assert by["src/core/models"]["kind"] == "dir" and by["src/core/models"]["depth"] == 2
+    file = by[f"{repo}/src/core/models/user.py"]
+    assert file["kind"] == "file"
+    # File carries its repo-relative parent dir (drives client-side drill-down;
+    # matches the dir hub's id form so a subtree prefix filter works on both).
+    assert file["dir"] == "src/core/models"
 
-
-async def test_edges_scoped_by_graph(store: SQLiteGraphStore) -> None:
-    """Hard case: folder edges for graph A must not include graph B's references."""
-    repo = "/Users/x/Documents/repo_a"
-    await store.add_nodes_batch("gA", [
-        _sym("a1", "gA", f"{repo}/src/one.ts"), _sym("a2", "gA", f"{repo}/lib/two.ts"),
-    ])
-    await store.add_nodes_batch("gB", [
-        _sym("b1", "gB", f"{repo}/x/p.ts"), _sym("b2", "gB", f"{repo}/y/q.ts"),
-    ])
-    await store.add_edges_batch("gA", [
-        CodeEdge(source="a1", target="a2", graph_id="gA", rel_type="REFERENCES", properties={})])
-    await store.add_edges_batch("gB", [
-        CodeEdge(source="b1", target="b2", graph_id="gB", rel_type="REFERENCES", properties={})])
-
-    edges = await queries.folder_edges(store, "gA", repo_root=repo)
-    assert edges == [{"source": "src", "target": "lib", "weight": 1}]  # no x→y from gB
+    tree = {(e["source"], e["target"]) for e in _edge_kinds(g, "tree")}
+    assert ("src/core", "src") in tree                       # dir -> parent dir
+    assert ("src/core/models", "src/core") in tree
+    assert (f"{repo}/src/core/models/user.py", "src/core/models") in tree  # file -> parent dir
 
 
-async def test_file_edges_within_folder(store: SQLiteGraphStore) -> None:
-    """File→file edges only when both endpoints are inside the folder subtree."""
+async def test_files_are_never_dropped(store: SQLiteGraphStore) -> None:
+    """Behavior change from the flat view: a file with no deps and no diagnostics
+    is still an 'employee' of its directory, so it is KEPT (its tree edge is its
+    reason to exist). The flat view dropped such isolates; the dir view must not.
+    """
     repo = "/Users/x/Documents/repo_a"
     await store.add_nodes_batch("g", [
-        _sym("a", "g", f"{repo}/server/index.ts"),
-        _sym("b", "g", f"{repo}/server/db.ts"),
-        _sym("c", "g", f"{repo}/shared/util.ts"),
+        _file("iso", "g", f"{repo}/src/orphan.py"),   # no edge, no diagnostic
     ])
-    await store.add_edges_batch("g", [
-        CodeEdge(source="a", target="b", graph_id="g", rel_type="REFERENCES", properties={}),
-        CodeEdge(source="a", target="c", graph_id="g", rel_type="REFERENCES", properties={}),  # leaves folder
+    g = await queries.full_graph(store, "g", repo_root=repo)
+    file_ids = {n["id"] for n in g["nodes"] if n["kind"] == "file"}
+    assert f"{repo}/src/orphan.py" in file_ids
+    # and it is attached to its dir
+    assert (f"{repo}/src/orphan.py", "src") in {
+        (e["source"], e["target"]) for e in _edge_kinds(g, "tree")}
+
+
+async def test_hygiene_rolls_up_the_directory_chain(store: SQLiteGraphStore) -> None:
+    """A dept shows its worst employee: a warning on one deep file must roll up
+    worst_level=warning to EVERY ancestor dir, while a sibling-free clean file
+    leaves unrelated dirs clean.
+    """
+    repo = "/Users/x/Documents/repo_a"
+    await store.add_nodes_batch("g", [
+        _file("f1", "g", f"{repo}/src/core/bad.py"),
+        _diag("d1", "g", f"{repo}/src/core/bad.py", "warning"),
+        _file("f2", "g", f"{repo}/tests/ok.py"),   # clean, other subtree
     ])
+    g = await queries.full_graph(store, "g", repo_root=repo)
+    by = _nodes_by_id(g)
 
-    edges = await queries.file_edges(store, "g", repo_root=repo, folder="server")
-    assert edges == [{"source": f"{repo}/server/index.ts",
-                      "target": f"{repo}/server/db.ts", "weight": 1}]
+    assert by[f"{repo}/src/core/bad.py"]["worst_level"] == "warning"
+    assert by["src/core"]["worst_level"] == "warning"    # rolled up one level
+    assert by["src"]["worst_level"] == "warning"         # rolled up to the top
+    assert by["tests"]["worst_level"] is None            # untouched subtree stays clean
 
 
-async def test_file_edges_from_scip_resolved_python_calls(store: SQLiteGraphStore) -> None:
+async def test_dep_edges_from_scip_resolved_python_calls(store: SQLiteGraphStore) -> None:
     """Python graphs never emit REFERENCES — SCIP refines CALLS in place, tagging
-    the resolved ones ``resolved_by=scip-python``. The view must draw file→file
-    edges from those resolved cross-file CALLS, or a Python repo renders as
-    disconnected dots (the enterprise_tabular_ad bug).
+    resolved ones ``resolved_by=scip-python``. Those become ``dep`` edges; unresolved
+    bare-name CALLS must NOT (fuzzy targets = noise, the enterprise_tabular_ad bug).
     """
-    repo = "/Users/x/Documents/py_repo"
-    await store.add_nodes_batch("gpy", [
-        _sym("caller", "gpy", f"{repo}/scripts/train.py"),
-        _sym("callee", "gpy", f"{repo}/scripts/model.py"),
-        _sym("local", "gpy", f"{repo}/scripts/train.py"),
-    ])
-    await store.add_edges_batch("gpy", [
-        # SCIP-resolved cross-file call: train.py -> model.py (must draw)
-        CodeEdge(source="caller", target="callee", graph_id="gpy", rel_type="CALLS",
-                 properties={"resolved_by": "scip-python"}),
-        # unresolved bare-name CALLS (fuzzy target) — must NOT draw
-        CodeEdge(source="caller", target="local", graph_id="gpy", rel_type="CALLS",
-                 properties={}),
-    ])
-
-    edges = await queries.file_edges(store, "gpy", repo_root=repo, folder="scripts")
-    assert edges == [{"source": f"{repo}/scripts/train.py",
-                      "target": f"{repo}/scripts/model.py", "weight": 1}]
-
-
-async def test_folder_edges_from_scip_resolved_python_calls(store: SQLiteGraphStore) -> None:
-    """Folder→folder edges also come from SCIP-resolved Python CALLS."""
     repo = "/Users/x/Documents/py_repo"
     await store.add_nodes_batch("gpy", [
         _sym("caller", "gpy", f"{repo}/scripts/train.py"),
         _sym("callee", "gpy", f"{repo}/src/model.py"),
+        _sym("local", "gpy", f"{repo}/scripts/train.py"),
+        _file("caller", "gpy", f"{repo}/scripts/train.py"),
+        _file("callee", "gpy", f"{repo}/src/model.py"),
     ])
     await store.add_edges_batch("gpy", [
         CodeEdge(source="caller", target="callee", graph_id="gpy", rel_type="CALLS",
-                 properties={"resolved_by": "scip-python"}),
+                 properties={"resolved_by": "scip-python"}),   # resolved -> dep edge
+        CodeEdge(source="caller", target="local", graph_id="gpy", rel_type="CALLS",
+                 properties={}),                                # unresolved -> dropped
     ])
 
-    edges = await queries.folder_edges(store, "gpy", repo_root=repo)
-    assert edges == [{"source": "scripts", "target": "src", "weight": 1}]
+    g = await queries.full_graph(store, "gpy", repo_root=repo)
+    # scripts/ -> src (a top-level organ front door) is NOT a violation.
+    assert _edge_kinds(g, "dep") == [
+        {"source": f"{repo}/scripts/train.py", "target": f"{repo}/src/model.py",
+         "weight": 1, "kind": "dep", "violation": False}]
 
 
-async def test_unresolved_calls_do_not_draw_edges(store: SQLiteGraphStore) -> None:
-    """Bare-name (unresolved) CALLS must never become file→file edges — their
-    targets are fuzzy, so drawing them would be noise, not real dependency.
-    """
-    repo = "/Users/x/Documents/py_repo"
-    await store.add_nodes_batch("gpy", [
-        _sym("caller", "gpy", f"{repo}/scripts/a.py"),
-        _sym("callee", "gpy", f"{repo}/scripts/b.py"),
-    ])
-    await store.add_edges_batch("gpy", [
-        CodeEdge(source="caller", target="callee", graph_id="gpy", rel_type="CALLS",
-                 properties={}),  # no resolved_by
-    ])
-
-    edges = await queries.file_edges(store, "gpy", repo_root=repo, folder="scripts")
-    assert edges == []
-
-
-async def test_cap_and_truncation(store: SQLiteGraphStore) -> None:
-    """No silent capping: over-limit results report a truncated count."""
-    repo = "/Users/x/Documents/repo_a"
-    nodes = [_file(f"f{i}", "g", f"{repo}/src/file{i}.py") for i in range(10)]
-    await store.add_nodes_batch("g", nodes)
-
-    result = await queries.list_files(store, "g", repo_root=repo, folder="src", limit=4)
-    assert len(result) == 4  # capped
-    # the query layer exposes truncation via a sibling call
-    total = await queries.count_files(store, "g", repo_root=repo, folder="src")
-    assert total == 10
-
-
-async def test_default_file_cap_is_2000(store: SQLiteGraphStore) -> None:
-    """Default cap is 2000, not 500 — a large folder (e.g. lumen_platform, 1889
-    files) must render fully so its file→file edges have both endpoints present.
-    A 501-file folder is fully returned by the default limit.
+async def test_mixed_absolute_and_relative_paths(store: SQLiteGraphStore) -> None:
+    """Real-world trap: one graph stores some file_paths absolute, some relative.
+    Both must nest under the same dir hub (module derived from the top segment).
     """
     repo = "/Users/x/Documents/repo_a"
-    nodes = [_file(f"f{i}", "g", f"{repo}/src/file{i}.py") for i in range(501)]
-    await store.add_nodes_batch("g", nodes)
+    await store.add_nodes_batch("g", [
+        _file("a", "g", f"{repo}/server/index.ts"),   # absolute
+        _file("b", "g", "server/routes.ts"),          # relative, same folder
+    ])
+    g = await queries.full_graph(store, "g", repo_root=repo)
+    by = _nodes_by_id(g)
+    assert by[f"{repo}/server/index.ts"]["module"] == "server"
+    assert by["server/routes.ts"]["module"] == "server"
+    # both attach to the single "server" dir hub
+    tree = {(e["source"], e["target"]) for e in _edge_kinds(g, "tree")}
+    assert (f"{repo}/server/index.ts", "server") in tree
+    assert ("server/routes.ts", "server") in tree
 
-    result = await queries.list_files(store, "g", repo_root=repo, folder="src")
-    assert len(result) == 501  # not clipped at the old 500 default
+
+def _dep(result: dict) -> dict:
+    """Map (rel-source-dir hint via file name)->violation for the dep edges.
+
+    Keyed by (source_basename, target_basename) for readable assertions.
+    """
+    out = {}
+    for e in result["edges"]:
+        if e["kind"] == "dep":
+            out[(e["source"].rsplit("/", 1)[-1], e["target"].rsplit("/", 1)[-1])] = e["violation"]
+    return out
+
+
+async def test_layering_violations(store: SQLiteGraphStore) -> None:
+    """The hard case: the layering rule must distinguish organ-internal / front-door
+    imports (OK) from reaching into ANOTHER organ's internals (violation). A fuzzy
+    'anything cross-dir = violation' or 'same-subtree-only' rule gets these wrong.
+
+    Rule: A->B is a violation UNLESS same top-level organ OR B is a top-level organ
+    front door. Reaching into a different organ's internals (depth>=1) = violation.
+    """
+    repo = "/Users/x/Documents/repo"
+    # Files across organs and depths. Symbol nodes carry the REFERENCES edges.
+    nodes = [
+        _sym("A", "g", f"{repo}/src/core/a.py"),       # organ src, deep
+        _sym("Bcousin", "g", f"{repo}/src/other/b.py"),  # organ src, deep (cousin)
+        _sym("Bself", "g", f"{repo}/src/core/d.py"),     # organ src, same dir as A
+        _sym("Bfront", "g", f"{repo}/tests/one.py"),     # organ tests, TOP level (dir='tests')
+        _sym("Bguts", "g", f"{repo}/tests/unit/deep.py"),# organ tests, INTERNALS (dir='tests/unit')
+        _file("A", "g", f"{repo}/src/core/a.py"),
+        _file("Bcousin", "g", f"{repo}/src/other/b.py"),
+        _file("Bself", "g", f"{repo}/src/core/d.py"),
+        _file("Bfront", "g", f"{repo}/tests/one.py"),
+        _file("Bguts", "g", f"{repo}/tests/unit/deep.py"),
+    ]
+    await store.add_nodes_batch("g", nodes)
+    await store.add_edges_batch("g", [
+        CodeEdge(source="A", target="Bcousin", graph_id="g", rel_type="REFERENCES", properties={}),
+        CodeEdge(source="A", target="Bself", graph_id="g", rel_type="REFERENCES", properties={}),
+        CodeEdge(source="A", target="Bfront", graph_id="g", rel_type="REFERENCES", properties={}),
+        CodeEdge(source="A", target="Bguts", graph_id="g", rel_type="REFERENCES", properties={}),
+    ])
+
+    g = await queries.full_graph(store, "g", repo_root=repo)
+    dep = _dep(g)
+
+    assert dep[("a.py", "b.py")] is False      # same organ 'src', cousin -> OK
+    assert dep[("a.py", "d.py")] is False      # same dir -> OK
+    assert dep[("a.py", "one.py")] is False    # src/core -> tests/ (organ front door) -> OK
+    assert dep[("a.py", "deep.py")] is True    # src/core -> tests/unit (other organ's guts) -> VIOLATION
+
+
+async def test_violation_rule_pure() -> None:
+    """Unit-level truth table for the predicate itself (no DB)."""
+    v = queries._is_violation
+    assert v("src/core", "src/other") is False   # same organ, cousin
+    assert v("src/core", "src") is False         # same organ, own ancestor
+    assert v("src", "tests") is False            # organ -> organ front door
+    assert v("src", "tests/unit") is True        # organ -> other organ internals
+    assert v("src/core", "scripts/lib") is True  # deep -> other organ internals
+    assert v("src", "src") is False              # identical
+    assert v("", "src") is False                 # root-level file source, no organ
+    assert v("src/a", "") is False               # target is a root-level file, no organ
+
+
+async def test_test_importer_exemption() -> None:
+    """Tests reaching into the code they exercise are NOT violations, but the
+    exemption is ONE-DIRECTIONAL: a non-test file reaching into a test organ's
+    internals is still a violation. A symmetric rule would get the second wrong.
+    """
+    v = queries._is_violation
+    # test importer -> another organ's internals: EXEMPT
+    assert v("tests/integration/api", "src/api/auth") is False
+    assert v("tests/unit", "scripts/lib/tool") is False
+    assert v("spec/x", "src/deep/y") is False        # other test-organ names too
+    # one-directional: prod file -> test organ internals is STILL a violation
+    assert v("src/core", "tests/unit/y") is True
+    # a non-test file is unaffected
+    assert v("scripts/x", "src/deep/y") is True
