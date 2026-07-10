@@ -21,6 +21,10 @@
   select, button { background: #10131a; color: var(--ink); border: 1px solid var(--line);
     border-radius: 6px; padding: 5px 9px; font-size: 13px; }
   button { cursor: pointer; } button:hover { border-color: var(--accent); }
+  #couple-ctl { display: flex; align-items: center; gap: 8px; color: var(--muted);
+    font-size: 13px; cursor: pointer; }
+  #couple-ctl input[type=range] { accent-color: var(--accent); width: 120px; cursor: pointer; }
+  #coupling-val { min-width: 2ch; text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; }
   #crumbs { color: var(--muted); font-size: 13px; }
   #crumbs a { color: var(--accent); cursor: pointer; text-decoration: none; }
   #stage { position: relative; width: 100%; height: 100%; overflow: hidden; }
@@ -46,7 +50,11 @@
     <select id="repo"></select>
     <span id="crumbs"></span>
     <span style="flex:1"></span>
-    <button id="mode" title="Rigid shows the ideal clean structure; Soft lets coupling distort it to reveal incoherence">Soft coupling</button>
+    <label id="couple-ctl" title="Ideal pack ↔ strong coupling: how far modules drift by cross-module entanglement">
+      Coupling
+      <input id="coupling" type="range" min="0" max="100" value="35">
+      <span id="coupling-val">35</span>
+    </label>
     <button id="labels" title="Show or hide file name labels">Names: auto</button>
     <button id="reset">Reset view</button>
   </header>
@@ -237,8 +245,8 @@ function computeModuleLinks(nodes, links, modules) {
   return moduleLinks;
 }
 
-const state = { graph: null, repoRoot: null, folder: null, subpath: "",
-                fileData: null, sim: null, mode: "soft",      // "soft" | "rigid"
+const state = { graph: null, repoRoot: null, folder: null,
+                fileData: null, sim: null,
                 modules: [], moduleLinks: [],                 // pack rigid bodies + cross-module coupling
                 slider: 0.35,                                 // coupling strength 0..1 (0 = pure pack home)
                 labelMode: "auto" };                          // "auto" | "on" | "off"
@@ -354,10 +362,31 @@ function render(nodes, links) {
     const k = Math.min((w - pad) / gw, (h - pad) / gh, 2);
     const tx = w / 2 - k * (minX + maxX) / 2;
     const ty = h / 2 - k * (minY + maxY) / 2;
-    svg.transition().duration(dur).call(zoom.transform,
-      d3.zoomIdentity.translate(tx, ty).scale(k));
+    const target = d3.zoomIdentity.translate(tx, ty).scale(k);
+    // Hidden tabs throttle requestAnimationFrame → a d3 zoom transition never
+    // advances; apply the transform directly so the fit still lands.
+    if (document.hidden) svg.call(zoom.transform, target);
+    else svg.transition().duration(dur).call(zoom.transform, target);
   }
   state.fitView = fitView;
+
+  // Drill = camera move. Zoom so a single circle (its current rendered position +
+  // radius; coupling offset already baked into d.x/d.y) fills the viewport. The
+  // whole tree is always laid out, so drilling never re-fetches or re-lays-out —
+  // it is pure zoom. The design calls this INSTANT camera movement, and applying
+  // the transform directly (not via a d3 transition) is also robust: d3 zoom
+  // transitions rely on requestAnimationFrame, which browsers throttle to ~0 in
+  // background/hidden tabs, so a transitioned zoom can silently never advance.
+  function zoomToNode(d, dur = 350) {
+    if (d == null || d.x == null || d.y == null) return;
+    const r = (d.r || d.size || 20) + 8;         // pad past the circle edge
+    const k = Math.min((w - 60) / (2 * r), (h - 60) / (2 * r), 4);
+    const tx = w / 2 - k * d.x, ty = h / 2 - k * d.y;
+    const target = d3.zoomIdentity.translate(tx, ty).scale(k);
+    if (document.hidden) svg.call(zoom.transform, target);              // no rAF → jump
+    else svg.transition().duration(dur).call(zoom.transform, target);  // smooth in a live tab
+  }
+  state.zoomToNode = zoomToNode;
 
   const hasHubs = nodes.some(d => d.kind === "dir");
   const charge = n > 200 ? -70 : n > 50 ? -200 : -340;
@@ -407,6 +436,7 @@ function render(nodes, links) {
     // Flat force layout for the folder (top-level) view.
     state.modules = [];   // no pack modules in a flat scope — clear any stale ones
     state.moduleLinks = [];   // and no cross-module coupling to aggregate
+    state.runLayout = null;   // stale pack sim runner must not fire on slider drag here
     const linkDist = n > 50 ? 70 : 110;
     sim = d3.forceSimulation(nodes)
       .force("link", d3.forceLink(links).id(d => d.id).distance(linkDist))
@@ -440,7 +470,15 @@ function render(nodes, links) {
   // their children/descendants — otherwise a later-drawn parent would cover the
   // leaves inside it. Flat/folder view has no meaningful depth nesting; the sort
   // is stable and harmless there. `.data` keeps its own order for tick updates.
-  const drawNodes = hasHubs ? nodes.slice().sort((a, b) => (a.depth || 0) - (b.depth || 0)) : nodes;
+  // Pack view: DROP the scope-root dir (depth 0) from the render — the model is a
+  // forest of top-level module territories, not one enclosing repository-root
+  // circle (once modules drift apart under coupling, an enclosing root circle is
+  // geometrically impossible). It still lives in `nodes` (carries the fit
+  // bounds); it just isn't drawn as a circle.
+  const drawNodes = hasHubs
+    ? nodes.filter(d => !(d.kind === "dir" && d.depth === 0))
+           .sort((a, b) => (a.depth || 0) - (b.depth || 0))
+    : nodes;
   const node = gRoot.append("g").selectAll("g").data(drawNodes).enter().append("g")
     .style("cursor", "pointer")
     .call(d3.drag().on("start", dragStart).on("drag", dragMove).on("end", dragEnd));
@@ -527,7 +565,7 @@ function render(nodes, links) {
       }
       showDetail(d);
       if (d.kind === "folder") showFiles(d.label);           // top level → into a folder
-      else if (d.kind === "dir" && d.canDrill) drillTo(d.drillTo);  // dir hub → descend
+      else if (hasHubs && d.kind === "dir") zoomToNode(d);    // dir circle → zoom in to fill view
     })
     .on("mouseenter", function (e, d) {
       d3.select(this).transition().duration(150)
@@ -545,14 +583,6 @@ function render(nodes, links) {
         d3.select(this.parentNode).select(".node-label").style("display", "none");
       if (hasHubs && !pinned) clearTrace();   // clear transient trace (keep a pinned one)
     });
-
-  // Drillable dir hubs (collapsed subtree) get a dashed outer ring cueing "click
-  // to descend" — the visible affordance for progressive disclosure.
-  node.filter(d => d.kind === "dir" && d.canDrill).append("circle")
-    .attr("r", d => d.size + 5).attr("fill", "none")
-    .attr("stroke", d => d.color).attr("stroke-width", 1.5)
-    .attr("stroke-dasharray", "3 3").attr("stroke-opacity", 0.8)
-    .style("pointer-events", "none");
 
   // initials inside file/folder nodes; dir hubs get no initials (labelled below).
   node.filter(d => d.kind !== "dir").append("text").attr("class", "node-initials")
@@ -677,78 +707,40 @@ async function showFolders() {
   document.getElementById("note").textContent = "";
 }
 
-// How many directory levels below the current scope to expand at once. Deeper
-// dirs collapse into a hub you click to descend — keeps every view readable.
-const MAX_DEPTH = 2;
-
-// Fetch a folder's files once, cache, then render scoped to the folder root.
+// Fetch a folder's files once, cache, then render the folder's whole tree.
 async function showFiles(folder) {
   state.folder = folder;
-  state.subpath = "";
   const data = await j(`/api/graph/files?graph=${state.graph}&repo_root=${encodeURIComponent(state.repoRoot)}&folder=${encodeURIComponent(folder)}`);
   state.fileData = data;
   renderScope();
 }
 
-// Descend into / jump to a sub-directory within the current folder.
-function drillTo(subpath) {
-  state.subpath = subpath;
-  renderScope();
-}
-
-// Build the radial view for the current (folder, subpath) scope. Files outside
-// the scope are excluded; dirs deeper than MAX_DEPTH collapse into a clickable
-// hub. Depths/violations are computed RELATIVE to the scope root.
+// Build the pack view for the whole folder. Every directory level gets its own
+// circle (no depth collapse — d3.pack lays out the full tree, zoom handles
+// density; drilling is camera movement, not re-scoping). Depths/violations are
+// computed relative to the folder root.
 function renderScope() {
   crumbs();
-  const { folder, subpath, fileData: data } = state;
-  const scope = subpath ? `${folder}/${subpath}` : folder;   // path we're rooted at
-  const scopePrefix = subpath ? subpath + "/" : "";
+  const { folder, fileData: data } = state;
 
-  // relPath within the SCOPE (organs/knowledge/db/pg.py, scoped at organs → knowledge/db/pg.py)
-  const inScope = [];
-  for (const f of data.files) {
+  const fileDir = new Map();          // file id → full dir (relative to folder; drives layering test)
+  const allDirs = new Set([""]);      // every directory level present, incl. the folder root ""
+  const subtreeCount = new Map();     // dir → file count in its whole subtree (for sizing)
+
+  const fileNodes = data.files.map(f => {
     const rel = relOf(f.file_path, state.repoRoot, folder);
-    if (subpath && !rel.startsWith(scopePrefix)) continue;   // outside the drilled subtree
-    inScope.push({ f, srel: subpath ? rel.slice(scopePrefix.length) : rel });
-  }
-
-  const fileDir = new Map();          // file id → full dir (for violation test, absolute within folder)
-  const dirFileCount = new Map();     // collapsed dir (relative, ≤MAX_DEPTH) → direct file count
-  const allDirs = new Set([""]);
-  const collapsedInto = new Map();    // file id → the (possibly collapsed) dir hub it hangs from
-
-  const fileNodes = inScope.map(({ f, srel }) => {
-    const fullDir = dirOf(relOf(f.file_path, state.repoRoot, folder));  // absolute-in-folder, for isViolation
-    fileDir.set(f.id, fullDir);
-    const relDir = dirOf(srel);                     // dir relative to scope
-    // Collapse anything deeper than MAX_DEPTH into its MAX_DEPTH-level ancestor.
-    const segs = relDir === "" ? [] : relDir.split("/");
-    const shown = segs.slice(0, MAX_DEPTH).join("/");
-    dirFileCount.set(shown, (dirFileCount.get(shown) || 0) + 1);
-    for (let d = shown; d !== null; d = parentDir(d)) allDirs.add(d);
-    collapsedInto.set(f.id, shown);
-    const branch = srel.indexOf("/") > 0 ? srel.slice(0, srel.indexOf("/")) : "(root)";
-    const depth = (shown === "" ? 0 : shown.split("/").length) + 1;
+    const relDir = dirOf(rel);                      // dir relative to folder root
+    fileDir.set(f.id, relDir);
+    for (let d = relDir; d !== null; d = parentDir(d)) {
+      allDirs.add(d);
+      subtreeCount.set(d, (subtreeCount.get(d) || 0) + 1);
+    }
+    const branch = rel.indexOf("/") > 0 ? rel.slice(0, rel.indexOf("/")) : "(root)";
+    const depth = (relDir === "" ? 0 : relDir.split("/").length) + 1;
     return { id: f.id, label: f.name, kind: "file", path: f.file_path,
-             dir: shown, branch, depth, color: dirColor(scope + "/" + branch),
+             dir: relDir, branch, depth, color: dirColor(folder + "/" + branch),
              worst: f.worst_level, size: sizeFor(f.diagnostic_count), diag: f.diagnostic_count };
   });
-
-  // Subtree file counts for hub sizing + "is this hub collapsible?" (has deeper dirs).
-  const subtreeCount = new Map();
-  for (const dir of allDirs) {
-    let c = 0;
-    for (const [d, n] of dirFileCount) if (d === dir || d.startsWith(dir === "" ? "" : dir + "/")) c += n;
-    subtreeCount.set(dir, c);
-  }
-  // A shown-dir is "collapsed" (drillable) if any file under it lives deeper than shown.
-  const drillable = new Set();
-  for (const { f, srel } of inScope) {
-    const relDir = dirOf(srel);
-    const segs = relDir === "" ? [] : relDir.split("/");
-    if (segs.length > MAX_DEPTH) drillable.add(segs.slice(0, MAX_DEPTH).join("/"));
-  }
 
   // Worst hygiene level over all files in each dir's SUBTREE — so a dir circle's
   // stroke can carry the worst-level tint (unhealthy modules read at dir level,
@@ -765,12 +757,10 @@ function renderScope() {
 
   const hubNodes = [...allDirs].filter(dir => dir != null).map(dir => {
     const branch = dir === "" ? "(root)" : dir.split("/")[0];
-    const canDrill = drillable.has(dir);
-    return { id: "dir:" + dir, kind: "dir", dir, branch, color: dirColor(scope + "/" + branch),
-             label: dir === "" ? (scope.split("/").pop() || folder) : dir.split("/").pop(),
+    return { id: "dir:" + dir, kind: "dir", dir, branch, color: dirColor(folder + "/" + branch),
+             label: dir === "" ? (folder.split("/").pop() || folder) : dir.split("/").pop(),
              depth: dir === "" ? 0 : dir.split("/").length,
              worst: dirWorst.get(dir) || null,
-             drillTo: (subpath ? subpath + "/" : "") + dir, canDrill,
              size: 10 + Math.min(28, Math.sqrt(subtreeCount.get(dir) || 1) * 2.4),
              file_count: subtreeCount.get(dir) };
   });
@@ -781,7 +771,7 @@ function renderScope() {
     const p = parentDir(dir);
     if (p !== null) treeLinks.push({ source: "dir:" + p, target: "dir:" + dir, weight: 1, kind: "hub" });
   }
-  fileNodes.forEach(f => treeLinks.push({ source: "dir:" + collapsedInto.get(f.id), target: f.id, weight: 1, kind: "hub" }));
+  fileNodes.forEach(f => treeLinks.push({ source: "dir:" + f.dir, target: f.id, weight: 1, kind: "hub" }));
 
   const shown = new Set(fileNodes.map(f => f.id));
   let violations = 0;
@@ -801,9 +791,8 @@ function renderScope() {
   render(nodes, treeLinks.concat(deps));
 
   const orphans = fileNodes.length - new Set(deps.flatMap(e => [e.source, e.target])).size;
-  const deeper = drillable.size ? ` · ${drillable.size} dirs collapsed (click to drill)` : "";
   document.getElementById("note").textContent =
-    `${fileNodes.length} files · ${allDirs.size - 1} directories · ${violations} layering violations · ${orphans} unwired${deeper}.`;
+    `${fileNodes.length} files · ${allDirs.size - 1} directories · ${violations} layering violations · ${orphans} unwired.`;
 }
 
 function row(cls, text) { const d = document.createElement("div"); d.className = cls; d.textContent = text; return d; }
@@ -830,21 +819,12 @@ function crumbs() {
   };
   const sep = () => document.createTextNode(" ▸ ");
   const repo = state.repoRoot ? (state.repoRoot.split("/").pop() || state.repoRoot) : "";
-  c.appendChild(crumb(repo, showFolders));
+  c.appendChild(crumb(repo, showFolders));   // ← up to the folder grid (re-fetch)
   if (state.folder) {
     c.appendChild(sep());
-    c.appendChild(crumb(state.folder, () => drillTo("")));   // folder root
-    // each drilled sub-directory segment is its own clickable crumb
-    if (state.subpath) {
-      const segs = state.subpath.split("/");
-      let acc = "";
-      segs.forEach(seg => {
-        acc = acc ? acc + "/" + seg : seg;
-        const path = acc;
-        c.appendChild(sep());
-        c.appendChild(crumb(seg, () => drillTo(path)));
-      });
-    }
+    // The whole folder is always laid out; the folder crumb is a zoom-out target
+    // (fit all), not a re-scope. Drilling into sub-dirs is pure camera zoom.
+    c.appendChild(crumb(state.folder, () => resetView()));
   }
 }
 
@@ -862,14 +842,24 @@ function resetView() {
   else if (state.zoom) svg.transition().duration(300).call(state.zoom.transform, d3.zoomIdentity);
 }
 
-// Re-render whatever view is active (after a mode/label toggle).
+// Re-render whatever view is active (after a label toggle).
 function refresh() { state.folder ? renderScope() : showFolders(); }
 
 document.getElementById("reset").onclick = resetView;
-document.getElementById("mode").onclick = (e) => {
-  state.mode = state.mode === "soft" ? "rigid" : "soft";
-  e.target.textContent = state.mode === "soft" ? "Soft coupling" : "Rigid structure";
-  refresh();
+// Coupling slider (0–100 → 0..1): re-runs ONLY the 8-body module sim in place
+// (no re-render), then re-fits once it settles. Drives state.slider, the single
+// source of truth. Re-fit is debounced so a fast drag doesn't fight the sim.
+const couplingInput = document.getElementById("coupling");
+const couplingVal = document.getElementById("coupling-val");
+couplingInput.oninput = (e) => {
+  const pct = +e.target.value;
+  couplingVal.textContent = pct;
+  state.slider = pct / 100;
+  if (!state.runLayout) return;                 // flat folder view: no module sim
+  state.runLayout(state.slider);                // slider=0 fits immediately; slider>0 starts the sim
+  clearTimeout(state.slideFitTimer);
+  if (state.slider > 0)                          // let the sim settle, then frame the new spread
+    state.slideFitTimer = setTimeout(() => state.fitView && state.fitView(400), 700);
 };
 document.getElementById("labels").onclick = (e) => {
   state.labelMode = state.labelMode === "auto" ? "on"
