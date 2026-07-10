@@ -217,85 +217,86 @@ function render(nodes, links) {
 
   let sim;
   if (hasHubs) {
-    // Radial "outward-drive" layout: every node is pushed OUTWARD from the center
-    // to a ring set by its depth (root pinned center, top dirs inner ring, files
-    // at the rim) — nodes "want to fly out", held back only by their relations.
-    // Tree springs keep children in their parent's wedge; dependency edges (weak)
-    // pull coupled nodes together, bending the rings inward where real coupling
-    // lives — so tight modules knot up and cross-tree imports visibly drag nodes
-    // out of place. No center gravity; the radial force replaces it.
+    // SUNBURST WEDGE layout: partition the full circle into angular wedges, one
+    // per directory, each sized by its leaf-file count and recursively split
+    // among its children. Radius = depth (concentric rings), angle = the node's
+    // wedge center. This gives every directory its OWN slice with room for its
+    // files — no shell overlap. Coupling edges then visibly cross wedges (soft
+    // mode bends them; rigid locks the clean partition).
     const cx = w / 2, cy = h / 2;
-    const ring = Math.max(70, Math.min(w, h) / 9);   // px between depth rings
+    const ring = Math.max(72, Math.min(w, h) / 9);   // px between depth rings
     const maxDepth = Math.max(1, ...nodes.map(d => d.depth || 0));
     const rigid = state.mode === "rigid";
     const byId = new Map(nodes.map(d => [d.id, d]));
 
-    // Pin the synthetic root at dead center so the whole tree hangs off it.
-    const root = nodes.find(d => d.kind === "dir" && d.depth === 0);
-    if (root) { root.fx = cx; root.fy = cy; }
+    // Build the tree: for each dir hub, its child dirs and its direct files.
+    const childDirs = new Map(), dirFiles = new Map();
+    nodes.forEach(d => { if (d.kind === "dir") { childDirs.set(d.dir, []); dirFiles.set(d.dir, []); } });
+    nodes.forEach(d => {
+      if (d.kind === "dir" && d.depth > 0) {
+        const p = parentDir(d.dir); if (childDirs.has(p)) childDirs.get(p).push(d);
+      } else if (d.kind === "file") {
+        if (dirFiles.has(d.dir)) dirFiles.get(d.dir).push(d);
+      }
+    });
+    // Leaf-weight = files in this dir's whole subtree (min 1) — drives wedge size.
+    const weight = new Map();
+    (function w1(dir) {
+      let sum = (dirFiles.get(dir) || []).length;
+      for (const c of childDirs.get(dir) || []) sum += w1(c.dir);
+      weight.set(dir, Math.max(1, sum)); return weight.get(dir);
+    })("");
 
-    // SHELL placement: give every file a stable angle around its hub so siblings
-    // sit on one equidistant arc (a directory reads as a coherent petal-shell).
-    // Group files by their hub, then fan them across an angular slice.
-    const filesByHub = new Map();
-    nodes.forEach(d => { if (d.kind === "file") {
-      const h = "dir:" + d.dir; (filesByHub.get(h) || filesByHub.set(h, []).get(h)).push(d);
-    }});
-    // Shell radius scales with how many files ride it, so a crowded directory
-    // gets a bigger ring (files don't overlap) while a small one stays tight —
-    // shell SIZE itself then reads as "how many files in this directory".
-    const AVG_FILE_R = 14;   // approx node radius + gap
-    filesByHub.forEach(arr => {
-      // circumference must fit all files: 2πR ≥ n · spacing  →  R ≥ n·spacing/2π
-      const rNeeded = (arr.length * AVG_FILE_R * 2) / (2 * Math.PI);
-      const shellR = Math.max(ring * 0.6, rNeeded);
-      arr.forEach((d, k) => {
-        d.shellAngle = (k + 0.5) / arr.length * 2 * Math.PI;   // even spread
-        d.shellR = shellR;
+    // Recursively assign each node a target (x,y): walk wedges [a0,a1), place a
+    // dir at its wedge midpoint on its depth ring, split the wedge among child
+    // dirs (by weight) and fan this dir's own files across a share of it.
+    function layout(dir, a0, a1) {
+      const hub = byId.get("dir:" + dir);
+      const mid = (a0 + a1) / 2, r = (hub.depth || 0) * ring;
+      hub.tx = cx + r * Math.cos(mid); hub.ty = cy + r * Math.sin(mid);
+      const kids = childDirs.get(dir) || [], files = dirFiles.get(dir) || [];
+      const total = weight.get(dir);
+      // Files of THIS dir occupy a slice proportional to their own count.
+      const fileShare = files.length / total;
+      let a = a0;
+      const span = a1 - a0;
+      // place files first, fanned across their share, at this dir's ring+1
+      const fa0 = a, fa1 = a + span * fileShare; a = fa1;
+      files.forEach((f, k) => {
+        const fa = files.length === 1 ? (fa0 + fa1) / 2
+                 : fa0 + (k + 0.5) / files.length * (fa1 - fa0);
+        const fr = ((hub.depth || 0) + 1) * ring;
+        f.tx = cx + fr * Math.cos(fa); f.ty = cy + fr * Math.sin(fa);
       });
-    });
-    // Seed positions on depth rings (golden-angle) so it starts unfolded.
-    nodes.forEach((d, i) => {
-      if (d.fx != null) return;
-      const a = (i * 2.399963);
-      const r = (d.depth || 0) * ring;
-      d.x = cx + r * Math.cos(a); d.y = cy + r * Math.sin(a);
-    });
+      // then child dirs, each getting a wedge sized by its subtree weight
+      for (const c of kids) {
+        const cShare = weight.get(c.dir) / total;
+        const ca1 = a + span * cShare;
+        layout(c.dir, a, ca1); a = ca1;
+      }
+    }
+    layout("", 0, 2 * Math.PI);
 
-    const tgtKind = d => (typeof d.target === "object" ? d.target.kind : null);
-    const isFileHub = d => d.kind === "hub" && tgtKind(d) === "file";
+    // Pin root at center; seed everyone at their wedge target so it opens tidy.
+    if (byId.get("dir:")) { byId.get("dir:").fx = cx; byId.get("dir:").fy = cy; }
+    nodes.forEach(d => { if (d.tx != null) { d.x = d.tx; d.y = d.ty; } });
+
     sim = d3.forceSimulation(nodes)
-      // Links: dir→dir tree spring holds the hierarchy spine. File→hub spokes
-      // carry ZERO force — the shell force alone positions files, so siblings
-      // land on one clean equidistant arc instead of being tugged three ways.
-      // Dep pull ∝ 1/(1+treeDistance)² (rigid mode: no dep positioning force).
-      .force("link", d3.forceLink(links).id(d => d.id)
-        .distance(d => d.kind === "hub" ? (tgtKind(d) === "file" ? ring * 0.7 : 40) : 70)
-        .strength(d => isFileHub(d) ? 0            // file→hub spoke: visual only
-          : d.kind === "hub" ? 0.9                 // dir→dir spine: stiff
-          : rigid ? 0 : 0.9 / Math.pow(1 + (d.dist || 0), 2)))
-      // Repulsion spreads siblings; hubs push harder to claim separate wedges.
-      .force("charge", d3.forceManyBody().strength(d =>
-        d.kind === "dir" ? -240 - 900 / (d.depth || 1) : -16).distanceMax(700))
-      .force("collision", d3.forceCollide().radius(d => d.size + (d.kind === "dir" ? 10 : 2.5)))
-      // Outward drive: dirs pulled to their depth ring (firm → crisp hierarchy).
-      .force("radial", d3.forceRadial(d => (d.depth || 0) * ring, cx, cy)
-        .strength(d => d.kind === "dir" ? 0.5 + 0.35 * ((d.depth || 1) / maxDepth) : 0))
-      // SHELL force: the SOLE positioner for files — pin each to its hub's
-      // position + (shellR, shellAngle) so siblings sit on one clean arc. Rigid
-      // → very firm (crisp petals). Soft → firm but yields to LCA-weighted
-      // coupling, so a file reaching outside its dir bulges off-shell = the
-      // visible incoherence cue. No competing tree-spring anymore.
-      .force("shellX", d3.forceX(d => {
-        if (d.kind !== "file") return cx;
-        const h = byId.get("dir:" + d.dir); if (!h) return cx;
-        return (h.x ?? cx) + d.shellR * Math.cos(d.shellAngle);
-      }).strength(d => d.kind === "file" ? (rigid ? 1 : 0.7) : 0))
-      .force("shellY", d3.forceY(d => {
-        if (d.kind !== "file") return cy;
-        const h = byId.get("dir:" + d.dir); if (!h) return cy;
-        return (h.y ?? cy) + d.shellR * Math.sin(d.shellAngle);
-      }).strength(d => d.kind === "file" ? (rigid ? 1 : 0.7) : 0));
+      // The wedge target (tx,ty) IS the layout — pull every node to its slice.
+      // Rigid → firm (clean sunburst). Soft → firm for dirs, softer for files
+      // so LCA-weighted coupling can bulge a file off its wedge = incoherence cue.
+      .force("wx", d3.forceX(d => d.tx ?? cx)
+        .strength(d => d.kind === "dir" ? 0.9 : rigid ? 0.9 : 0.55))
+      .force("wy", d3.forceY(d => d.ty ?? cy)
+        .strength(d => d.kind === "dir" ? 0.9 : rigid ? 0.9 : 0.55))
+      // Collision keeps nodes from overlapping within their wedge.
+      .force("collision", d3.forceCollide().radius(d => d.size + (d.kind === "dir" ? 8 : 2)))
+      // Dependency pull ∝ 1/(1+treeDistance)² — in soft mode only, and gentle,
+      // so tight (same-dir) couplings barely tug while cross-tree ones are near
+      // zero. Rigid mode: coupling is edges only, never moves a node.
+      .force("dep", rigid ? null : d3.forceLink(links.filter(l => l.kind === "dep"))
+        .id(d => d.id).distance(50)
+        .strength(d => 0.25 / Math.pow(1 + (d.dist || 0), 2)));
   } else {
     // Flat force layout for the folder (top-level) view.
     const linkDist = n > 50 ? 70 : 110;
