@@ -210,6 +210,66 @@ async def test_file_edges_within_folder(store: SQLiteGraphStore) -> None:
                       "target": f"{repo}/server/db.ts", "weight": 1}]
 
 
+async def test_file_edges_from_scip_resolved_python_calls(store: SQLiteGraphStore) -> None:
+    """Python graphs never emit REFERENCES — SCIP refines CALLS in place, tagging
+    the resolved ones ``resolved_by=scip-python``. The view must draw file→file
+    edges from those resolved cross-file CALLS, or a Python repo renders as
+    disconnected dots (the enterprise_tabular_ad bug).
+    """
+    repo = "/Users/x/Documents/py_repo"
+    await store.add_nodes_batch("gpy", [
+        _sym("caller", "gpy", f"{repo}/scripts/train.py"),
+        _sym("callee", "gpy", f"{repo}/scripts/model.py"),
+        _sym("local", "gpy", f"{repo}/scripts/train.py"),
+    ])
+    await store.add_edges_batch("gpy", [
+        # SCIP-resolved cross-file call: train.py -> model.py (must draw)
+        CodeEdge(source="caller", target="callee", graph_id="gpy", rel_type="CALLS",
+                 properties={"resolved_by": "scip-python"}),
+        # unresolved bare-name CALLS (fuzzy target) — must NOT draw
+        CodeEdge(source="caller", target="local", graph_id="gpy", rel_type="CALLS",
+                 properties={}),
+    ])
+
+    edges = await queries.file_edges(store, "gpy", repo_root=repo, folder="scripts")
+    assert edges == [{"source": f"{repo}/scripts/train.py",
+                      "target": f"{repo}/scripts/model.py", "weight": 1}]
+
+
+async def test_folder_edges_from_scip_resolved_python_calls(store: SQLiteGraphStore) -> None:
+    """Folder→folder edges also come from SCIP-resolved Python CALLS."""
+    repo = "/Users/x/Documents/py_repo"
+    await store.add_nodes_batch("gpy", [
+        _sym("caller", "gpy", f"{repo}/scripts/train.py"),
+        _sym("callee", "gpy", f"{repo}/src/model.py"),
+    ])
+    await store.add_edges_batch("gpy", [
+        CodeEdge(source="caller", target="callee", graph_id="gpy", rel_type="CALLS",
+                 properties={"resolved_by": "scip-python"}),
+    ])
+
+    edges = await queries.folder_edges(store, "gpy", repo_root=repo)
+    assert edges == [{"source": "scripts", "target": "src", "weight": 1}]
+
+
+async def test_unresolved_calls_do_not_draw_edges(store: SQLiteGraphStore) -> None:
+    """Bare-name (unresolved) CALLS must never become file→file edges — their
+    targets are fuzzy, so drawing them would be noise, not real dependency.
+    """
+    repo = "/Users/x/Documents/py_repo"
+    await store.add_nodes_batch("gpy", [
+        _sym("caller", "gpy", f"{repo}/scripts/a.py"),
+        _sym("callee", "gpy", f"{repo}/scripts/b.py"),
+    ])
+    await store.add_edges_batch("gpy", [
+        CodeEdge(source="caller", target="callee", graph_id="gpy", rel_type="CALLS",
+                 properties={}),  # no resolved_by
+    ])
+
+    edges = await queries.file_edges(store, "gpy", repo_root=repo, folder="scripts")
+    assert edges == []
+
+
 async def test_cap_and_truncation(store: SQLiteGraphStore) -> None:
     """No silent capping: over-limit results report a truncated count."""
     repo = "/Users/x/Documents/repo_a"
@@ -221,3 +281,16 @@ async def test_cap_and_truncation(store: SQLiteGraphStore) -> None:
     # the query layer exposes truncation via a sibling call
     total = await queries.count_files(store, "g", repo_root=repo, folder="src")
     assert total == 10
+
+
+async def test_default_file_cap_is_2000(store: SQLiteGraphStore) -> None:
+    """Default cap is 2000, not 500 — a large folder (e.g. lumen_platform, 1889
+    files) must render fully so its file→file edges have both endpoints present.
+    A 501-file folder is fully returned by the default limit.
+    """
+    repo = "/Users/x/Documents/repo_a"
+    nodes = [_file(f"f{i}", "g", f"{repo}/src/file{i}.py") for i in range(501)]
+    await store.add_nodes_batch("g", nodes)
+
+    result = await queries.list_files(store, "g", repo_root=repo, folder="src")
+    assert len(result) == 501  # not clipped at the old 500 default

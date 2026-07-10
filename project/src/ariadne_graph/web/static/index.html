@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ariadne — code graph</title>
-<script src="/graph/cytoscape.min.js"></script>
+<script src="/graph/d3.min.js"></script>
 <style>
   :root {
     --bg: #0f1115; --panel: #171a21; --ink: #e6e9ef; --muted: #8b94a7;
@@ -23,7 +23,9 @@
   button { cursor: pointer; } button:hover { border-color: var(--accent); }
   #crumbs { color: var(--muted); font-size: 13px; }
   #crumbs a { color: var(--accent); cursor: pointer; text-decoration: none; }
-  #cy { width: 100%; height: 100%; }
+  #stage { position: relative; width: 100%; height: 100%; overflow: hidden; }
+  #graph { width: 100%; height: 100%; display: block; cursor: grab; }
+  #graph:active { cursor: grabbing; }
   #side { border-left: 1px solid var(--line); background: var(--panel); padding: 14px; overflow-y: auto; }
   #side h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em;
     color: var(--muted); margin: 0 0 8px; }
@@ -32,7 +34,9 @@
   .sel-title { font-weight: 600; margin: 14px 0 4px; word-break: break-all; }
   .stat { color: var(--muted); font-size: 13px; }
   #note { color: var(--warn); font-size: 12px; margin-top: 10px; }
-  #empty { color: var(--muted); padding: 30px; }
+  #empty { color: var(--muted); padding: 30px; position: absolute; }
+  .node-label { fill: #c7ccd6; font-size: 10px; pointer-events: none; }
+  .node-initials { fill: #fff; font-weight: 600; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -44,7 +48,7 @@
     <span style="flex:1"></span>
     <button id="reset">Reset view</button>
   </header>
-  <div id="cy"></div>
+  <div id="stage"><svg id="graph"></svg></div>
   <aside id="side">
     <h2>Hygiene legend</h2>
     <div class="legend">
@@ -53,37 +57,239 @@
       <div><span class="dot" style="background:var(--warn)"></span> warning</div>
       <div><span class="dot" style="background:var(--error)"></span> error</div>
     </div>
-    <p class="stat" style="margin-top:10px">Node size = diagnostic count. Click a
-      folder to drill into its files.</p>
+    <p class="stat" style="margin-top:10px">Node size = diagnostic count. Drag nodes
+      to rearrange; click a folder to drill into its files.</p>
     <div id="detail"></div>
     <div id="note"></div>
   </aside>
 </div>
 <script>
 const LEVEL_COLOR = { error: "#e05a5a", warning: "#e0a44a", info: "#6ea8fe", null: "#3fb27f" };
-const state = { graph: null, repoRoot: null, folder: null };
+// Categorical hues for directory groups — jewel-toned so distinct on dark bg
+// without turning neon. Files inherit their directory's hue; hygiene rides as a
+// thin ring so both "which module" and "how healthy" read at once.
+const DIR_PALETTE = [
+  "#7aa2f7", "#bb9af7", "#7dcfff", "#9ece6a", "#e0af68", "#f7768e",
+  "#2ac3de", "#c0caf5", "#ff9e64", "#41a6b5", "#b4f9f8", "#e69ac0",
+  "#89ddff", "#a6da95", "#eed49f", "#f5a97f", "#8aadf4", "#c6a0f6",
+];
+const _dirColor = new Map();
+function dirColor(dir) {
+  if (!_dirColor.has(dir))
+    _dirColor.set(dir, DIR_PALETTE[_dirColor.size % DIR_PALETTE.length]);
+  return _dirColor.get(dir);
+}
+// First path segment of a file relative to the open folder → its "department".
+function subdirOf(filePath, repoRoot, folder) {
+  const base = `${repoRoot.replace(/\/$/, "")}/${folder}/`;
+  let rel = filePath.startsWith(base) ? filePath.slice(base.length)
+          : filePath.startsWith(`${folder}/`) ? filePath.slice(folder.length + 1)
+          : filePath;
+  const i = rel.indexOf("/");
+  return i > 0 ? rel.slice(0, i) : "(root)";
+}
 
-const cy = cytoscape({
-  container: document.getElementById("cy"),
-  style: [
-    { selector: "node", style: {
-        "background-color": ele => LEVEL_COLOR[ele.data("worst")] || "#3fb27f",
-        "label": "data(label)", "color": "#c7ccd6", "font-size": 10,
-        "text-valign": "bottom", "text-margin-y": 4, "width": "data(size)", "height": "data(size)",
-        "border-width": 1, "border-color": "#0b0d11" } },
-    { selector: "edge", style: {
-        "width": ele => Math.min(6, 1 + Math.log2((ele.data("weight") || 1) + 1)),
-        "line-color": "#4a5570", "target-arrow-color": "#4a5570",
-        "target-arrow-shape": "triangle", "arrow-scale": 0.7,
-        "curve-style": "bezier", "opacity": 0.55 } },
-    { selector: "node:selected", style: { "border-width": 3, "border-color": "#6ea8fe" } },
-  ],
-});
+const state = { graph: null, repoRoot: null, folder: null, sim: null };
 
-function sizeFor(count) { return 18 + Math.min(42, Math.sqrt(count || 0) * 6); }
+function colorFor(worst) { return LEVEL_COLOR[worst] || "#3fb27f"; }
+function sizeFor(count) { return 10 + Math.min(24, Math.sqrt(count || 0) * 3.5); }
 
 async function j(url) { const r = await fetch(url); if (!r.ok) throw new Error(await r.text()); return r.json(); }
 
+// ---- D3 force graph (live simulation; matches Lumen_Ai's KG tab feel) --------
+const svg = d3.select("#graph");
+let gRoot = null;  // zoom/pan container
+
+function stageSize() {
+  const s = document.getElementById("stage");
+  return { w: s.clientWidth, h: s.clientHeight };
+}
+
+function ensureDefs() {
+  // One-time <defs>: gradients per hygiene level, drop shadow, arrowhead.
+  if (svg.select("defs").size()) return;
+  const defs = svg.append("defs");
+  Object.entries(LEVEL_COLOR).forEach(([k, c]) => {
+    const grad = defs.append("radialGradient").attr("id", "grad-" + k)
+      .attr("cx", "35%").attr("cy", "35%").attr("r", "65%");
+    grad.append("stop").attr("offset", "0%").attr("stop-color", d3.rgb(c).brighter(0.9));
+    grad.append("stop").attr("offset", "100%").attr("stop-color", c);
+  });
+  const sh = defs.append("filter").attr("id", "nshadow")
+    .attr("x", "-50%").attr("y", "-50%").attr("width", "200%").attr("height", "200%");
+  sh.append("feDropShadow").attr("dx", 0).attr("dy", 1).attr("stdDeviation", 2)
+    .attr("flood-color", "#000").attr("flood-opacity", 0.45);
+  defs.append("marker").attr("id", "arrow").attr("viewBox", "0 -5 10 10")
+    .attr("refX", 18).attr("refY", 0).attr("markerWidth", 6).attr("markerHeight", 6)
+    .attr("orient", "auto").append("path").attr("d", "M0,-5L10,0L0,5").attr("fill", "#4a5570");
+}
+
+function render(nodes, links) {
+  if (state.sim) { state.sim.stop(); state.sim = null; }
+  svg.selectAll("*").remove();
+  const empty = document.getElementById("empty");
+  if (empty) empty.remove();
+  ensureDefs();
+
+  const n = nodes.length;
+  // Dense graphs (many nodes) hide always-on labels — they collide into noise.
+  // Initials stay inside the node; the full label appears on hover and when
+  // zoomed in past LABEL_ZOOM. Sparse graphs (folder view) always label.
+  const denseLabels = n > 200;
+
+  const { w, h } = stageSize();
+  gRoot = svg.append("g");
+  let labelsForced = false;
+  const LABEL_ZOOM = 1.8;  // zoomed in past this → reveal all labels even when dense
+  const zoom = d3.zoom().scaleExtent([0.05, 4]).on("zoom", (e) => {
+    gRoot.attr("transform", e.transform);
+    const shouldForce = e.transform.k >= LABEL_ZOOM;
+    if (denseLabels && shouldForce !== labelsForced) {
+      labelsForced = shouldForce;
+      gRoot.selectAll(".node-label").style("display", labelsForced ? null : "none");
+    }
+  });
+  svg.call(zoom);
+  state.zoom = zoom;  // Reset-view + auto-fit use this to reframe.
+
+  // Fit all nodes into view (with padding). Called once the sim settles so the
+  // whole arrangement is visible instead of landing zoomed into one cluster.
+  function fitView(dur = 500) {
+    const xs = nodes.map(d => d.x), ys = nodes.map(d => d.y);
+    if (!xs.length || xs.some(v => v == null)) return;
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const gw = maxX - minX || 1, gh = maxY - minY || 1;
+    const pad = 80;
+    const k = Math.min((w - pad) / gw, (h - pad) / gh, 2);
+    const tx = w / 2 - k * (minX + maxX) / 2;
+    const ty = h / 2 - k * (minY + maxY) / 2;
+    svg.transition().duration(dur).call(zoom.transform,
+      d3.zoomIdentity.translate(tx, ty).scale(k));
+  }
+  state.fitView = fitView;
+
+  const hasHubs = nodes.some(d => d.kind === "dir");
+  const charge = n > 200 ? -70 : n > 50 ? -200 : -340;
+
+  let sim;
+  if (hasHubs) {
+    // Hierarchical (department) layout: directory hubs claim separated territory
+    // on a ring; each file is pulled hard toward its own hub so directories form
+    // distinct fans. Dependency edges are kept WEAK so cross-file coupling bends
+    // the fans (visible intermingling) without collapsing them into one ball.
+    const hubs = nodes.filter(d => d.kind === "dir");
+    const byId = new Map(nodes.map(d => [d.id, d]));
+    // Seed hubs evenly on a ring so they don't start stacked.
+    const R = Math.min(w, h) * 0.36;
+    hubs.forEach((hb, i) => {
+      const a = (i / hubs.length) * 2 * Math.PI;
+      hb.x = w / 2 + R * Math.cos(a); hb.y = h / 2 + R * Math.sin(a);
+    });
+    const hubOf = d => d.kind === "file" ? byId.get("dir:" + d.dir) : d;
+
+    sim = d3.forceSimulation(nodes)
+      .force("link", d3.forceLink(links).id(d => d.id)
+        .distance(d => d.kind === "hub" ? 28 : 60)
+        .strength(d => d.kind === "hub" ? 0.7 : 0.02))   // dep pull deliberately faint
+      .force("charge", d3.forceManyBody().strength(d => d.kind === "dir" ? -1400 : -24))
+      .force("collision", d3.forceCollide().radius(d => d.size + (d.kind === "dir" ? 14 : 3)))
+      // Pull each file toward ITS hub — this is what forms the fans.
+      .force("cx", d3.forceX(d => hubOf(d) ? hubOf(d).x : w / 2).strength(d => d.kind === "file" ? 0.35 : 0))
+      .force("cy", d3.forceY(d => hubOf(d) ? hubOf(d).y : h / 2).strength(d => d.kind === "file" ? 0.35 : 0))
+      // Keep hubs spread around the center.
+      .force("hubX", d3.forceX(w / 2).strength(d => d.kind === "dir" ? 0.02 : 0))
+      .force("hubY", d3.forceY(h / 2).strength(d => d.kind === "dir" ? 0.02 : 0));
+  } else {
+    // Flat force layout for the folder (top-level) view.
+    const linkDist = n > 50 ? 70 : 110;
+    sim = d3.forceSimulation(nodes)
+      .force("link", d3.forceLink(links).id(d => d.id).distance(linkDist))
+      .force("charge", d3.forceManyBody().strength(charge))
+      .force("center", d3.forceCenter(w / 2, h / 2))
+      .force("collision", d3.forceCollide().radius(d => d.size + 5));
+  }
+  state.sim = sim;
+
+  // Two link layers: faint hub spokes (no arrow) UNDER bright dependency edges.
+  const link = gRoot.append("g").selectAll("line").data(links).enter().append("line")
+    .attr("stroke", d => d.kind === "hub" ? "#2c3444" : "#5b6b8f")
+    .attr("stroke-opacity", d => d.kind === "hub" ? 0.35 : 0.7)
+    .attr("stroke-width", d => d.kind === "hub" ? 0.6 : Math.min(5, 1 + Math.log2((d.weight || 1) + 1)))
+    .attr("marker-end", d => d.kind === "hub" ? null : "url(#arrow)")
+    .style("pointer-events", d => d.kind === "hub" ? "none" : null)
+    .on("mouseenter", function (e, d) { if (d.kind !== "hub") d3.select(this).transition().duration(150)
+      .attr("stroke-opacity", 1).attr("stroke", "#89b4fa"); })
+    .on("mouseleave", function (e, d) { if (d.kind !== "hub") d3.select(this).transition().duration(150)
+      .attr("stroke-opacity", 0.7).attr("stroke", "#5b6b8f"); });
+
+  const node = gRoot.append("g").selectAll("g").data(nodes).enter().append("g")
+    .style("cursor", "pointer")
+    .call(d3.drag().on("start", dragStart).on("drag", dragMove).on("end", dragEnd));
+
+  // Fill = directory hue (or hygiene gradient in the folder view where there are
+  // no dir hubs); a thin hygiene-colored ring carries the health signal on top.
+  node.append("circle")
+    .attr("r", d => d.size)
+    .attr("fill", d => hasHubs ? d.color : `url(#grad-${d.worst || "null"})`)
+    .attr("fill-opacity", d => d.kind === "file" ? 0.92 : 1)
+    .attr("stroke", d => hasHubs ? colorFor(d.worst) : "#0b0d11")
+    .attr("stroke-width", d => d.kind === "dir" ? 3 : hasHubs ? 2 : 1.5)
+    .attr("filter", "url(#nshadow)")
+    .on("click", (e, d) => { showDetail(d); if (d.kind === "folder") showFiles(d.label); })
+    .on("mouseenter", function (e, d) {
+      d3.select(this).transition().duration(150)
+        .attr("r", d.size + 4).attr("stroke", "#c7d2fe").attr("stroke-width", d.kind === "dir" ? 4 : 3);
+      d3.select(this.parentNode).select(".node-label").style("display", null);
+    })
+    .on("mouseleave", function (e, d) {
+      d3.select(this).transition().duration(150)
+        .attr("r", d.size).attr("stroke", hasHubs ? colorFor(d.worst) : "#0b0d11")
+        .attr("stroke-width", d.kind === "dir" ? 3 : hasHubs ? 2 : 1.5);
+      if (denseLabels && !labelsForced && d.kind !== "dir")
+        d3.select(this.parentNode).select(".node-label").style("display", "none");
+    });
+
+  // initials inside file/folder nodes; dir hubs get no initials (labelled below).
+  node.filter(d => d.kind !== "dir").append("text").attr("class", "node-initials")
+    .attr("dy", ".35em").attr("text-anchor", "middle")
+    .attr("font-size", d => Math.max(8, d.size * 0.7)).attr("fill", "#0b0d11")
+    .attr("font-weight", 700)
+    .text(d => (d.label || "").substring(0, 3).toUpperCase());
+  // full label below. Dir hubs ALWAYS show their name (the "department"); file
+  // labels follow the dense rule (hidden when crowded, shown on hover/zoom).
+  node.append("text").attr("class", "node-label").attr("text-anchor", "middle")
+    .attr("dy", d => d.size + 12)
+    .attr("font-size", d => d.kind === "dir" ? 13 : 10)
+    .attr("font-weight", d => d.kind === "dir" ? 700 : 400)
+    .attr("fill", d => d.kind === "dir" ? d.color : "#c7ccd6")
+    .text(d => d.label)
+    .style("display", d => (denseLabels && d.kind !== "dir") ? "none" : null);
+  // native tooltip; textContent-safe (d.label from disk file names)
+  node.append("title").text(d => d.kind === "folder"
+    ? `${d.label}\n${d.file_count} files · ${d.diag || 0} diagnostics`
+    : d.kind === "dir"
+    ? `${d.label}/\n${d.file_count} files`
+    : `${d.path || d.label}\n${d.dir ? d.dir + "/ · " : ""}${d.diag || 0} diagnostics${d.worst ? " · worst: " + d.worst : ""}`);
+
+  sim.on("tick", () => {
+    link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+        .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+    node.attr("transform", d => `translate(${d.x},${d.y})`);
+  });
+  // Frame the whole arrangement once the layout has taken shape. Large graphs
+  // decay alpha slowly, so "end" is unreliable — fit on a fixed settle timer
+  // (scaled to node count), which is deterministic. The user can re-fit anytime
+  // via Reset view.
+  clearTimeout(state.fitTimer);
+  state.fitTimer = setTimeout(() => fitView(700), n > 400 ? 4500 : n > 50 ? 2000 : 900);
+
+  function dragStart(e, d) { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; }
+  function dragMove(e, d) { d.fx = e.x; d.fy = e.y; }
+  function dragEnd(e, d) { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }
+}
+
+// ---- data loading + drill-down (unchanged API contract) ----------------------
 async function loadRepos() {
   const { repos } = await j("/api/graph/repos");
   const sel = document.getElementById("repo");
@@ -96,7 +302,7 @@ async function loadRepos() {
   });
   sel.onchange = () => selectRepo(sel.value, sel.selectedOptions[0].dataset.root);
   if (sel.options.length) selectRepo(sel.value, sel.selectedOptions[0].dataset.root);
-  else document.getElementById("cy").innerHTML = '<div id="empty">No indexed repos with data.</div>';
+  else showEmpty("No indexed repos with data.");
 }
 
 async function selectRepo(graph, root) {
@@ -109,15 +315,14 @@ async function showFolders() {
   crumbs();
   const { folders, edges } = await j(`/api/graph/folders?graph=${state.graph}&repo_root=${encodeURIComponent(state.repoRoot)}`);
   const ids = new Set(folders.map(f => "folder:" + f.folder));
-  const nodes = folders.map(f => ({ data: {
+  const nodes = folders.map(f => ({
     id: "folder:" + f.folder, label: f.folder, kind: "folder",
     worst: f.worst_level, size: sizeFor(f.diagnostic_count),
-    file_count: f.file_count, diag: f.diagnostic_count } }));
-  const eds = (edges || [])
+    file_count: f.file_count, diag: f.diagnostic_count }));
+  const links = (edges || [])
     .filter(e => ids.has("folder:" + e.source) && ids.has("folder:" + e.target))
-    .map(e => ({ data: { id: `fe:${e.source}>${e.target}`, source: "folder:" + e.source,
-                         target: "folder:" + e.target, weight: e.weight } }));
-  render(nodes, eds);
+    .map(e => ({ source: "folder:" + e.source, target: "folder:" + e.target, weight: e.weight }));
+  render(nodes, links);
   document.getElementById("note").textContent = "";
 }
 
@@ -126,31 +331,39 @@ async function showFiles(folder) {
   crumbs();
   const data = await j(`/api/graph/files?graph=${state.graph}&repo_root=${encodeURIComponent(state.repoRoot)}&folder=${encodeURIComponent(folder)}`);
   const byPath = new Map(data.files.map(f => [f.file_path, f.id]));
-  const nodes = data.files.map(f => ({ data: {
-    id: f.id, label: f.name, kind: "file", path: f.file_path,
-    worst: f.worst_level, size: sizeFor(f.diagnostic_count), diag: f.diagnostic_count } }));
-  const eds = (data.edges || [])
+
+  // Bucket files by sub-directory ("department") and synthesize one hub per dir.
+  const dirCounts = new Map();
+  const fileNodes = data.files.map(f => {
+    const dir = subdirOf(f.file_path, state.repoRoot, folder);
+    dirCounts.set(dir, (dirCounts.get(dir) || 0) + 1);
+    return { id: f.id, label: f.name, kind: "file", path: f.file_path, dir,
+             color: dirColor(dir), worst: f.worst_level,
+             size: sizeFor(f.diagnostic_count), diag: f.diagnostic_count };
+  });
+  const hubNodes = [...dirCounts].map(([dir, count]) => ({
+    id: "dir:" + dir, label: dir, kind: "dir", dir, color: dirColor(dir),
+    size: 14 + Math.min(30, Math.sqrt(count) * 3), file_count: count }));
+  const nodes = hubNodes.concat(fileNodes);
+
+  // Hub links: every file ties to its directory hub → nothing floats; a file
+  // linked ONLY to its hub is a visible orphan (not wired into any other file).
+  const hubLinks = fileNodes.map(f => ({
+    source: "dir:" + f.dir, target: f.id, weight: 1, kind: "hub" }));
+  // Real file→file dependency edges (the coupling / intermingling signal).
+  const depLinks = (data.edges || [])
     .filter(e => byPath.has(e.source) && byPath.has(e.target))
-    .map(e => ({ data: { id: `ce:${byPath.get(e.source)}>${byPath.get(e.target)}`,
-                         source: byPath.get(e.source), target: byPath.get(e.target), weight: e.weight } }));
-  render(nodes, eds);
-  document.getElementById("note").textContent =
-    data.truncated ? `Showing top ${data.files.length} of ${data.total} files (${data.truncated} hidden).` : "";
-}
+    .map(e => ({ source: byPath.get(e.source), target: byPath.get(e.target),
+                 weight: e.weight, kind: "dep" }));
+  render(nodes, hubLinks.concat(depLinks));
 
-function render(nodes, edges) {
-  cy.elements().remove();
-  cy.add(nodes.concat(edges));
-  cy.layout({ name: "cose", animate: false, idealEdgeLength: 80,
-    nodeRepulsion: 12000, gravity: 0.3, componentSpacing: 120 }).run();
-  cy.fit(undefined, 40);
+  const orphans = fileNodes.length - new Set(
+    depLinks.flatMap(e => [e.source, e.target])).size;
+  const note = document.getElementById("note");
+  note.textContent =
+    (data.truncated ? `Showing top ${data.files.length} of ${data.total} files (${data.truncated} hidden). ` : "") +
+    `${dirCounts.size} directories · ${orphans} files with no cross-file dependency.`;
 }
-
-cy.on("tap", "node", evt => {
-  const d = evt.target.data();
-  showDetail(d);
-  if (d.kind === "folder") showFiles(d.label);
-});
 
 function row(cls, text) { const d = document.createElement("div"); d.className = cls; d.textContent = text; return d; }
 
@@ -158,9 +371,13 @@ function showDetail(d) {
   // textContent everywhere: labels/paths come from on-disk file names — treat as untrusted.
   const el = document.getElementById("detail");
   el.replaceChildren();
-  el.appendChild(row("sel-title", d.label));
-  el.appendChild(row("stat", d.kind === "folder" ? `${d.file_count} files` : (d.path || "")));
-  el.appendChild(row("stat", `${d.diag || 0} diagnostics${d.worst ? " · worst: " + d.worst : ""}`));
+  el.appendChild(row("sel-title", d.kind === "dir" ? d.label + "/" : d.label));
+  if (d.kind === "dir") {
+    el.appendChild(row("stat", `${d.file_count} files in this directory`));
+  } else {
+    el.appendChild(row("stat", d.kind === "folder" ? `${d.file_count} files` : (d.path || "")));
+    el.appendChild(row("stat", `${d.diag || 0} diagnostics${d.worst ? " · worst: " + d.worst : ""}`));
+  }
 }
 
 function crumbs() {
@@ -173,8 +390,22 @@ function crumbs() {
   if (state.folder) c.appendChild(document.createTextNode(` ▸ ${state.folder}`));
 }
 
-document.getElementById("reset").onclick = () => state.folder ? showFolders() : cy.fit(undefined, 40);
-loadRepos().catch(e => { document.getElementById("cy").innerHTML = '<div id="empty">'+e.message+'</div>'; });
+function showEmpty(msg) {
+  svg.selectAll("*").remove();
+  const s = document.getElementById("stage");
+  let e = document.getElementById("empty");
+  if (!e) { e = document.createElement("div"); e.id = "empty"; s.appendChild(e); }
+  e.textContent = msg;
+}
+
+function resetView() {
+  // Re-frame the current view (fit all nodes); does NOT navigate away.
+  if (state.fitView) state.fitView(400);
+  else if (state.zoom) svg.transition().duration(300).call(state.zoom.transform, d3.zoomIdentity);
+}
+
+document.getElementById("reset").onclick = resetView;
+loadRepos().catch(e => showEmpty(e.message));
 </script>
 </body>
 </html>

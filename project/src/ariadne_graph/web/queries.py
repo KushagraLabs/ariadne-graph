@@ -48,10 +48,14 @@ async def _rows(store: SQLiteGraphStore, sql: str, params: tuple[Any, ...]) -> l
         await db.close()  # releases the store lock; underlying conn stays open
 
 
-# SCIP-resolved cross-file dependency edges live in the REFERENCES rel_type
-# (every symbol occurrence resolving to its definition in another file). The
-# older AST-derived CALLS edges are NOT resolved (targets are bare names), so we
-# deliberately use REFERENCES for real file→file links.
+# SCIP-resolved cross-file dependency edges, per language:
+#   * TypeScript: the `REFERENCES` rel_type (every symbol occurrence that the
+#     SCIP translator resolves to its definition in another file).
+#   * Python: SCIP does not emit REFERENCES; it refines the target of `CALLS`
+#     edges in place, tagging the resolved ones ``resolved_by=scip-python``.
+#     Bare-name (unresolved) CALLS keep fuzzy targets, so they are excluded.
+# Both are real, definition-resolved file→file links; import-level edges are
+# deliberately NOT used (they would bypass SCIP resolution entirely).
 _XREF_SQL = """
 SELECT json_extract(sn.properties, '$.file_path') AS sf,
        json_extract(tn.properties, '$.file_path') AS tf
@@ -59,7 +63,11 @@ FROM edges e
 JOIN nodes sn ON sn.graph_id = e.graph_id AND sn.id = e.source
 JOIN nodes tn ON tn.graph_id = e.graph_id AND tn.id = e.target
 WHERE e.graph_id = ?
-  AND e.rel_type = 'REFERENCES'
+  AND (
+        e.rel_type = 'REFERENCES'
+        OR (e.rel_type = 'CALLS'
+            AND json_extract(e.properties, '$.resolved_by') = 'scip-python')
+      )
   AND json_extract(sn.properties, '$.file_path') IS NOT NULL
   AND json_extract(tn.properties, '$.file_path') IS NOT NULL
   AND json_extract(sn.properties, '$.file_path') != json_extract(tn.properties, '$.file_path')
@@ -195,7 +203,7 @@ async def list_files(
     *,
     repo_root: str,
     folder: str,
-    limit: int = 500,
+    limit: int = 2000,
 ) -> list[dict[str, Any]]:
     """Altitude 2: CodeFiles in ``folder``'s subtree, with hygiene paint.
 

@@ -24,7 +24,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _STATIC = Path(__file__).parent / "static"
-_NODE_CAP = 500
+# Large packages (e.g. lumen_platform, ~1889 files) must render fully so their
+# file→file edges have both endpoints present; 500 hid most nodes and dropped
+# their edges. The D3 view handles ~2000 nodes; count_files still reports truncation.
+_NODE_CAP = 2000
 
 
 def _store() -> SQLiteGraphStore | None:
@@ -50,9 +53,9 @@ def register_routes(mcp: FastMCP) -> None:
     async def graph_page(request: Request) -> Response:  # noqa: ARG001
         return FileResponse(_STATIC / "index.html", media_type="text/html")
 
-    @mcp.custom_route("/graph/cytoscape.min.js", methods=["GET"])
-    async def graph_cytoscape(request: Request) -> Response:  # noqa: ARG001
-        return FileResponse(_STATIC / "cytoscape.min.js", media_type="application/javascript")
+    @mcp.custom_route("/graph/d3.min.js", methods=["GET"])
+    async def graph_d3(request: Request) -> Response:  # noqa: ARG001
+        return FileResponse(_STATIC / "d3.min.js", media_type="application/javascript")
 
     @mcp.custom_route("/api/graph/repos", methods=["GET"])
     async def api_repos(request: Request) -> Response:  # noqa: ARG001
