@@ -1,34 +1,65 @@
 // Regression guard for the circle-PACK graph layout in web/static/index.html.
+// The single guard for the whole pack + module-coupling layout feature (Tasks
+// 1-7); it replaced the retired ring/hub-satellite harness once that layout and
+// its math (ringR / haloRadius / fileRows / dirSize / FILE_MIN…) were removed.
 //
 //   Run:  node project/tests/test_web/pack_layout_invariants.mjs   (exit 0 = pass)
 //
 // The layout math lives in inline <script> (no JS test runner in this repo), so
-// the pure tree-builder (`buildPackTree`) is mirrored here VERBATIM and fed the
-// SAME node shape `renderScope` produces (dir hubs + file leaves carrying `dir`).
-// The vendored d3.min.js loads under plain Node, so this exercises the GENUINE
-// d3.hierarchy + d3.pack geometry (no browser needed for the math).
+// the pure functions (`buildPackTree`, `computeModules`, `computeModuleLinks`,
+// and the runLayout sim config: couple / homeStrength / gap) are mirrored here
+// VERBATIM and fed the SAME node shape `renderScope` produces (dir hubs + file
+// leaves carrying `dir`). The vendored d3.min.js loads under plain Node, so this
+// exercises the GENUINE d3.hierarchy + d3.pack + d3.forceSimulation geometry (no
+// browser needed for the math). Edit any of those in index.html → update the
+// mirrors below and keep green; each check is proven RED when its logic is absent.
 //
-// It locks the invariants that make the pack read as a nested HIERARCHY:
-//   1. CONTAINMENT — every file leaf sits inside its directory circle, and every
-//      child directory sits inside its parent directory circle (no leakage).
-//   2. RELAXED WEIGHT — a directory with more files is GENERALLY larger. NOT exact
-//      area∝count: a single recursive d3.pack lets packing shape inflate an
-//      enclosing radius (design "promise correction"), so we assert a monotone
-//      TREND on well-separated sizes, not per-pair area equality.
-//   3. HOME positions — every pack node (dir + file) receives a finite (hx,hy,r).
-//   4. ROOT/FOREST — modules are the depth-1 dir circles PLUS a synthetic
-//      "synthetic:root-files" module for depth-1 leaf files; the synthetic pack
-//      root is never a module. The synthetic module appears iff root-level files
-//      exist. Its id lives in a disjoint namespace from real dirs ("mod:"+dir),
-//      so a real dir literally named "(root files)" cannot collide with it.
-//   5. RIGID BODY — every descendant carries a frozen (ox,oy) from its module
-//      center, so moving the module by (dx,dy) moves every descendant by exactly
-//      (dx,dy). We verify the offset math (no force sim in this task).
-//   6. COUPLING — cross-module dep edges roll up to `moduleLinks` with weight =
-//      crossEdges / sqrt(nA*nB); same-module edges contribute 0. Normalizing lets
-//      a small-but-tangled pair OUTRANK a big-but-loosely-linked pair.
-// If you edit buildPackTree / computeModules / computeModuleLinks in index.html,
-// update the mirrors below and keep green. Proven RED when that logic is absent.
+// Invariants guarded (one `check(...)` per line below; grouped here by theme):
+//
+//   HOME + CONTAINMENT (the pack reads as a nested hierarchy)
+//     - every pack node (dir + file) gets a finite (hx,hy,r).
+//     - every file leaf sits inside its directory circle (no leakage).
+//     - every child directory sits inside its parent directory circle.
+//     - the root pack node fills the requested SxS square; the 200-file giant
+//       stays fully contained (can't blow out of the frame).
+//
+//   WEIGHT (size encodes subtree file count)
+//     - a directory with (well) more files is larger — a monotone TREND on
+//       well-separated sizes, NOT exact area∝count (a single recursive d3.pack
+//       lets packing shape inflate an enclosing radius; design "promise
+//       correction"), so we compare clearly-separated dirs, not every pair.
+//
+//   MODULES / ROOT-FOREST (rigid bodies + the synthetic root-files module)
+//     - modules are the depth-1 dir circles PLUS a synthetic "synthetic:root-
+//       files" module holding depth-1 leaf files; the synthetic pack root is
+//       NEVER a module and is not rendered.
+//     - the synthetic module appears IFF root-level files exist (both edge
+//       cases: subdirs-but-no-root-files, and only-root-files).
+//     - ID COLLISION: a real dir literally named "(root files)" (id "mod:(root
+//       files)") stays disjoint from the synthetic id ("synthetic:" prefix).
+//     - ZERO-FILE dir: a depth-1 dir with no files anywhere (r=0 from d3.pack)
+//       is EXCLUDED from modules; a sibling with files stays.
+//     - every module carries a finite home + R + positive leaf count n.
+//     - EMPTY SCOPE: a zero-weight subtree (no files) floors the pack root so
+//       d3.pack doesn't divide-by-zero → no NaN in hx/hy/r.
+//
+//   RIGID BODY (a module moves as one piece)
+//     - every descendant carries a frozen (ox,oy) from its module center, so
+//       moving the module by (dx,dy) moves every descendant by exactly (dx,dy).
+//       Verifies the offset MATH (the force sim is exercised separately below).
+//
+//   COUPLING (normalized cross-module entanglement)
+//     - cross-module dep edges roll up to one `moduleLink` per pair with weight
+//       = crossEdges / sqrt(nA*nB); same-module edges (and non-"dep" edges)
+//       contribute 0. Normalizing lets a small-but-tangled pair OUTRANK a big-
+//       but-loosely-linked pair even with fewer absolute edges.
+//
+//   FORCE SIM / SLIDER (asserted by BEHAVIOR — run the sim, don't peek at forces)
+//     - slider=0 is a STATIC BYPASS: every module x,y === its homeX,homeY exactly.
+//     - slider=1: after settling, no two module circles overlap (dist >= Ra+Rb).
+//     - residual home-spring strength = 0.1 at slider=1 (never 0 — orientation
+//       preserved, so full coupling keeps the mental map instead of a blob).
+//     - couple(w) is monotone on [0,1] and saturates strong pairs at 1.
 
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
