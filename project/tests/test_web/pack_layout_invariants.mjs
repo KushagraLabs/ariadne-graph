@@ -16,8 +16,16 @@
 //      enclosing radius (design "promise correction"), so we assert a monotone
 //      TREND on well-separated sizes, not per-pair area equality.
 //   3. HOME positions — every pack node (dir + file) receives a finite (hx,hy,r).
-// If you edit buildPackTree in index.html, update the mirror below and keep green.
-// It is proven to go RED when the builder is absent / the tree is mis-nested.
+//   4. ROOT/FOREST — modules are the depth-1 dir circles PLUS a synthetic
+//      "synthetic:root-files" module for depth-1 leaf files; the synthetic pack
+//      root is never a module. The synthetic module appears iff root-level files
+//      exist. Its id lives in a disjoint namespace from real dirs ("mod:"+dir),
+//      so a real dir literally named "(root files)" cannot collide with it.
+//   5. RIGID BODY — every descendant carries a frozen (ox,oy) from its module
+//      center, so moving the module by (dx,dy) moves every descendant by exactly
+//      (dx,dy). We verify the offset math (no force sim in this task).
+// If you edit buildPackTree / computeModules in index.html, update the mirrors
+// below and keep green. Proven RED when the builder/module logic is absent.
 
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
@@ -55,6 +63,60 @@ function packLayout(nodes, S) {
   d3.pack().size([S, S]).padding(3)(root);
   return root;
 }
+
+// Identify TOP-LEVEL MODULES (rigid bodies) from a packed hierarchy `root`.
+// A module is a depth-1 DIRECTORY pack node, PLUS one synthetic "(root files)"
+// module holding any depth-1 leaf files (files directly under the scope root,
+// with no owning directory circle). The synthetic pack root is NOT a module and
+// is skipped when rendering. For every descendant of a module we FREEZE an offset
+// (ox,oy) = (node.hx − module.hx, node.hy − module.hy) onto its flat src node and
+// tag node.moduleId — so later a module can move as one body (module.x+ox, +oy).
+// Home positions (hx,hy) are pack coords shifted by (offX,offY). Pure — mirrored
+// VERBATIM in web/static/index.html (keep both in sync). Returns the module list.
+function computeModules(root, offX, offY) {
+  const modules = [];
+  const rootFiles = [];
+  for (const child of (root.children || [])) {
+    if (child.data.kind === "dir") {
+      const hx = child.x + offX, hy = child.y + offY;
+      const id = "mod:" + child.data.dir;
+      let n = 0;
+      child.each(pn => {
+        const d = pn.data.src; if (!d) return;
+        d.moduleId = id;
+        d.ox = (pn.x + offX) - hx;
+        d.oy = (pn.y + offY) - hy;
+        if (pn.data.kind === "file") n++;
+      });
+      // Drop degenerate empty dirs (no files anywhere in subtree): d3.pack gives
+      // them r=0, a degenerate rigid body for the later force sim (Task 4).
+      if (n > 0) modules.push({ id, homeX: hx, homeY: hy, R: child.r, n });
+    } else if (child.data.kind === "file") {
+      rootFiles.push(child);
+    }
+  }
+  if (rootFiles.length) {
+    // "synthetic:" prefix (not "mod:") so a real dir literally named "(root files)"
+    // — whose id is "mod:(root files)" — can never collide with this module.
+    const id = "synthetic:root-files";
+    // n = root-files array length here; for real dirs above n = full-subtree file
+    // count. Coincidentally both are "file count", but semantics differ. R is an
+    // ad-hoc bounding circle over the scattered root files, unlike real dirs which
+    // reuse child.r from d3.pack.
+    const hx = rootFiles.reduce((s, f) => s + f.x + offX, 0) / rootFiles.length;
+    const hy = rootFiles.reduce((s, f) => s + f.y + offY, 0) / rootFiles.length;
+    let R = 0;
+    for (const f of rootFiles) {
+      const d = f.data.src; if (!d) continue;
+      d.moduleId = id;
+      d.ox = (f.x + offX) - hx;
+      d.oy = (f.y + offY) - hy;
+      R = Math.max(R, Math.hypot(f.x + offX - hx, f.y + offY - hy) + f.r);
+    }
+    modules.push({ id, homeX: hx, homeY: hy, R, n: rootFiles.length });
+  }
+  return modules;
+}
 // ---- end mirror ----
 
 // ---- synthetic lumen_platform-shaped scope (same fixture family as the old harness) ----
@@ -84,6 +146,16 @@ root.each(pn => {
   if (pn.data.kind === "dir") packByDir.set(pn.data.dir, pn);
   else if (pn.data.kind === "file") packFiles.push(pn);
 });
+
+// Emit HOME positions onto the flat src nodes (mirrors index.html's write-back),
+// then compute modules + freeze subtree offsets against a nonzero stage offset.
+const S_offX = 50, S_offY = 50;
+root.each(pn => {
+  const d = pn.data.src; if (!d) return;
+  d.hx = pn.x + S_offX; d.hy = pn.y + S_offY; d.r = pn.r;
+});
+const modules = computeModules(root, S_offX, S_offY);
+const flatById = new Map(nodes.map(d => [d.id, d]));
 
 // ---- assertions ----
 let fails = 0;
@@ -148,6 +220,113 @@ emptyRoot.each(pn => {
 });
 check("empty scope (zero-weight subtree) has no NaN in hx/hy/r", emptyFinite,
   `root r=${emptyRoot.r}`);
+
+// (5) ROOT/FOREST: the synthetic pack root is NOT a module (not in `modules`) and
+//     is not rendered (its src is null). Depth-1 directories ARE modules; and the
+//     4 root-level files land in a synthetic "(root files)" module, each carrying a
+//     valid moduleId + finite offset.
+const modIds = new Set(modules.map(m => m.id));
+// The pack root (dir "") is never collected as a module (modules come only from
+// root.children), so no descendant carries the root's own moduleId and the root
+// circle is never rendered as a module body.
+check("synthetic pack root is NOT a module", !modIds.has("mod:"),
+  `ids=[${[...modIds].join(", ")}]`);
+check("every depth-1 directory is a module",
+  ["organs", "adapters", "infra", "utils"].every(dir => modIds.has("mod:" + dir)),
+  `ids=[${[...modIds].join(", ")}]`);
+const rootFilesMod = modules.find(m => m.id === "synthetic:root-files");
+check("root-level files form a synthetic (root files) module",
+  !!rootFilesMod && rootFilesMod.n === 4,
+  rootFilesMod ? `n=${rootFilesMod.n}` : "module absent");
+const rootFileNodes = nodes.filter(d => d.kind === "file" && d.dir === "");
+check("each root-level file has moduleId=synthetic:root-files + finite offset",
+  rootFileNodes.length === 4 && rootFileNodes.every(d =>
+    d.moduleId === "synthetic:root-files" && Number.isFinite(d.ox) && Number.isFinite(d.oy)),
+  `tagged=${rootFileNodes.filter(d=>d.moduleId==="synthetic:root-files").length}/4`);
+check("every module has finite home + R + positive leaf count n",
+  modules.length > 0 && modules.every(m =>
+    [m.homeX, m.homeY, m.R].every(Number.isFinite) && m.n > 0),
+  `modules=${modules.length}`);
+
+// (6) RIGID BODY: shifting a module center by (dx,dy) moves EVERY descendant by
+//     exactly (dx,dy). We verify the OFFSET MATH (no sim yet): rendered position =
+//     home + offset, so (module.home+delta)+offset − original-home === delta for
+//     every descendant. Pick the "organs" module (a deep multi-level subtree).
+const organsMod = modules.find(m => m.id === "mod:organs");
+const [dx, dy] = [123.5, -87.25];
+let rigidOk = true, rigidWorst = 0;
+for (const d of nodes) {
+  if (d.moduleId !== organsMod.id) continue;
+  // original rendered home for this descendant
+  const home0X = d.hx, home0Y = d.hy;
+  // module moves to home+delta; descendant re-placed via frozen offset
+  const newX = (organsMod.homeX + dx) + d.ox;
+  const newY = (organsMod.homeY + dy) + d.oy;
+  const errX = (newX - home0X) - dx, errY = (newY - home0Y) - dy;
+  if (Math.abs(errX) > 1e-6 || Math.abs(errY) > 1e-6) rigidOk = false;
+  rigidWorst = Math.max(rigidWorst, Math.abs(errX), Math.abs(errY));
+}
+const organsDescendants = nodes.filter(d => d.moduleId === organsMod.id).length;
+check("rigid body: every organs descendant tracks module delta exactly",
+  rigidOk && organsDescendants > 1,
+  `descendants=${organsDescendants} worst_err=${rigidWorst.toExponential(2)}px`);
+
+// (7) FOREST edge cases — the synthetic (root files) module appears iff there are
+//     depth-1 leaf files:
+//   (a) scope with subdirs but NO root-level files ⇒ no synthetic module.
+//   (b) scope with ONLY root-level files (no subdirs) ⇒ exactly the synthetic one.
+function modulesFor(dirFileMap) {
+  const ns = [];
+  for (const dir of Object.keys(dirFileMap)) {
+    ns.push({ id: "dir:" + dir, kind: "dir", dir, label: dir || "root" });
+    for (let k = 0; k < dirFileMap[dir]; k++)
+      ns.push({ id: `${dir}#${k}`, kind: "file", dir, label: `f${k}.py`, path: dir + "/f" + k });
+  }
+  const r = packLayout(ns, S);
+  r.each(pn => { const d = pn.data.src; if (d) { d.hx = pn.x + 50; d.hy = pn.y + 50; d.r = pn.r; } });
+  return { modules: computeModules(r, 50, 50), nodes: ns };
+}
+const noRootFiles = modulesFor({ "": 0, "a": 3, "b": 5 }).modules;
+check("no root-level files ⇒ no synthetic (root files) module",
+  !noRootFiles.some(m => m.id === "synthetic:root-files") &&
+  noRootFiles.length === 2,
+  `ids=[${noRootFiles.map(m=>m.id).join(", ")}]`);
+const onlyRootFiles = modulesFor({ "": 6 }).modules;
+check("only root-level files ⇒ exactly the synthetic module",
+  onlyRootFiles.length === 1 && onlyRootFiles[0].id === "synthetic:root-files" && onlyRootFiles[0].n === 6,
+  `ids=[${onlyRootFiles.map(m=>`${m.id}(n=${m.n})`).join(", ")}]`);
+
+// (8) ID COLLISION: a real directory literally named "(root files)" must NOT
+//     collide with the synthetic root-files module. Real dir ids are "mod:"+dir;
+//     the synthetic id uses a "synthetic:" prefix, so they occupy disjoint
+//     namespaces. Build a scope with such a dir AND root-level files → two
+//     DISTINCT module ids, each descendant tagged with the right one.
+const collisionRun = (() => {
+  const ns = [];
+  ns.push({ id: "dir:(root files)", kind: "dir", dir: "(root files)", label: "(root files)" });
+  for (let k = 0; k < 3; k++)
+    ns.push({ id: `(root files)#${k}`, kind: "file", dir: "(root files)", label: `f${k}.py`, path: "(root files)/f" + k });
+  for (let k = 0; k < 4; k++)
+    ns.push({ id: `root#${k}`, kind: "file", dir: "", label: `g${k}.py`, path: "g" + k });
+  const r = packLayout(ns, S);
+  r.each(pn => { const d = pn.data.src; if (d) { d.hx = pn.x + 50; d.hy = pn.y + 50; d.r = pn.r; } });
+  return { modules: computeModules(r, 50, 50), nodes: ns };
+})();
+const collisionIds = collisionRun.modules.map(m => m.id);
+check("real dir named '(root files)' does NOT collide with synthetic module id",
+  new Set(collisionIds).size === collisionIds.length &&
+  collisionIds.includes("mod:(root files)") &&
+  collisionIds.includes("synthetic:root-files"),
+  `ids=[${collisionIds.join(", ")}]`);
+
+// (9) ZERO-FILE DEPTH-1 DIR: an empty directory (no files anywhere in its
+//     subtree) gets r=0 from d3.pack — a degenerate rigid body — and must be
+//     EXCLUDED from `modules`. A sibling dir with files stays.
+const zeroFileRun = modulesFor({ "": 0, "empty": 0, "full": 5 });
+const zeroFileIds = zeroFileRun.modules.map(m => m.id);
+check("zero-file depth-1 dir is excluded from modules",
+  !zeroFileIds.includes("mod:empty") && zeroFileIds.includes("mod:full"),
+  `ids=[${zeroFileIds.join(", ")}]`);
 
 console.log(`\n${fails===0?"ALL PASS":fails+" FAILURES"}`);
 process.exit(fails===0?0:1);

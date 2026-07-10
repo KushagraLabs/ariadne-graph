@@ -153,6 +153,60 @@ function buildPackTree(nodes) {
   return treeByDir.get("");
 }
 
+// Identify TOP-LEVEL MODULES (rigid bodies) from a packed hierarchy `root`.
+// A module is a depth-1 DIRECTORY pack node, PLUS one synthetic "(root files)"
+// module holding any depth-1 leaf files (files directly under the scope root,
+// with no owning directory circle). The synthetic pack root is NOT a module and
+// is skipped when rendering. For every descendant of a module we FREEZE an offset
+// (ox,oy) = (node.hx − module.hx, node.hy − module.hy) onto its flat src node and
+// tag node.moduleId — so later a module can move as one body (module.x+ox, +oy).
+// Home positions (hx,hy) are pack coords shifted by (offX,offY). Pure — mirrored
+// VERBATIM in tests/test_web/pack_layout_invariants.mjs (keep both in sync).
+function computeModules(root, offX, offY) {
+  const modules = [];
+  const rootFiles = [];
+  for (const child of (root.children || [])) {
+    if (child.data.kind === "dir") {
+      const hx = child.x + offX, hy = child.y + offY;
+      const id = "mod:" + child.data.dir;
+      let n = 0;
+      child.each(pn => {
+        const d = pn.data.src; if (!d) return;
+        d.moduleId = id;
+        d.ox = (pn.x + offX) - hx;
+        d.oy = (pn.y + offY) - hy;
+        if (pn.data.kind === "file") n++;
+      });
+      // Drop degenerate empty dirs (no files anywhere in subtree): d3.pack gives
+      // them r=0, a degenerate rigid body for the later force sim (Task 4).
+      if (n > 0) modules.push({ id, homeX: hx, homeY: hy, R: child.r, n });
+    } else if (child.data.kind === "file") {
+      rootFiles.push(child);
+    }
+  }
+  if (rootFiles.length) {
+    // "synthetic:" prefix (not "mod:") so a real dir literally named "(root files)"
+    // — whose id is "mod:(root files)" — can never collide with this module.
+    const id = "synthetic:root-files";
+    // n = root-files array length here; for real dirs above n = full-subtree file
+    // count. Coincidentally both are "file count", but semantics differ. R is an
+    // ad-hoc bounding circle over the scattered root files, unlike real dirs which
+    // reuse child.r from d3.pack.
+    const hx = rootFiles.reduce((s, f) => s + f.x + offX, 0) / rootFiles.length;
+    const hy = rootFiles.reduce((s, f) => s + f.y + offY, 0) / rootFiles.length;
+    let R = 0;
+    for (const f of rootFiles) {
+      const d = f.data.src; if (!d) continue;
+      d.moduleId = id;
+      d.ox = (f.x + offX) - hx;
+      d.oy = (f.y + offY) - hy;
+      R = Math.max(R, Math.hypot(f.x + offX - hx, f.y + offY - hy) + f.r);
+    }
+    modules.push({ id, homeX: hx, homeY: hy, R, n: rootFiles.length });
+  }
+  return modules;
+}
+
 const state = { graph: null, repoRoot: null, folder: null, subpath: "",
                 fileData: null, sim: null, mode: "soft",      // "soft" | "rigid"
                 labelMode: "auto" };                          // "auto" | "on" | "off"
@@ -268,11 +322,18 @@ function render(nodes, links) {
       d.x = d.hx; d.y = d.hy; d.fx = d.hx; d.fy = d.hy;
     });
 
+    // Collect top-level modules (depth-1 dir circles + a synthetic root-files
+    // module) and freeze each descendant's offset from its module center. Later
+    // tasks move a module as one rigid body via (module.x+ox, module.y+oy); this
+    // task only computes the offsets — modules sit at their home position.
+    state.modules = computeModules(root, offX, offY);
+
     // No forces yet (modules + coupling are later tasks): an alpha-0 sim just
     // carries the pinned nodes through the existing tick handler unchanged.
     sim = d3.forceSimulation(nodes).alpha(0).alphaTarget(0).stop();
   } else {
     // Flat force layout for the folder (top-level) view.
+    state.modules = [];   // no pack modules in a flat scope — clear any stale ones
     const linkDist = n > 50 ? 70 : 110;
     sim = d3.forceSimulation(nodes)
       .force("link", d3.forceLink(links).id(d => d.id).distance(linkDist))
