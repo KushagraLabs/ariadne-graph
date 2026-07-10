@@ -128,6 +128,31 @@ function treeDistance(dirA, dirB) {
   return (a.length - i) + (b.length - i);  // steps up from A + steps up from B
 }
 
+// Build a nested {name, dir, kind, src, children, value} tree from the flat scope
+// nodes (dir hubs + file leaves, each carrying `dir`). Directories nest by
+// parentDir; files attach as value:1 leaves under their (collapsed) dir. This is
+// the input to d3.hierarchy().sum(leaf=1) → d3.pack(): the pack's ENCLOSURE
+// mirrors this nesting, so containment (file inside its dir, child dir inside
+// parent) is guaranteed by construction. Pure — no d3, no DOM (mirrored verbatim
+// in tests/test_web/pack_layout_invariants.mjs).
+function buildPackTree(nodes) {
+  const treeByDir = new Map();
+  const mk = (dir, src) => ({ name: dir === "" ? "" : dir.split("/").pop(),
+    dir, kind: "dir", src, children: [], value: 0 });
+  for (const d of nodes) if (d.kind === "dir") treeByDir.set(d.dir, mk(d.dir, d));
+  if (!treeByDir.has("")) treeByDir.set("", mk("", null));
+  for (const d of nodes) {
+    if (d.kind !== "dir" || d.dir === "") continue;
+    (treeByDir.get(parentDir(d.dir)) || treeByDir.get("")).children.push(treeByDir.get(d.dir));
+  }
+  for (const d of nodes) {
+    if (d.kind !== "file") continue;
+    (treeByDir.get(d.dir) || treeByDir.get("")).children.push(
+      { name: d.label, dir: d.dir, kind: "file", src: d, value: 1 });
+  }
+  return treeByDir.get("");
+}
+
 const state = { graph: null, repoRoot: null, folder: null, subpath: "",
                 fileData: null, sim: null, mode: "soft",      // "soft" | "rigid"
                 labelMode: "auto" };                          // "auto" | "on" | "off"
@@ -217,86 +242,35 @@ function render(nodes, links) {
 
   let sim;
   if (hasHubs) {
-    // SUNBURST WEDGE layout: partition the full circle into angular wedges, one
-    // per directory, each sized by its leaf-file count and recursively split
-    // among its children. Radius = depth (concentric rings), angle = the node's
-    // wedge center. This gives every directory its OWN slice with room for its
-    // files — no shell overlap. Coupling edges then visibly cross wedges (soft
-    // mode bends them; rigid locks the clean partition).
-    const cx = w / 2, cy = h / 2;
-    const ring = Math.max(72, Math.min(w, h) / 9);   // px between depth rings
-    const maxDepth = Math.max(1, ...nodes.map(d => d.depth || 0));
-    const rigid = state.mode === "rigid";
-    const byId = new Map(nodes.map(d => [d.id, d]));
+    // CIRCLE-PACK layout (rest state). d3.pack() on the directory tree: every
+    // directory is a circle enclosing its child dirs and file leaves, nested by
+    // hierarchy, area ∝ file count (relaxed — packing shape inflates enclosing
+    // radii; see the pack design "promise correction"). Each node keeps a frozen
+    // HOME (hx,hy) + pack radius r — the ideal position later tasks perturb with
+    // module-level coupling forces. This task only computes the home layout; the
+    // sim below is inert (every node pinned at home), so the existing tick/render
+    // pipeline draws the pack directly.
+    const S = Math.min(w, h) - 40;          // pack fills a centered square
+    const offX = (w - S) / 2, offY = (h - S) / 2;
+    const root = d3.hierarchy(buildPackTree(nodes))
+      .sum(d => d.value || 0)
+      .sort((a, b) => (b.value || 0) - (a.value || 0));
+    if (!(root.value > 0)) root.value = 1;   // empty scope: floor root so d3.pack doesn't divide by 0 → NaN
+    d3.pack().size([S, S]).padding(3)(root);
 
-    // Build the tree: for each dir hub, its child dirs and its direct files.
-    const childDirs = new Map(), dirFiles = new Map();
-    nodes.forEach(d => { if (d.kind === "dir") { childDirs.set(d.dir, []); dirFiles.set(d.dir, []); } });
-    nodes.forEach(d => {
-      if (d.kind === "dir" && d.depth > 0) {
-        const p = parentDir(d.dir); if (childDirs.has(p)) childDirs.get(p).push(d);
-      } else if (d.kind === "file") {
-        if (dirFiles.has(d.dir)) dirFiles.get(d.dir).push(d);
-      }
+    // Write the pack geometry back onto the flat scope nodes (keyed via `src`).
+    // Home = pack (x,y) shifted into stage coords; render radius = pack r. Pin
+    // every node at home (fx,fy) so the inert sim holds the exact pack shape.
+    root.each(pn => {
+      const d = pn.data.src; if (!d) return;   // skip the synthetic root wrapper
+      d.hx = pn.x + offX; d.hy = pn.y + offY; d.r = pn.r;
+      d.size = pn.r;                            // downstream circle/label sizing reads d.size
+      d.x = d.hx; d.y = d.hy; d.fx = d.hx; d.fy = d.hy;
     });
-    // Leaf-weight = files in this dir's whole subtree (min 1) — drives wedge size.
-    const weight = new Map();
-    (function w1(dir) {
-      let sum = (dirFiles.get(dir) || []).length;
-      for (const c of childDirs.get(dir) || []) sum += w1(c.dir);
-      weight.set(dir, Math.max(1, sum)); return weight.get(dir);
-    })("");
 
-    // Recursively assign each node a target (x,y): walk wedges [a0,a1), place a
-    // dir at its wedge midpoint on its depth ring, split the wedge among child
-    // dirs (by weight) and fan this dir's own files across a share of it.
-    function layout(dir, a0, a1) {
-      const hub = byId.get("dir:" + dir);
-      const mid = (a0 + a1) / 2, r = (hub.depth || 0) * ring;
-      hub.tx = cx + r * Math.cos(mid); hub.ty = cy + r * Math.sin(mid);
-      const kids = childDirs.get(dir) || [], files = dirFiles.get(dir) || [];
-      const total = weight.get(dir);
-      // Files of THIS dir occupy a slice proportional to their own count.
-      const fileShare = files.length / total;
-      let a = a0;
-      const span = a1 - a0;
-      // place files first, fanned across their share, at this dir's ring+1
-      const fa0 = a, fa1 = a + span * fileShare; a = fa1;
-      files.forEach((f, k) => {
-        const fa = files.length === 1 ? (fa0 + fa1) / 2
-                 : fa0 + (k + 0.5) / files.length * (fa1 - fa0);
-        const fr = ((hub.depth || 0) + 1) * ring;
-        f.tx = cx + fr * Math.cos(fa); f.ty = cy + fr * Math.sin(fa);
-      });
-      // then child dirs, each getting a wedge sized by its subtree weight
-      for (const c of kids) {
-        const cShare = weight.get(c.dir) / total;
-        const ca1 = a + span * cShare;
-        layout(c.dir, a, ca1); a = ca1;
-      }
-    }
-    layout("", 0, 2 * Math.PI);
-
-    // Pin root at center; seed everyone at their wedge target so it opens tidy.
-    if (byId.get("dir:")) { byId.get("dir:").fx = cx; byId.get("dir:").fy = cy; }
-    nodes.forEach(d => { if (d.tx != null) { d.x = d.tx; d.y = d.ty; } });
-
-    sim = d3.forceSimulation(nodes)
-      // The wedge target (tx,ty) IS the layout — pull every node to its slice.
-      // Rigid → firm (clean sunburst). Soft → firm for dirs, softer for files
-      // so LCA-weighted coupling can bulge a file off its wedge = incoherence cue.
-      .force("wx", d3.forceX(d => d.tx ?? cx)
-        .strength(d => d.kind === "dir" ? 0.9 : rigid ? 0.9 : 0.55))
-      .force("wy", d3.forceY(d => d.ty ?? cy)
-        .strength(d => d.kind === "dir" ? 0.9 : rigid ? 0.9 : 0.55))
-      // Collision keeps nodes from overlapping within their wedge.
-      .force("collision", d3.forceCollide().radius(d => d.size + (d.kind === "dir" ? 8 : 2)))
-      // Dependency pull ∝ 1/(1+treeDistance)² — in soft mode only, and gentle,
-      // so tight (same-dir) couplings barely tug while cross-tree ones are near
-      // zero. Rigid mode: coupling is edges only, never moves a node.
-      .force("dep", rigid ? null : d3.forceLink(links.filter(l => l.kind === "dep"))
-        .id(d => d.id).distance(50)
-        .strength(d => 0.25 / Math.pow(1 + (d.dist || 0), 2)));
+    // No forces yet (modules + coupling are later tasks): an alpha-0 sim just
+    // carries the pinned nodes through the existing tick handler unchanged.
+    sim = d3.forceSimulation(nodes).alpha(0).alphaTarget(0).stop();
   } else {
     // Flat force layout for the folder (top-level) view.
     const linkDist = n > 50 ? 70 : 110;
@@ -386,11 +360,16 @@ function render(nodes, links) {
     ? `${d.label}/\n${d.file_count} files`
     : `${d.path || d.label}\n${d.dir ? d.dir + "/ · " : ""}${d.diag || 0} diagnostics${d.worst ? " · worst: " + d.worst : ""}`);
 
-  sim.on("tick", () => {
+  function drawPositions() {
     link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
         .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
     node.attr("transform", d => `translate(${d.x},${d.y})`);
-  });
+  }
+  sim.on("tick", drawPositions);
+  // Pack view seeds every node at its pinned home and runs an inert sim, so no
+  // tick ever fires — paint the initial positions once. (The folder/flat view's
+  // live sim ticks on its own.)
+  if (hasHubs) drawPositions();
   // Frame the whole arrangement once the layout has taken shape. Large graphs
   // decay alpha slowly, so "end" is unreliable — fit on a fixed settle timer
   // (scaled to node count), which is deterministic. The user can re-fit anytime
