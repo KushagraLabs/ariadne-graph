@@ -28,11 +28,10 @@
 
 **Step 1: Write the failing test** — new harness that mirrors the pack-tree builder + `d3.pack`. Since the harness has no DOM/d3, vendor a minimal pack? No — instead extract the tree-builder (pure) and assert tree shape; assert containment against d3 by loading d3 in Node. Check first whether `d3.min.js` loads under Node:
 
-Run: `node -e "const d3=require('./project/src/ariadne_graph/web/static/d3.min.js'); console.log(typeof d3.pack)"`
-Expected: prints `function` (UMD export works) OR errors (browser-only build).
+**RESOLVED (2026-07-10):** the vendored `d3.min.js` DOES load under Node —
+`node -e "const d3=require('./project/src/ariadne_graph/web/static/d3.min.js'); console.log(typeof d3.pack, typeof d3.hierarchy)"` prints `function function`. So the harness `require()`s the real d3 and asserts against genuine pack geometry (no browser needed for the math).
 
-- If it loads: harness uses real `d3.pack` and asserts **containment** (every leaf inside its dir, every child dir inside parent) and **weight ∝ area** (top-level module area ratio ≈ file-count ratio within tolerance).
-- If it does NOT load under Node: the harness asserts only the pure tree-builder (correct nesting, leaf counts, offsets); containment/weight are verified live in-browser in Task 6 instead. Document which path was taken in the harness header.
+Harness asserts: **containment** (every leaf inside its dir, every child dir inside parent) and **relaxed weight** — a module with more files is *generally* larger, NOT exact area∝count (packing shape affects enclosing radius; see design "promise correction").
 
 **Step 2: Run to verify it fails**
 
@@ -61,15 +60,17 @@ git commit -m "feat(web): circle-pack tree + home positions for file view"
 
 **Files:** Modify `index.html`; extend `pack_layout_invariants.mjs`.
 
-**Step 1: Failing test** — RIGID-BODY invariant: after shifting a module center by (dx,dy), every descendant's rendered position = home + (dx,dy). In the harness: build modules, pick one, shift its center, recompute `x=module.x+ox`, assert every descendant moved by exactly (dx,dy).
+**Step 1: Failing test** — TWO invariants:
+- RIGID-BODY: after shifting a module center by (dx,dy), every descendant's rendered position = home + (dx,dy).
+- ROOT/FOREST: the synthetic pack root is NOT in `modules` and is NOT rendered; direct-root files belong to a synthetic `(root files)` module (assert a fixture with a root-level file produces that module and the file has a valid `moduleId`).
 
-**Step 2: Run → FAIL** (offsets not computed yet).
+**Step 2: Run → FAIL** (offsets not computed / root handling absent).
 
-**Step 3: Implement** — collect depth-1 pack nodes as `modules`. For each module, for every descendant node set `ox = node.hx - module.hx`, `oy = node.hy - module.hy`, and tag `node.moduleId`. Store module `{id, hx, hy, R=node.r}`.
+**Step 3: Implement** — collect depth-1 **directory** pack nodes as `modules`, PLUS a synthetic `(root files)` module for any depth-1 leaf files (files directly under scope root). Do NOT include the pack root node in `modules` and skip it when rendering. For each module, for every descendant node set `ox = node.hx - module.hx`, `oy = node.hy - module.hy`, tag `node.moduleId`. Store module `{id, homeX, homeY, R=node.r, n=leafCount}`.
 
 **Step 4: Run → PASS.**
 
-**Step 5: Commit** `feat(web): freeze module subtree offsets as rigid bodies`
+**Step 5: Commit** `feat(web): module rigid bodies + forest (synthetic root-files module, no root circle)`
 
 ---
 
@@ -77,15 +78,15 @@ git commit -m "feat(web): circle-pack tree + home positions for file view"
 
 **Files:** Modify `index.html`; extend harness.
 
-**Step 1: Failing test** — COUPLING-AGGREGATION: given synthetic dep edges, cross-module pairs roll up to weighted `moduleLinks`; same-module edges contribute 0.
+**Step 1: Failing test** — COUPLING-AGGREGATION (normalized entanglement): given synthetic dep edges, cross-module pairs roll up to `moduleLinks` with `weight = crossEdges / sqrt(nA*nB)`; same-module edges contribute 0. Assert a small-but-tangled pair outranks a big-but-loosely-linked pair (the point of normalizing).
 
 **Step 2: Run → FAIL.**
 
-**Step 3: Implement** — map each dep edge (`data.edges`, source/target file paths → node ids → `moduleId`). Skip same-module. Accumulate `moduleLinks` keyed by unordered `{a,b}` with `weight = count`. (Reuse existing `byPath` map.)
+**Step 3: Implement** — map each dep edge (`data.edges`, source/target file paths → node ids → `moduleId`, reuse existing `byPath`). Skip same-module. Count `crossEdges` per unordered `{a,b}` pair, then `weight = crossEdges / Math.sqrt(nA * nB)` (nX = module leaf count). Emit `moduleLinks {source, target, weight}`.
 
 **Step 4: Run → PASS.**
 
-**Step 5: Commit** `feat(web): aggregate cross-module coupling into module links`
+**Step 5: Commit** `feat(web): normalized cross-module entanglement links`
 
 ---
 
@@ -93,25 +94,35 @@ git commit -m "feat(web): circle-pack tree + home positions for file view"
 
 **Files:** Modify `index.html`; extend harness.
 
-**Step 1: Failing test** — SLIDER-BOUNDS: at slider=0, module centers equal home (pure ideal); at slider=1, home-spring strength≈0 (coupling dominates). Assert the force config, not a full sim run (deterministic config check).
+**Step 1: Failing test** — SLIDER-ENDPOINTS + NO-OVERLAP, asserted by BEHAVIOR (run the layout fn), not force-strength inspection:
+- slider=0 → `runLayout(0)` bypasses the sim; every module `x,y` equals its `homeX,homeY` exactly.
+- slider=1 → after settling, no two module circles overlap (`dist(a,b) >= a.R+b.R` for all pairs), and the residual home strength used is `0.1` (nonzero — orientation preserved).
 
 **Step 2: Run → FAIL.**
 
-**Step 3: Implement** — replace the current `d3.forceSimulation(nodes)` with a sim over **module centers only**:
+**Step 3: Implement** — a `runLayout(slider)`:
 ```
+if (slider === 0) {                       // explicit static ideal — sim would drift via collision
+  modules.forEach(m => { m.x = m.homeX; m.y = m.homeY; m.vx = m.vy = 0; });
+  renderPositions(); fitView(); return;
+}
+const gap = w => 12 + 88 * (1 - clamp01(w / maxWeight));   // strong pair → small gap
 sim = d3.forceSimulation(modules)
-  .force("couple", d3.forceLink(moduleLinks).id(m=>m.id).distance(40)
-      .strength(l => coupleStrength(l.weight) * slider))
+  .force("couple", d3.forceLink(moduleLinks).id(m=>m.id)
+      .distance(l => l.source.R + l.target.R + gap(l.weight))   // RADIUS-AWARE, not 40
+      .strength(l => couple(l.weight) * slider))
   .force("collide", d3.forceCollide(m => m.R + 8))
-  .force("hx", d3.forceX(m=>m.homeX).strength(1 - slider))
-  .force("hy", d3.forceY(m=>m.homeY).strength(1 - slider));
+  .force("hx", d3.forceX(m=>m.homeX).strength(0.1 + 0.9*(1 - slider)))   // RESIDUAL spring
+  .force("hy", d3.forceY(m=>m.homeY).strength(0.1 + 0.9*(1 - slider)));
 ```
-On tick: `for each node: node.x = module.x + node.ox; node.y = module.y + node.oy`. Draw circles from ALL pack nodes (not just modules). `state.slider` defaults 0.35.
+On tick: `for each rendered pack node (NOT the root): node.x = module.x + node.ox; node.y = module.y + node.oy`. Draw circles from all pack nodes except the root. `state.slider` defaults 0.35.
+
+**Also fix `fitView` to bound by circle EXTENT, not centers** (existing fn ~line 220): `minX = Math.min(...nodes.map(d => d.x - (d.r||0)))`, `maxX = ...d.x + (d.r||0)`, same for y. With pack radii of hundreds of px, center-only bounds clip the biggest modules after coupling/reset.
 
 **Step 4: Run harness → PASS. Then live check:**
 - Reload browser, drive to `lumen_platform`, `await settle`, screenshot.
-- Assert via injected JS: module count ~8, every file `hypot(x-(mod.x+ox)) < 1` (rigid), no NaN.
-Expected: packed modules visible, files inside their dir circles.
+- Assert via injected JS: module count ~8, every file `hypot(x-(mod.x+ox)) < 1` (rigid), no NaN, largest module fully within viewport bounds after fit (radii honored).
+Expected: packed modules visible, files inside their dir circles, nothing clipped.
 
 **Step 5: Commit** `feat(web): 8-body coupling sim with rigid-body module render`
 
@@ -151,7 +162,7 @@ Expected: packed modules visible, files inside their dir circles.
 
 **Step 1–3: Implement:**
 - Click a dir circle → `zoom.transform` transition to fit that circle's bounds (compute from `d.x,d.y,d.r` + current sim offset). Click empty space / breadcrumb → zoom out. Breadcrumbs drive zoom targets.
-- Header: replace **Soft coupling** button + **Depth** dropdown with a **coupling range slider** (`<input type=range 0..100>`, label "Coupling: ideal↔real"); `oninput` sets `state.slider`, re-runs the 8-body sim (`sim.alpha(0.6).restart()`), re-fits. Keep Names, Reset, repo picker.
+- Header: replace **Soft coupling** button + **Depth** dropdown with a **coupling range slider** (`<input type=range 0..100>`, label "Coupling: ideal ↔ strong" — NOT "reality"; a force layout is a distortion cue, not ground truth). `oninput` sets `state.slider` and calls `runLayout(slider/100)` (which bypasses the sim at 0, else `sim.alpha(0.6).restart()`), re-fits. Keep Names, Reset, repo picker.
 - Remove now-dead code paths: `MAX_DEPTH`/`maxDepth()` control, drill-by-refetch, sunburst/hub layout remnants in the `hasHubs` branch. Keep the flat folder view branch.
 
 **Step 4: Live check** — drag slider 0→100 (modules spread→cluster by coupling); click a module (zooms in); Reset (zooms out); zero console errors. Screenshot at slider 0 and slider 1 to show ideal-vs-real.

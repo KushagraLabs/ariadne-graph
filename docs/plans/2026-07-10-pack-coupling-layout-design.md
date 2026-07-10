@@ -20,30 +20,50 @@ frozen **home** position `(hx, hy)` and radius from the pack.
 
 **Reality distortion (overlay).** Top-level module circles are **rigid bodies**: each module's
 entire packed subtree (sub-dirs + files) is frozen relative to the module center and travels
-as one unit. A force simulation runs on **only the ~8 top-level module centers**:
+as one unit. Once modules drift apart, an enclosing repository-root circle is geometrically
+impossible — the model is a **forest of top-level module territories, not one enclosing root
+circle**. A force simulation runs on **only the ~8 top-level module centers**:
 
-- **Coupling attraction** — for each pair of top-level modules, an attractive force ∝ the
-  number of cross-module dependency edges between them (aggregate coupling). Entangled modules
-  pull together.
-- **Collision** — module circles can't overlap (pack radius + margin); independent modules
-  push apart.
-- **Home spring** — a weak pull back to each module's packed position, so the arrangement stays
-  on-screen and there is a stable "ideal" to compare against.
+- **Coupling attraction** — for each pair of top-level modules, an attractive force whose
+  *target distance is radius-aware*: `distance = R_a + R_b + gap(weight)`, where a strongly-
+  entangled pair gets a small gap and a weak pair keeps whitespace. Distance-40 style links are
+  WRONG here (radii are hundreds of px → centers would coincide → everything compresses to a
+  central touching-cluster, the exact failure this redesign avoids).
+- **Collision** — module circles can't overlap (`R + margin`); independent modules push apart.
+- **Home spring** — a **residual** pull back to each module's packed home:
+  `homeStrength = 0.1 + 0.9 * (1 − slider)`. It never reaches 0, so even at full coupling the
+  arrangement keeps its high-level orientation (preserves the mental map) rather than rotating
+  into a generic force blob. The endpoint is therefore labelled **"strong coupling"**, not
+  "literal reality" — a force layout is a distortion cue, not ground truth.
 
-A **coupling slider (0–100%)** scales coupling force vs. home spring: 0 = pure pack (ideal),
-100 = full module-coupling distortion (reality).
+**Coupling metric = entanglement, normalized:** `weight = crossEdges / sqrt(nA * nB)` (nX = file
+count of module X). This surfaces modules that are *disproportionately* entangled independent of
+size — a small module tightly bound to a big one stands out — rather than raw dependency volume,
+where big modules always look most coupled.
+
+A **coupling slider (0–100%)** scales the coupling force vs. the residual home spring.
+**Slider = 0 is an explicit static layout:** bypass the simulation entirely, set every module to
+its packed home, render once. (Collision at `R + margin` demands more clearance than
+`pack().padding(3)` provides, so leaving the sim running at 0 would still nudge modules off
+home — violating the "pure ideal" endpoint.)
 
 ## Data flow (per scope, in `renderScope`)
 
 1. **Tree** — build nested `{name, children}` from file paths → `d3.hierarchy().sum(leaf=1)` →
    `d3.pack().padding(k)`. Store each node's home `(hx, hy)` and `r`.
-2. **Modules** — depth-1 pack nodes. For each: center, radius `R`, and descendants with a
-   **frozen offset** `(ox, oy) = (node.hx − module.hx, node.hy − module.hy)`.
-3. **Aggregate coupling** — map each dep edge's endpoints to their top-level module; count
-   cross-module pairs → `moduleLinks {source, target, weight}`. Same-module edges ignored.
+2. **Modules** — the depth-1 **directory** pack nodes, PLUS a synthetic `(root files)` module
+   holding any files directly under the scope root (they are depth-1 leaves with no owning
+   directory module). The synthetic pack **root** node is NOT a module and is NOT rendered.
+   For each module: center, radius `R`, and descendants with a **frozen offset**
+   `(ox, oy) = (node.hx − module.hx, node.hy − module.hy)`.
+3. **Coupling** — map each dep edge's endpoints to their top-level module; skip same-module
+   edges; accumulate `crossEdges` per unordered module pair; normalize →
+   `moduleLinks {source, target, weight = crossEdges / sqrt(nA*nB)}`.
 
-**Simulate (~8 bodies):** `forceLink(moduleLinks)` strength ∝ weight × slider; `forceCollide(R+margin)`;
-`forceX/Y(home)` strength = (1 − slider).
+**Simulate (~8 bodies), slider > 0 only:**
+`forceLink(moduleLinks).distance(l => l.source.R + l.target.R + gap(l.weight)).strength(l => couple(l.weight) * slider)`;
+`forceCollide(R + margin)`; `forceX/Y(home).strength(0.1 + 0.9*(1 − slider))`.
+Render (all pack nodes except the root): `x = module.x + ox`, `y = module.y + oy`.
 
 **Render each tick:** for every node, `x = module.x + ox`, `y = module.y + oy`. Moving a module
 center rigidly translates its whole subtree. Files/sub-dirs never compute their own physics —
@@ -73,7 +93,9 @@ only ~8 module centers are simulated, so it is fast and cannot re-ball toward ce
 - **Coupling slider (0–100%)** replaces the Soft/Rigid toggle. Dragging re-runs only the 8-body
   sim and re-fits.
 - **Names auto/on/off**, **Reset view**, repo picker, hygiene legend, detail panel — preserved.
-- **Fit** — two-shot (early + settle); 8 bodies settle fast.
+- **Fit** — two-shot (early + settle); 8 bodies settle fast. **`fitView` must bound by circle
+  extent, not centers:** `minX = min(node.x − node.r)`, `maxX = max(node.x + node.r)`, etc.
+  With pack radii of hundreds of px, center-only bounds clip the largest modules.
 
 ## Testing (mirrors `tests/test_web/layout_invariants.mjs`)
 
@@ -82,13 +104,21 @@ guards a real mechanism:
 
 1. **Containment** — every leaf circle fully inside its directory circle; every child dir fully
    inside its parent.
-2. **Weight distribution** — top-level module area ∝ its file count (the core ask).
+2. **Weight (relaxed, not exact proportionality)** — leaf weights are equal per file; a module
+   with more files is *generally* larger than one with fewer. We do NOT assert exact
+   area ∝ file-count: with a single recursive `d3.pack`, an enclosing directory's radius also
+   depends on packing efficiency and subtree shape, so equal-file-count modules with different
+   nesting legitimately differ in radius. (Exact proportionality would need a two-stage layout —
+   out of scope unless it becomes a hard requirement.)
 3. **Rigid body** — after shifting a module center by (dx,dy), every descendant's rendered
    position shifts by exactly (dx,dy).
-4. **Coupling aggregation** — cross-module edge counts roll up correctly; same-module edges
-   contribute zero drift.
-5. **Slider bounds** — at 0, module centers sit on home positions (pure ideal); at 1, home
-   spring ≈ 0 so coupling dominates.
+4. **Coupling aggregation** — cross-module edges roll up per module pair and normalize
+   (`crossEdges / sqrt(nA*nB)`); same-module edges contribute zero.
+5. **No overlap after distortion** — after the sim settles at slider=1, no two module circles
+   overlap (collision holds).
+6. **Slider endpoints** — at slider=0 the sim is bypassed and every module sits exactly on its
+   home (assert the behavior, not force-strength values); at slider=1 the residual home spring
+   is `0.1` (nonzero) so coupling dominates but orientation is preserved.
 
 ## Rollout
 
@@ -106,6 +136,17 @@ console errors. No backend change.
   entangled."
 - **Replace, not coexist** — packing subsumes what the ring layout reached for. Keeping the old
   force path as a toggle is speculative flexibility; remove it.
+- **Radius-aware coupling distance, static slider-0, residual home spring, forest-not-root,
+  radii-in-fitView** — five mechanism corrections from review (2026-07-10). Without the first,
+  high coupling compresses to a central touching-cluster; without static slider-0, the "ideal"
+  endpoint isn't actually the pack; without the residual spring, full coupling loses the mental
+  map; without forest handling, the synthetic root breaks the tick formula and can't contain
+  drifted modules; without radii in fit, big modules clip.
+- **Entanglement over volume** — `weight = crossEdges / sqrt(nA*nB)` so size doesn't inflate
+  coupling; surfaces disproportionately-entangled modules.
+- **Area is NOT exactly proportional to file count** — single `d3.pack` makes leaf *area*
+  weight-proportional, but enclosing-dir radius also depends on packing shape. Promise/test
+  relaxed to "larger file-count → generally larger + contained + non-overlapping."
 
 ## Risk
 
