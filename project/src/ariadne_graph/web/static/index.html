@@ -161,10 +161,21 @@ function render(data) {
   const nDeps = data.edges.filter(e => e.kind === "dep").length;
   d3.select("#counts").text(`${nFiles} files · ${nDirs} dirs · ${nDeps} deps · ${mods.length} modules`);
 
-  // childCount per dir (its subtree size) sizes the hub; file leaves are fixed-small.
-  const kids = new Map(data.nodes.map(n => [n.id, 0]));
-  data.edges.forEach(e => { if (e.kind === "tree") kids.set(e.target, (kids.get(e.target)||0)+1); });
-  const R = d => d.kind === "dir" ? 5 + Math.sqrt(kids.get(d.id)||0) * 2.2 : 3.5;
+  // TOTAL subtree size per dir (all nested files + sub-dirs), not just direct
+  // children — a parent must never render smaller than a child it contains. Dir
+  // ids and file `dir`s are path prefixes, so a node is inside dir D iff its path
+  // equals D or starts with "D/". kids[] also feeds the hover tooltip.
+  const kids = new Map(data.nodes.filter(n => n.kind === "dir").map(n => [n.id, 0]));
+  const add = id => kids.set(id, kids.get(id) + 1);
+  data.nodes.forEach(n => {
+    for (const [id] of kids) {
+      // A FILE counts toward its own dir + every ancestor; a DIR toward each
+      // STRICT ancestor (not itself). Both use path-prefix containment.
+      if (n.kind === "file" ? (n.dir === id || n.dir.startsWith(id + "/")) : n.id.startsWith(id + "/"))
+        add(id);
+    }
+  });
+  const R = d => d.kind === "dir" ? 5 + Math.sqrt(kids.get(d.id)||0) * 1.7 : 3.5;
 
   // Neighbor index (over BOTH edge kinds) for hover-trace.
   const nbr = new Map(data.nodes.map(n => [n.id, new Set()]));
@@ -258,16 +269,20 @@ function render(data) {
                                 : (e.violation ? "url(#arr-vio)" : "url(#arr-hi)"));
     label.style("opacity", n => keep.has(n.id) ? 1 : 0.05);
 
-    // Render names for the hovered node + neighbors on top.
-    const named = data.nodes.filter(n => keep.has(n.id));
+    // Reveal FILE names on top — but only when hovering a file (so its name and
+    // the files it wires to are readable). Hovering a dir must NOT dump every
+    // child file's name; its standing dir label is enough.
+    const named = d.kind === "file"
+      ? data.nodes.filter(n => keep.has(n.id) && n.kind === "file")
+      : [];
     hoverLabel = hoverLabel.data(named, n => n.id).join("text")
-      .attr("class", "label").classed("dir", n => n.kind === "dir")
+      .attr("class", "label")
       .style("opacity", 1).text(n => n.name)
       .attr("x", n => n.x + 6).attr("y", n => n.y + 3);
 
     const out = data.edges.filter(e => e.kind==="dep" && idOf(e.source)===d.id).length;
     const inc = data.edges.filter(e => e.kind==="dep" && idOf(e.target)===d.id).length;
-    const kind = d.kind === "dir" ? `dir · ${kids.get(d.id)||0} children`
+    const kind = d.kind === "dir" ? `dir · ${kids.get(d.id)||0} items in subtree`
       : `${d.module} · imports ${out} · imported by ${inc}`;
     tip.style("opacity",1).html(`<div class="n">${d.name}</div>`+
       `<div class="p">${kind} · ${d.worst_level||"clean"}</div>`);

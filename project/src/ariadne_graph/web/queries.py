@@ -76,28 +76,37 @@ def _dir_of(rel_path: str) -> str:
     return head if sep else ""
 
 
-# Test organs are exempt as IMPORTERS: a test reaching into the code it exercises
-# is expected, not a layering smell. (A non-test file reaching into a test organ's
-# internals is still a violation — the exemption is one-directional.)
-_TEST_ORGANS = {"tests", "test", "__tests__", "spec", "specs", "e2e"}
+# Peripheral organs (tests, scripts, and kin) are entry-point / glue code that
+# legitimately reaches into everything it exercises or wires together. Dep edges
+# ORIGINATING from these organs are omitted entirely, so the graph focuses on the
+# core wiring rather than being swamped by test/script fan-in.
+_PERIPHERAL_ORGANS = {
+    "tests", "test", "__tests__", "spec", "specs", "e2e",
+    "scripts", "script",
+}
+
+
+def _is_peripheral_source(dir_path: str) -> bool:
+    """True if a file in ``dir_path`` belongs to a peripheral organ (test/script)."""
+    organ = dir_path.split("/", 1)[0] if dir_path else ""
+    return organ in _PERIPHERAL_ORGANS
 
 
 def _is_violation(dir_a: str, dir_b: str) -> bool:
     """Layering rule for an import from a file in ``dir_a`` to one in ``dir_b``.
 
-    ``dir_*`` are repo-relative directory paths. The top-level *organ* is the
-    first path segment. An import is ALLOWED (not a violation) when any of:
+    Only ever called for NON-peripheral sources (peripheral-source edges are
+    dropped upstream). ``dir_*`` are repo-relative directory paths; the top-level
+    *organ* is the first path segment. An import is ALLOWED when either:
 
       1. Same organ — A and B share the first segment. Any direction within your
          own organ is fine (organ is the unit of encapsulation).
       2. Organ front door — B sits directly at another organ's top level (its dir
          IS a top-level organ, no deeper), e.g. ``src/x -> tests``.
-      3. Test importer — A is inside a test organ (``tests/``, ``spec/``, …). Tests
-         are meant to reach into the code they exercise, so they never violate.
 
-    A VIOLATION is a NON-test file reaching into a *different* organ's internals
-    (B one or more levels below its organ root), e.g. ``src/x -> tests/unit/y``.
-    Root-level files (empty dir) belong to no organ and never violate.
+    A VIOLATION is reaching into a *different* organ's internals (B one or more
+    levels below its organ root), e.g. ``src/x -> tests/unit/y``. Root-level files
+    (empty dir) belong to no organ and never violate.
     """
     if dir_a == dir_b:
         return False
@@ -105,8 +114,6 @@ def _is_violation(dir_a: str, dir_b: str) -> bool:
     organ_b = dir_b.split("/", 1)[0] if dir_b else ""
     if organ_a == organ_b:
         return False               # same organ — always fine
-    if organ_a in _TEST_ORGANS:
-        return False               # test importer — exempt (one-directional)
     # Different organ: OK only if B is that organ's top-level front door (no "/"),
     # a violation if it reaches into the organ's internals.
     return "/" in dir_b
@@ -215,8 +222,13 @@ async def full_graph(store: SQLiteGraphStore, graph_id: str, *, repo_root: str) 
     weights: dict[tuple[str, str], int] = {}
     for r in xref:
         sf, tf = r["sf"], r["tf"]
-        if sf in files and tf in files:
-            weights[(sf, tf)] = weights.get((sf, tf), 0) + 1
+        if sf not in files or tf not in files:
+            continue
+        # Drop edges originating from peripheral organs (tests/scripts/…) — they
+        # are entry-point glue and swamp the core wiring otherwise.
+        if _is_peripheral_source(files[sf]["dir"]):
+            continue
+        weights[(sf, tf)] = weights.get((sf, tf), 0) + 1
     dep_edges = [
         {
             "source": s, "target": t, "weight": w, "kind": "dep",

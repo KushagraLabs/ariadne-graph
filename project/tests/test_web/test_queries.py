@@ -157,13 +157,14 @@ async def test_dep_edges_from_scip_resolved_python_calls(store: SQLiteGraphStore
     """Python graphs never emit REFERENCES — SCIP refines CALLS in place, tagging
     resolved ones ``resolved_by=scip-python``. Those become ``dep`` edges; unresolved
     bare-name CALLS must NOT (fuzzy targets = noise, the enterprise_tabular_ad bug).
+    Uses a non-peripheral source (``src/``) so the edge is not dropped upstream.
     """
     repo = "/Users/x/Documents/py_repo"
     await store.add_nodes_batch("gpy", [
-        _sym("caller", "gpy", f"{repo}/scripts/train.py"),
+        _sym("caller", "gpy", f"{repo}/src/train.py"),
         _sym("callee", "gpy", f"{repo}/src/model.py"),
-        _sym("local", "gpy", f"{repo}/scripts/train.py"),
-        _file("caller", "gpy", f"{repo}/scripts/train.py"),
+        _sym("local", "gpy", f"{repo}/src/train.py"),
+        _file("caller", "gpy", f"{repo}/src/train.py"),
         _file("callee", "gpy", f"{repo}/src/model.py"),
     ])
     await store.add_edges_batch("gpy", [
@@ -174,10 +175,41 @@ async def test_dep_edges_from_scip_resolved_python_calls(store: SQLiteGraphStore
     ])
 
     g = await queries.full_graph(store, "gpy", repo_root=repo)
-    # scripts/ -> src (a top-level organ front door) is NOT a violation.
+    # src/train -> src/model is same-organ, so drawn and NOT a violation.
     assert _edge_kinds(g, "dep") == [
-        {"source": f"{repo}/scripts/train.py", "target": f"{repo}/src/model.py",
+        {"source": f"{repo}/src/train.py", "target": f"{repo}/src/model.py",
          "weight": 1, "kind": "dep", "violation": False}]
+
+
+async def test_peripheral_source_edges_dropped(store: SQLiteGraphStore) -> None:
+    """The hard case: dep edges ORIGINATING from a peripheral organ (tests, scripts,
+    tools, bin) are omitted entirely — not merely un-flagged — so the core wiring
+    isn't swamped. But edges INTO those organs from core code are unaffected.
+    """
+    repo = "/Users/x/Documents/repo"
+    await store.add_nodes_batch("g", [
+        _sym("s1", "g", f"{repo}/scripts/run.py"),
+        _sym("t1", "g", f"{repo}/tests/test_x.py"),
+        _sym("c1", "g", f"{repo}/src/core/a.py"),
+        _sym("c2", "g", f"{repo}/src/core/b.py"),
+        _file("s1", "g", f"{repo}/scripts/run.py"),
+        _file("t1", "g", f"{repo}/tests/test_x.py"),
+        _file("c1", "g", f"{repo}/src/core/a.py"),
+        _file("c2", "g", f"{repo}/src/core/b.py"),
+    ])
+    await store.add_edges_batch("g", [
+        # peripheral SOURCES -> dropped
+        CodeEdge(source="s1", target="c1", graph_id="g", rel_type="REFERENCES", properties={}),
+        CodeEdge(source="t1", target="c1", graph_id="g", rel_type="REFERENCES", properties={}),
+        # core source -> another core file: kept
+        CodeEdge(source="c1", target="c2", graph_id="g", rel_type="REFERENCES", properties={}),
+    ])
+
+    g = await queries.full_graph(store, "g", repo_root=repo)
+    srcs = {e["source"] for e in _edge_kinds(g, "dep")}
+    assert srcs == {f"{repo}/src/core/a.py"}          # only the core->core edge survives
+    assert f"{repo}/scripts/run.py" not in srcs        # scripts source dropped
+    assert f"{repo}/tests/test_x.py" not in srcs        # tests source dropped
 
 
 async def test_mixed_absolute_and_relative_paths(store: SQLiteGraphStore) -> None:
@@ -263,17 +295,15 @@ async def test_violation_rule_pure() -> None:
     assert v("src/a", "") is False               # target is a root-level file, no organ
 
 
-async def test_test_importer_exemption() -> None:
-    """Tests reaching into the code they exercise are NOT violations, but the
-    exemption is ONE-DIRECTIONAL: a non-test file reaching into a test organ's
-    internals is still a violation. A symmetric rule would get the second wrong.
+async def test_peripheral_source_predicate() -> None:
+    """Which organs are peripheral sources (their outgoing dep edges get dropped).
+    The check is one-directional: it keys off the SOURCE dir's top-level organ.
     """
-    v = queries._is_violation
-    # test importer -> another organ's internals: EXEMPT
-    assert v("tests/integration/api", "src/api/auth") is False
-    assert v("tests/unit", "scripts/lib/tool") is False
-    assert v("spec/x", "src/deep/y") is False        # other test-organ names too
-    # one-directional: prod file -> test organ internals is STILL a violation
-    assert v("src/core", "tests/unit/y") is True
-    # a non-test file is unaffected
-    assert v("scripts/x", "src/deep/y") is True
+    p = queries._is_peripheral_source
+    assert p("tests/integration/api") is True
+    assert p("scripts/lib") is True
+    assert p("spec/x") is True
+    assert p("src/core") is False          # core code is not peripheral
+    assert p("lumen_platform/api") is False
+    assert p("tools/x") is False           # 'tools' is NOT assumed peripheral (may be real code)
+    assert p("") is False                  # root-level file, no organ
