@@ -241,10 +241,19 @@ function render(nodes, links) {
     nodes.forEach(d => { if (d.kind === "file") {
       const h = "dir:" + d.dir; (filesByHub.get(h) || filesByHub.set(h, []).get(h)).push(d);
     }});
-    filesByHub.forEach(arr => arr.forEach((d, k) => {
-      d.shellAngle = (k + 0.5) / arr.length * 2 * Math.PI;   // even spread
-      d.shellR = ring * 0.7;                                  // files ride just outside their hub
-    }));
+    // Shell radius scales with how many files ride it, so a crowded directory
+    // gets a bigger ring (files don't overlap) while a small one stays tight —
+    // shell SIZE itself then reads as "how many files in this directory".
+    const AVG_FILE_R = 14;   // approx node radius + gap
+    filesByHub.forEach(arr => {
+      // circumference must fit all files: 2πR ≥ n · spacing  →  R ≥ n·spacing/2π
+      const rNeeded = (arr.length * AVG_FILE_R * 2) / (2 * Math.PI);
+      const shellR = Math.max(ring * 0.6, rNeeded);
+      arr.forEach((d, k) => {
+        d.shellAngle = (k + 0.5) / arr.length * 2 * Math.PI;   // even spread
+        d.shellR = shellR;
+      });
+    });
     // Seed positions on depth rings (golden-angle) so it starts unfolded.
     nodes.forEach((d, i) => {
       if (d.fx != null) return;
@@ -254,14 +263,16 @@ function render(nodes, links) {
     });
 
     const tgtKind = d => (typeof d.target === "object" ? d.target.kind : null);
+    const isFileHub = d => d.kind === "hub" && tgtKind(d) === "file";
     sim = d3.forceSimulation(nodes)
-      // Tree spring: stiff & short — files hug their hub, dirs hug their parent.
+      // Links: dir→dir tree spring holds the hierarchy spine. File→hub spokes
+      // carry ZERO force — the shell force alone positions files, so siblings
+      // land on one clean equidistant arc instead of being tugged three ways.
+      // Dep pull ∝ 1/(1+treeDistance)² (rigid mode: no dep positioning force).
       .force("link", d3.forceLink(links).id(d => d.id)
         .distance(d => d.kind === "hub" ? (tgtKind(d) === "file" ? ring * 0.7 : 40) : 70)
-        // KEY: dependency pull ∝ 1/(1+treeDistance)² — same-dir couples pull hard,
-        // cross-organ couples pull ~weakly so they settle FAR (no ball-up). In
-        // rigid mode coupling contributes NO positioning force (edges only).
-        .strength(d => d.kind === "hub" ? 0.9
+        .strength(d => isFileHub(d) ? 0            // file→hub spoke: visual only
+          : d.kind === "hub" ? 0.9                 // dir→dir spine: stiff
           : rigid ? 0 : 0.9 / Math.pow(1 + (d.dist || 0), 2)))
       // Repulsion spreads siblings; hubs push harder to claim separate wedges.
       .force("charge", d3.forceManyBody().strength(d =>
@@ -270,19 +281,21 @@ function render(nodes, links) {
       // Outward drive: dirs pulled to their depth ring (firm → crisp hierarchy).
       .force("radial", d3.forceRadial(d => (d.depth || 0) * ring, cx, cy)
         .strength(d => d.kind === "dir" ? 0.5 + 0.35 * ((d.depth || 1) / maxDepth) : 0))
-      // SHELL force: place each file at its hub's position + (shellR, shellAngle).
-      // Rigid → strong (files locked on a clean arc). Soft → gentler, so LCA-
-      // weighted coupling can bulge a file off-shell = visible incoherence cue.
+      // SHELL force: the SOLE positioner for files — pin each to its hub's
+      // position + (shellR, shellAngle) so siblings sit on one clean arc. Rigid
+      // → very firm (crisp petals). Soft → firm but yields to LCA-weighted
+      // coupling, so a file reaching outside its dir bulges off-shell = the
+      // visible incoherence cue. No competing tree-spring anymore.
       .force("shellX", d3.forceX(d => {
         if (d.kind !== "file") return cx;
         const h = byId.get("dir:" + d.dir); if (!h) return cx;
         return (h.x ?? cx) + d.shellR * Math.cos(d.shellAngle);
-      }).strength(d => d.kind === "file" ? (rigid ? 0.9 : 0.5) : 0))
+      }).strength(d => d.kind === "file" ? (rigid ? 1 : 0.7) : 0))
       .force("shellY", d3.forceY(d => {
         if (d.kind !== "file") return cy;
         const h = byId.get("dir:" + d.dir); if (!h) return cy;
         return (h.y ?? cy) + d.shellR * Math.sin(d.shellAngle);
-      }).strength(d => d.kind === "file" ? (rigid ? 0.9 : 0.5) : 0));
+      }).strength(d => d.kind === "file" ? (rigid ? 1 : 0.7) : 0));
   } else {
     // Flat force layout for the folder (top-level) view.
     const linkDist = n > 50 ? 70 : 110;
