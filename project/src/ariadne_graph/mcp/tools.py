@@ -17,6 +17,7 @@ from ariadne_graph.core.architecture import (
     _rel,
     explain_edge,
     persist_architecture_diagnostics,
+    read_dependency_matrix,
 )
 from ariadne_graph.core.auto_sync import AutoSyncManager
 
@@ -43,6 +44,7 @@ from ariadne_graph.mcp.schemas import (
     CommunitiesOutput,
     DeleteProjectInput,
     DeleteProjectOutput,
+    DependencyMatrixOutput,
     DetectChangesInput,
     DetectChangesOutput,
     ExplainEdgeInput,
@@ -50,6 +52,7 @@ from ariadne_graph.mcp.schemas import (
     FindHotspotsInput,
     FindHotspotsOutput,
     GetArchitectureInput,
+    GetDependencyMatrixInput,
     ImpactAnalysisInput,
     ImpactAnalysisOutput,
     IndexInput,
@@ -1202,6 +1205,49 @@ class ToolRegistry:
             message=(
                 f"{explanation.src} -> {explanation.dst}: {explanation.reason}"
                 + ("" if explanation.allowed else " (violation)")
+            ),
+        )
+
+    async def handle_get_dependency_matrix(
+        self, input: GetDependencyMatrixInput
+    ) -> DependencyMatrixOutput:
+        """Get the file/directory/module-level dependency graph (nodes + edges).
+
+        SQLite-only, like the persisted architecture pass: the dep-edge join is
+        SQL (``_DEP_EDGE_SQL``), so other stores are not supported.
+        """
+        repo_path = str(Path(input.repo_path).resolve())
+        graph_id = self._get_graph_id(repo_path)
+
+        exists = await self._graph_exists(graph_id)
+        if not exists:
+            return DependencyMatrixOutput(message="Repository has not been indexed yet")
+
+        if not isinstance(self.graph_store, SQLiteGraphStore):
+            return DependencyMatrixOutput(
+                message="Dependency matrix requires the SQLite graph store"
+            )
+
+        matrix = await read_dependency_matrix(
+            self.graph_store, graph_id, repo_path, group_by=input.group_by
+        )
+        return DependencyMatrixOutput(
+            nodes=[
+                {"id": n.id, "module": n.module, "production": n.production}
+                for n in matrix.nodes
+            ],
+            edges=[
+                {
+                    "source": e.source,
+                    "target": e.target,
+                    "import_count": e.import_count,
+                    "violation_count": e.violation_count,
+                }
+                for e in matrix.edges
+            ],
+            message=(
+                f"Dependency matrix ({input.group_by}): {len(matrix.nodes)} nodes, "
+                f"{len(matrix.edges)} edges"
             ),
         )
 

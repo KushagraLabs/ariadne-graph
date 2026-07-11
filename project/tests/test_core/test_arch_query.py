@@ -16,8 +16,6 @@ helpers rather than reimplementing the layering rule.
 
 from __future__ import annotations
 
-import pytest
-
 from ariadne_graph.core import architecture
 
 
@@ -56,7 +54,6 @@ def test_explain_edge_front_door_import_is_allowed():
 # cross-organ but contributes ZERO violations, while a deep edge contributes one.
 # --------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="bead cq7", strict=True)
 def test_dependency_matrix_file_level_nodes_and_violation_counts():
     files = ["src/x.py", "lib/deep/nested/y.py", "lib/api.py"]
     dep_edges = [
@@ -83,7 +80,6 @@ def test_dependency_matrix_file_level_nodes_and_violation_counts():
     assert front.violation_count == 0  # front door is allowed
 
 
-@pytest.mark.xfail(reason="bead cq7", strict=True)
 def test_dependency_matrix_matches_is_deep_import_for_every_edge():
     files = ["src/a/x.py", "src/b/deep/y.py", "app/deep/z.py"]
     dep_edges = [
