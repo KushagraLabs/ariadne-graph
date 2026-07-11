@@ -15,7 +15,7 @@
 #   bd hooks install --chain      # re-adds beads' marker-section into .git/hooks
 repos:
   - repo: https://github.com/KushagraLabs/ariadne-graph
-    rev: codex-gate-v1.0.0
+    rev: cd8cba9215b40bc8c1d0eaf43e357db9e1fc1108  # tag codex-gate-v1.0.0 — SHA-pinned (immutable) per supply-chain review
     hooks:
       - id: codex-review-gate
         args: [--code-suffixes=py,ts,tsx,js,jsx,mjs,cjs]
