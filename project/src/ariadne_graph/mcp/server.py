@@ -31,6 +31,7 @@ from ariadne_graph.mcp.schemas import (
     ExplainEdgeInput,
     FindHotspotsInput,
     GetArchitectureInput,
+    GetDependencyMatrixInput,
     ImpactAnalysisInput,
     IndexInput,
     IndexStatusInput,
@@ -386,6 +387,27 @@ async def code_graph_explain_edge(src_path: str, dst_path: str) -> dict[str, Any
     registry = _get_registry()
     input_data = ExplainEdgeInput(src_path=src_path, dst_path=dst_path)
     result = await registry.handle_explain_edge(input_data)
+    return result.model_dump()
+
+
+@mcp.tool()
+async def code_graph_get_dependency_matrix(
+    repo_path: str, group_by: Literal["file", "directory", "module"] = "file"
+) -> dict[str, Any]:
+    """Get the file/directory/module-level dependency graph (nodes + edges).
+
+    Args:
+        repo_path: Absolute or relative path to the repository root.
+        group_by: Granularity to collapse nodes/edges to: "file" (default),
+            "directory", or "module".
+
+    Returns:
+        Dict with nodes (id, module, production) and edges (source, target,
+        import_count, violation_count).
+    """
+    registry = _get_registry()
+    input_data = GetDependencyMatrixInput(repo_path=repo_path, group_by=group_by)
+    result = await registry.handle_get_dependency_matrix(input_data)
     return result.model_dump()
 
 

@@ -156,6 +156,123 @@ def explain_edge(src_rel: str, dst_rel: str) -> EdgeExplanation:
     )
 
 
+@dataclass(frozen=True)
+class MatrixNode:
+    """One graph node in a :class:`DependencyMatrix` — a file, directory, or module
+    depending on ``group_by``."""
+
+    id: str
+    module: str
+    production: bool
+
+
+@dataclass(frozen=True)
+class MatrixEdge:
+    """One aggregated edge in a :class:`DependencyMatrix`."""
+
+    source: str
+    target: str
+    import_count: int
+    violation_count: int
+
+
+@dataclass(frozen=True)
+class DependencyMatrix:
+    """File/module-level dependency graph: nodes + aggregated edges."""
+
+    nodes: list[MatrixNode]
+    edges: list[MatrixEdge]
+
+
+def _is_production(node_id: str, group_by: str) -> bool:
+    """Whether a matrix node is production code, using the same exemptions
+    :func:`_orphan_modules` and :func:`_deep_imports` apply: peripheral organs
+    (tests, scripts) and, for file-level nodes, entry-point/packaging stems are
+    not production.
+    """
+    if _module_of_key(node_id, group_by) in PERIPHERAL_ORGANS:
+        return False
+    if group_by == "file" and _stem(node_id) in _ENTRY_POINT_STEMS:
+        return False
+    return True
+
+
+def _group_key(rel_path: str, group_by: str) -> str:
+    """Collapse a repo-relative file path to the grouping unit for ``group_by``."""
+    if group_by == "file":
+        return rel_path
+    if group_by == "directory":
+        return _dir_of(rel_path)
+    if group_by == "module":
+        return _organ(_dir_of(rel_path))
+    raise ValueError(f"Unknown group_by: {group_by!r}")
+
+
+def _module_of_key(node_id: str, group_by: str) -> str:
+    """Top-level module (organ) for a node id, given how it was grouped.
+
+    "file" ids are file paths (module = organ of their directory); "directory"
+    ids are directory paths (module = their own organ); "module" ids ARE the
+    module already.
+    """
+    if group_by == "file":
+        return _organ(_dir_of(node_id))
+    if group_by == "directory":
+        return _organ(node_id)
+    return node_id
+
+
+def dependency_matrix(
+    files: list[str],
+    dep_edges: list[tuple[str, str]],
+    *,
+    group_by: str = "file",
+) -> DependencyMatrix:
+    """Build the file/module-level dependency graph for MCP consumption.
+
+    Pure and store-agnostic, mirroring :func:`analyze`: repo-relative file
+    paths and dep edges in, a :class:`DependencyMatrix` out. ``group_by``
+    collapses nodes (and sums their edges) to "file" (identity, default),
+    "directory" (:func:`_dir_of`), or "module" (:func:`_organ`, the top-level
+    organ).
+
+    ``violation_count`` is driven by :func:`is_deep_import` — the same SSOT the
+    persisted ``deep_import`` diagnostic and the browser paint use — so a
+    front-door edge (cross-organ but targeting the organ root) contributes zero
+    violations while a deep edge contributes one. Edges originating from a
+    peripheral organ (tests, scripts) are exempt from violations, matching
+    :func:`_deep_imports`.
+    """
+    node_ids = {_group_key(f, group_by) for f in files}
+    nodes = [
+        MatrixNode(
+            id=nid,
+            module=_module_of_key(nid, group_by),
+            production=_is_production(nid, group_by),
+        )
+        for nid in node_ids
+    ]
+
+    edge_agg: dict[tuple[str, str], list[int]] = {}
+    for src, dst in dep_edges:
+        src_key, dst_key = _group_key(src, group_by), _group_key(dst, group_by)
+        if src_key == dst_key:
+            continue
+        src_dir, dst_dir = _dir_of(src), _dir_of(dst)
+        is_violation = (
+            _organ(src_dir) not in PERIPHERAL_ORGANS and is_deep_import(src_dir, dst_dir)
+        )
+        counts = edge_agg.setdefault((src_key, dst_key), [0, 0])
+        counts[0] += 1
+        counts[1] += 1 if is_violation else 0
+
+    edges = [
+        MatrixEdge(source=s, target=t, import_count=c[0], violation_count=c[1])
+        for (s, t), c in edge_agg.items()
+    ]
+    return DependencyMatrix(nodes=nodes, edges=edges)
+
+
 def analyze(
     files: list[str],
     dep_edges: list[tuple[str, str]],
@@ -548,6 +665,36 @@ async def persist_architecture_diagnostics(
     await store.add_nodes_batch(graph_id, nodes)
     await store.add_edges_batch(graph_id, edges)
     return len(nodes)
+
+
+async def read_dependency_matrix(
+    store: SQLiteGraphStore,
+    graph_id: str,
+    repo_root: str,
+    *,
+    group_by: str = "file",
+) -> DependencyMatrix:
+    """Read-only counterpart to :func:`persist_architecture_diagnostics`.
+
+    Runs the same ``_FILE_SQL``/``_DEP_EDGE_SQL`` queries against ``store``,
+    converts to repo-relative paths, and feeds the pure :func:`dependency_matrix`
+    — no writes, no diagnostics persisted. Used by the
+    ``code_graph_get_dependency_matrix`` MCP tool.
+    """
+    db = await store._connect()
+    try:
+        file_cursor = await db.execute(_FILE_SQL, (graph_id,))
+        file_rows = await file_cursor.fetchall()
+        dep_cursor = await db.execute(_DEP_EDGE_SQL, (graph_id,))
+        dep_rows = await dep_cursor.fetchall()
+    finally:
+        await db.close()
+
+    files = [_rel(r["file_path"], repo_root) for r in file_rows]
+    dep_edges = [
+        (_rel(r["sf"], repo_root), _rel(r["tf"], repo_root)) for r in dep_rows
+    ]
+    return dependency_matrix(files, dep_edges, group_by=group_by)
 
 
 async def _delete_arch_diagnostics(store: SQLiteGraphStore, graph_id: str) -> None:

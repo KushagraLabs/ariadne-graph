@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -137,6 +137,15 @@ class ExplainEdgeInput(BaseModel):
 
     src_path: str = Field(description="Repo-relative path of the importing file")
     dst_path: str = Field(description="Repo-relative path of the imported file")
+
+
+class GetDependencyMatrixInput(BaseModel):
+    """Input for code_graph_get_dependency_matrix tool."""
+
+    repo_path: str = Field(description="Absolute or relative path to repository root")
+    group_by: Literal["file", "directory", "module"] = Field(
+        default="file", description="Granularity to collapse dependency-matrix nodes/edges to"
+    )
 
 
 class ListCommunitiesInput(BaseModel):
@@ -326,6 +335,16 @@ class ExplainEdgeOutput(BaseModel):
     rule: str | None = Field(default=None, description="Violated rule name, or None when allowed")
     front_door_would_fix: bool = Field(
         default=False, description="Whether routing through the target organ's front door would make the edge valid"
+    )
+    message: str = Field(default="", description="Human-readable status message")
+
+
+class DependencyMatrixOutput(BaseModel):
+    """Output for code_graph_get_dependency_matrix tool."""
+
+    nodes: list[dict[str, Any]] = Field(default_factory=list, description="Matrix nodes: id, module, production")
+    edges: list[dict[str, Any]] = Field(
+        default_factory=list, description="Matrix edges: source, target, import_count, violation_count"
     )
     message: str = Field(default="", description="Human-readable status message")
 
