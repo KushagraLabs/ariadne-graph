@@ -117,6 +117,22 @@ class TestDiscoverProjects:
         # Only the root tsconfig survives; vendored/build/archived ones are noise.
         assert indexer.discover_projects() == [repo]
 
+    def test_excludes_agent_worktree_tsconfigs(
+        self, repo: Path, config: AnalyzerConfig
+    ) -> None:
+        """Agent worktrees under ``.claude/worktrees/`` are full repo copies with
+        their own tsconfigs. Indexing them duplicates every project and bloats the
+        graph, so discovery must skip them — honoring ``config.ignore_patterns``
+        (which lists ``.claude`` and ``worktrees``), not just the vendored/build set.
+        """
+        worktree = repo / ".claude" / "worktrees" / "agent-abc" / "frontend"
+        worktree.mkdir(parents=True)
+        (worktree / "tsconfig.json").write_text("{}", encoding="utf-8")
+
+        indexer = ScipTypeScriptIndexer(repo, config)
+
+        assert indexer.discover_projects() == [repo]
+
     def test_no_tsconfig_returns_repo_root(self, tmp_path: Path) -> None:
         # A package.json-only project (no tsconfig) still indexes from the root
         # via --infer-tsconfig; discovery must not return an empty list.

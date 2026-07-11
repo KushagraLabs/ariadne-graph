@@ -53,9 +53,11 @@ class ScipTypeScriptIndexer:
             or (self.repo_root / "package.json").exists()
         )
 
-    # Directories whose tsconfigs are never real project roots: vendored deps,
-    # build output, and archived/legacy code.
-    _NON_PROJECT_DIRS = frozenset({"node_modules", "dist", "build", "archive", ".ariadne"})
+    # scip-typescript's own output dir is never a project root; the rest of the
+    # exclusions (vendored deps, build output, agent worktrees, archived code)
+    # come from ``config.ignore_patterns`` — the single source of truth shared
+    # with the file-discovery walk.
+    _NON_PROJECT_DIRS = frozenset({".ariadne"})
 
     def discover_projects(self) -> list[Path]:
         """Return every directory that is its own scip-typescript project root.
@@ -66,13 +68,18 @@ class ScipTypeScriptIndexer:
         each must be indexed separately or the others are silently uncovered.
 
         The repo root is always included (even with no tsconfig — it is then
-        indexed via ``--infer-tsconfig``). Vendored/build/archived directories
+        indexed via ``--infer-tsconfig``). Directories excluded by
+        ``config.ignore_patterns`` (vendored/build/archived/agent-worktree dirs)
         are skipped. Results are sorted for determinism, repo root first.
         """
+        ignore_names = frozenset(
+            p for p in self.config.ignore_patterns if not p.startswith("*")
+        )
+        skip = self._NON_PROJECT_DIRS | ignore_names
         projects: set[Path] = {self.repo_root}
         for tsconfig in self.repo_root.rglob("tsconfig.json"):
             rel_parts = tsconfig.relative_to(self.repo_root).parts
-            if any(part in self._NON_PROJECT_DIRS for part in rel_parts):
+            if any(part in skip for part in rel_parts):
                 continue
             projects.add(tsconfig.parent)
         ordered = sorted(projects, key=lambda p: str(p))
