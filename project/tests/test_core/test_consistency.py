@@ -193,7 +193,6 @@ async def test_inspect_file_nodes_and_edges_agree_on_normalized_key(tmp_path: Pa
 # until w2b lands so it documents the gap without failing 8h2's verification.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="bead w2b: retrieve-by-filename not yet implemented", strict=True)
 async def test_retrieve_by_filename_resolves_module_node(tmp_path: Path) -> None:
     """``code_graph_retrieve('schema.ts')`` should find the file's module node.
 
@@ -228,3 +227,41 @@ async def test_retrieve_by_filename_resolves_module_node(tmp_path: Path) -> None
         "retrieve could not resolve the filename 'schema.ts' to any node — "
         "resolver matches only id/name/qualname, not file_path basename (bead B)."
     )
+
+
+async def test_retrieve_by_filename_ambiguous_returns_candidates(tmp_path: Path) -> None:
+    """Two files sharing a basename must yield candidates, not a silent guess.
+
+    Complements the single-match case: when ``schema.ts`` exists under two
+    different directories, ``retrieve`` cannot know which one the caller
+    means, so it must report ``found: False`` plus a ``candidates`` list
+    covering both files instead of arbitrarily picking one (bead w2b).
+    """
+    graph_id = "g_retrieve_ambiguous"
+    store = MemoryGraphStore()
+    registry = _make_registry(store, tmp_path)
+
+    path_a = str((tmp_path / "src" / "schema.ts").resolve())
+    path_b = str((tmp_path / "lib" / "schema.ts").resolve())
+    nodes_a, edges_a = _scip_like_delta(graph_id, node_file_path=path_a, edge_owner_file_path=path_a)
+    nodes_b, edges_b = _scip_like_delta(graph_id, node_file_path=path_b, edge_owner_file_path=path_b)
+    # Distinct ids per file so nodes don't collide in the store.
+    for node in nodes_b:
+        node.id = node.id + "#b"
+    for edge in edges_b:
+        edge.source = edge.source + "#b"
+        edge.target = edge.target + "#b"
+    await store.add_nodes_batch(graph_id, nodes_a + nodes_b)
+    await store.add_edges_batch(graph_id, edges_a + edges_b)
+
+    result = await registry.handle_retrieve(
+        RetrieveInput(query="schema.ts", graph_id=graph_id)
+    )
+
+    assert result.results, "expected a result entry documenting the ambiguity"
+    data = result.results[0].get("data", {})
+    assert data.get("found") is False, "ambiguous basename must not silently resolve"
+    candidates = data.get("candidates", [])
+    assert len(candidates) == 2, f"expected 2 candidate files, got {len(candidates)}"
+    candidate_files = {c.get("properties", {}).get("file_path") for c in candidates}
+    assert candidate_files == {path_a, path_b}
