@@ -7,23 +7,21 @@ last-writer-wins by id, no label union) the stub clobbers A's
 ``CodeFile``/``CodeModule`` labels, so ~30% of files end up with symbol nodes
 but no ``CodeFile`` node and file-scoped queries skip them.
 
-BOUNDARY NOTE (bead hgm blocked in this lane): the stub is NOT safe to drop at
-the translator level — the live SCIP/Tree-sitter boundary
-(``test_scip_live_mixed_id``) *requires* the symbol-string stub node to exist
-so ``GraphRetriever._canonicalize_neighbor`` can redirect it to the concrete
-same-named node. The correct, non-destructive fix is label union on upsert in
-``graphstores/sqlite.py::add_nodes_batch`` (union labels + keep the richer
-node's properties on REPLACE), which is OUTSIDE this lane's owned files
-(scip_translator.py / scip_enricher.py). This test is therefore ``xfail`` until
-that persist-layer change lands.
+The stub is NOT safe to drop at the translator level — the live SCIP/Tree-sitter
+boundary (``test_scip_live_mixed_id``) *requires* the symbol-string stub node to
+exist so ``GraphRetriever._canonicalize_neighbor`` can redirect it to the
+concrete same-named node. The fix (bead 6c7) is label union on upsert in
+``graphstores/sqlite.py::add_nodes_batch``: on the stub-vs-anchor id collision it
+unions labels and keeps the richer node's properties instead of clobbering. This
+test drives that REAL persistence path (add_nodes_batch + query), not a dict
+simulation, so it validates the fix end-to-end.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
+from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
 from ariadne_graph.languages.typescript.scip_parser import (
     ScipDocument,
     ScipOccurrence,
@@ -85,13 +83,7 @@ def _doc_b() -> ScipDocument:
     )
 
 
-@pytest.mark.xfail(
-    reason="hgm needs label-union upsert in graphstores/sqlite.py::add_nodes_batch, "
-    "outside this lane's owned files; the stub cannot be dropped without breaking "
-    "the live SCIP/Tree-sitter boundary redirection.",
-    strict=True,
-)
-def test_codefile_survives_cross_file_import(tmp_path: Path) -> None:
+async def test_codefile_survives_cross_file_import(tmp_path: Path) -> None:
     # A real repo where src/a.ts exists so its symbols are local, not external.
     (tmp_path / "src").mkdir(parents=True)
     (tmp_path / "src" / "a.ts").write_text("export function doThing() {}\n")
@@ -101,13 +93,18 @@ def test_codefile_survives_cross_file_import(tmp_path: Path) -> None:
     delta_a = translator.translate(_doc_a())
     delta_b = translator.translate(_doc_b())
 
-    # Simulate persist: last-writer-wins by node id across both files.
-    merged: dict[str, list[str]] = {}
-    for delta in (delta_a, delta_b):
-        for n in delta.nodes:
-            merged[n.id] = n.labels
+    # Persist through the REAL store: A's rich node then B's bare import stub
+    # (same id). The fixed add_nodes_batch must union labels, not clobber.
+    store = SQLiteGraphStore(str(tmp_path / "graph.db"))
+    try:
+        await store.add_nodes_batch("g", delta_a.nodes)
+        await store.add_nodes_batch("g", delta_b.nodes)
+        rows = await store.query("g", "node_by_id", {"node_id": A_MODULE})
+    finally:
+        await store.close()
 
-    assert "CodeFile" in merged.get(A_MODULE, []), (
-        f"file A's CodeFile node was clobbered by a cross-file import stub; "
-        f"labels={merged.get(A_MODULE)}"
+    assert rows, f"file A's node {A_MODULE!r} not found after cross-file import persist"
+    labels = rows[0]["n"]["labels"]
+    assert "CodeFile" in labels, (
+        f"file A's CodeFile node was clobbered by a cross-file import stub; labels={labels}"
     )
