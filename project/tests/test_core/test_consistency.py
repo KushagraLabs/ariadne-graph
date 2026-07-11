@@ -30,6 +30,7 @@ import pytest
 
 from ariadne_graph.core.config import AnalyzerConfig
 from ariadne_graph.core.models import CodeEdge, CodeNode
+from ariadne_graph.core.retrieval import GraphRetriever
 from ariadne_graph.core.snippets import SnippetExtractor
 from ariadne_graph.graphstores.base import GraphStore, SearchableGraphStore
 from ariadne_graph.graphstores.memory import MemoryGraphStore
@@ -265,3 +266,81 @@ async def test_retrieve_by_filename_ambiguous_returns_candidates(tmp_path: Path)
     assert len(candidates) == 2, f"expected 2 candidate files, got {len(candidates)}"
     candidate_files = {c.get("properties", {}).get("file_path") for c in candidates}
     assert candidate_files == {path_a, path_b}
+
+
+# ---------------------------------------------------------------------------
+# C (bug, bead 11m): edge direction must be classified from the edge's own
+# source/target relative to the requested node, not from which named query
+# happened to return the row.
+# ---------------------------------------------------------------------------
+
+async def test_retrieve_edge_direction_relative_to_requested_node(tmp_path: Path) -> None:
+    """An external node pointing AT the requested node must land in `incoming`.
+
+    ``GraphRetriever._get_edges`` asks the store for e.g. "node_outgoing_edges";
+    when that named query returns no rows it falls back to "node_edges", which
+    every backend implements as bidirectional (source == node_id OR
+    target == node_id). The old code kept whichever rows the query returned
+    and labelled them by which query slot produced them ("outgoing" or
+    "incoming"), so a bidirectional fallback row landed in the wrong bucket
+    whenever the node had edges in only one direction — e.g. a cross-extractor
+    stub / external node with an edge that points AT the requested node (N has
+    only an incoming edge) still showed up under "outgoing".
+
+    Acceptance criterion (bead 11m): for the requested node N, every edge in
+    ``outgoing`` has source == N and every edge in ``incoming`` has
+    target == N, regardless of which query produced the row.
+    """
+    graph_id = "g_edge_direction"
+    store = MemoryGraphStore()
+    registry = _make_registry(store, tmp_path)
+
+    target_node = CodeNode(
+        id="N",
+        graph_id=graph_id,
+        labels=["CodeFunction"],
+        properties={"name": "N"},
+    )
+    external_node = CodeNode(
+        id="EXT",
+        graph_id=graph_id,
+        labels=["CodeFunction"],
+        properties={"name": "EXT", "is_external": True},
+    )
+    await store.add_nodes_batch(graph_id, [target_node, external_node])
+
+    # N has ONLY an incoming edge (external -> N), no outgoing edges at all.
+    # This forces GraphRetriever._get_edges(direction="outgoing") through the
+    # bidirectional "node_edges" fallback (since "node_outgoing_edges" finds
+    # nothing), which is exactly the path that used to mislabel direction.
+    await store.add_edges_batch(
+        graph_id,
+        [CodeEdge(source="EXT", target="N", graph_id=graph_id, rel_type="CALLS")],
+    )
+
+    retriever = GraphRetriever(store, SnippetExtractor(repo_root=tmp_path))
+    result = await retriever.retrieve_node(graph_id, "N")
+
+    outgoing = result["edges"]["outgoing"]
+    incoming = result["edges"]["incoming"]
+
+    for edge in outgoing:
+        assert edge.get("source") == "N", (
+            f"edge {edge} in 'outgoing' does not have source == requested node "
+            "'N' (bead 11m: direction must be classified from the edge's own "
+            "source/target, not from which query produced the row)."
+        )
+    for edge in incoming:
+        assert edge.get("target") == "N", (
+            f"edge {edge} in 'incoming' does not have target == requested node "
+            "'N' (bead 11m)."
+        )
+
+    # The EXT -> N edge must be classified as incoming to N, and must NOT
+    # also appear under outgoing.
+    assert any(e.get("source") == "EXT" for e in incoming), (
+        "expected the EXT -> N edge to appear in 'incoming'"
+    )
+    assert not any(e.get("source") == "EXT" for e in outgoing), (
+        "EXT -> N edge incorrectly classified as 'outgoing' for node 'N'"
+    )

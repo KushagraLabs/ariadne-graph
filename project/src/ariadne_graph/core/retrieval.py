@@ -116,7 +116,14 @@ class GraphRetriever:
             direction: "outgoing", "incoming", or "both".
 
         Returns:
-            List of edge dictionaries.
+            List of edge dictionaries, each with source == node_id
+            (direction="outgoing") or target == node_id
+            (direction="incoming"). Direction is decided from each edge's
+            actual source/target relative to node_id, never from which
+            named query happened to return the row: some backend query
+            names (e.g. "node_edges" used as a fallback) are bidirectional,
+            so a naive "whichever query returned it" label can put an
+            incoming edge in the outgoing bucket and vice versa.
         """
         if direction == "outgoing":
             query_names = ["node_outgoing_edges", "node_edges"]
@@ -157,8 +164,21 @@ class GraphRetriever:
         edges: list[dict[str, Any]] = []
         for row in rows:
             edge_data = row.get("r", row)
-            if edge_data:
-                edges.append(edge_data)
+            if not edge_data:
+                continue
+            src = edge_data.get("source", "")
+            tgt = edge_data.get("target", "")
+            # Classify by the edge's own source/target relative to node_id,
+            # not by which named query produced the row (queries like
+            # "node_edges" are bidirectional and can return an edge where
+            # node_id is the target even when "outgoing" was requested).
+            if direction == "outgoing" and src != node_id:
+                continue
+            if direction == "incoming" and tgt != node_id:
+                continue
+            if direction == "both" and node_id not in (src, tgt):
+                continue
+            edges.append(edge_data)
 
         return edges
 
