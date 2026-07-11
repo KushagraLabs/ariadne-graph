@@ -86,6 +86,36 @@ class TestScipGraphTranslator:
         module_nodes = [n for n in delta.nodes if "CodeModule" in n.labels]
         assert module_nodes
 
+    def test_path_prefix_rebases_file_path_to_repo_relative(
+        self, parsed_index: ScipIndex
+    ) -> None:
+        """A subproject's SCIP doc paths are project-relative ('src/dog.ts').
+        With path_prefix='mobile' they must become repo-relative
+        ('mobile/src/dog.ts') so files don't collide or lose their directory.
+        """
+        translator = ScipGraphTranslator(
+            repo_root=Path(__file__).parent.parent / "fixtures" / "ts_scip_project",
+            graph_id="test-graph",
+            path_prefix="mobile",
+        )
+        doc = parsed_index.documents[Path("src/dog.ts")]
+        delta = translator.translate(doc)
+
+        code_files = [n for n in delta.nodes if "CodeFile" in n.labels]
+        assert code_files
+        assert code_files[0].properties["file_path"] == "mobile/src/dog.ts"
+
+    def test_no_prefix_keeps_project_relative_path(self, parsed_index: ScipIndex) -> None:
+        translator = ScipGraphTranslator(
+            repo_root=Path(__file__).parent.parent / "fixtures" / "ts_scip_project",
+            graph_id="test-graph",
+        )
+        doc = parsed_index.documents[Path("src/dog.ts")]
+        delta = translator.translate(doc)
+
+        code_files = [n for n in delta.nodes if "CodeFile" in n.labels]
+        assert code_files[0].properties["file_path"] == "src/dog.ts"
+
     def test_class_labels(self, parsed_index: ScipIndex) -> None:
         translator = ScipGraphTranslator(
             repo_root=Path(__file__).parent.parent / "fixtures" / "ts_scip_project",

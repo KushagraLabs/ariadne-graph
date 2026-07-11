@@ -87,6 +87,99 @@ class TestAvailability:
         assert indexer.has_project() is True
 
 
+class TestDiscoverProjects:
+    """discover_projects() finds every real tsconfig, so multi-project repos
+    (e.g. a root app + a mobile/ subproject) are fully indexed rather than only
+    whatever the root tsconfig's ``include`` happens to cover.
+    """
+
+    def test_root_only_returns_repo_root(self, repo: Path, config: AnalyzerConfig) -> None:
+        indexer = ScipTypeScriptIndexer(repo, config)
+        assert indexer.discover_projects() == [repo]
+
+    def test_finds_nested_tsconfig(self, repo: Path, config: AnalyzerConfig) -> None:
+        (repo / "mobile").mkdir()
+        (repo / "mobile" / "tsconfig.json").write_text("{}", encoding="utf-8")
+
+        indexer = ScipTypeScriptIndexer(repo, config)
+
+        assert set(indexer.discover_projects()) == {repo, repo / "mobile"}
+
+    def test_excludes_vendored_and_build_tsconfigs(
+        self, repo: Path, config: AnalyzerConfig
+    ) -> None:
+        for junk in ("node_modules", "dist", "archive"):
+            (repo / junk).mkdir()
+            (repo / junk / "tsconfig.json").write_text("{}", encoding="utf-8")
+
+        indexer = ScipTypeScriptIndexer(repo, config)
+
+        # Only the root tsconfig survives; vendored/build/archived ones are noise.
+        assert indexer.discover_projects() == [repo]
+
+    def test_no_tsconfig_returns_repo_root(self, tmp_path: Path) -> None:
+        # A package.json-only project (no tsconfig) still indexes from the root
+        # via --infer-tsconfig; discovery must not return an empty list.
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        cfg = AnalyzerConfig(repo_root=tmp_path)
+
+        indexer = ScipTypeScriptIndexer(tmp_path, cfg)
+
+        assert indexer.discover_projects() == [tmp_path]
+
+
+class TestEnsureProjectIndexes:
+    """ensure_project_indexes() runs scip-typescript once per discovered project
+    and returns (project_dir, scip_path) for each that succeeded.
+    """
+
+    async def test_indexes_each_project(self, repo: Path, config: AnalyzerConfig) -> None:
+        config.scip_typescript_enabled = True
+        (repo / "mobile").mkdir()
+        (repo / "mobile" / "tsconfig.json").write_text("{}", encoding="utf-8")
+        (repo / "src").mkdir()
+        (repo / "src" / "a.ts").write_text("export const x=1;", encoding="utf-8")
+        indexer = ScipTypeScriptIndexer(repo, config)
+
+        run_cwds: list[Path] = []
+
+        async def fake_run(output_path: Path, cwd: Path) -> tuple[int, str, str]:
+            run_cwds.append(cwd)
+            output_path.write_bytes(b"fake")
+            return (0, "", "")
+
+        with mock.patch.object(indexer, "_run_indexer", side_effect=fake_run):
+            results = await indexer.ensure_project_indexes(
+                [repo / "src" / "a.ts"], "g", force=True
+            )
+
+        # One result per project, each carrying its own project dir.
+        got = {proj for proj, _ in results}
+        assert got == {repo, repo / "mobile"}
+        assert set(run_cwds) == {repo, repo / "mobile"}
+        for _, scip in results:
+            assert scip.exists()
+
+    async def test_skips_failed_project_keeps_others(
+        self, repo: Path, config: AnalyzerConfig
+    ) -> None:
+        config.scip_typescript_enabled = True
+        (repo / "mobile").mkdir()
+        (repo / "mobile" / "tsconfig.json").write_text("{}", encoding="utf-8")
+        indexer = ScipTypeScriptIndexer(repo, config)
+
+        async def fake_run(output_path: Path, cwd: Path) -> tuple[int, str, str]:
+            if cwd == repo / "mobile":
+                return (1, "", "boom")  # mobile fails
+            output_path.write_bytes(b"fake")
+            return (0, "", "")
+
+        with mock.patch.object(indexer, "_run_indexer", side_effect=fake_run):
+            results = await indexer.ensure_project_indexes([], "g", force=True)
+
+        assert [proj for proj, _ in results] == [repo]  # only the root survived
+
+
 class TestRunIndexer:
     async def test_command_includes_output_path(
         self, repo: Path, config: AnalyzerConfig

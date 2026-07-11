@@ -19,9 +19,21 @@ logger = logging.getLogger(__name__)
 class ScipGraphTranslator:
     """Convert one :class:`ScipDocument` into a :class:`CodeGraphDelta`."""
 
-    def __init__(self, repo_root: Path, graph_id: str) -> None:
+    def __init__(
+        self, repo_root: Path, graph_id: str, path_prefix: str = ""
+    ) -> None:
         self.repo_root = repo_root.resolve()
         self.graph_id = graph_id
+        # Repo-relative directory of the subproject this index was produced in
+        # (e.g. "mobile"). SCIP doc paths are relative to the project cwd, so for
+        # a subproject they must be rebased under this prefix to stay unique and
+        # repo-root-relative. Empty for the repo-root project.
+        self.path_prefix = path_prefix.strip("/")
+
+    def _rel_path(self, document: ScipDocument) -> str:
+        """Repo-root-relative path of *document*, applying the subproject prefix."""
+        rel = str(document.relative_path)
+        return f"{self.path_prefix}/{rel}" if self.path_prefix else rel
 
     def translate(
         self,
@@ -47,8 +59,8 @@ class ScipGraphTranslator:
         """
         call_ranges = call_ranges or set()
         enclosing_map = enclosing_map or {}
-        file_path = str(document.relative_path)
-        abs_path = str(self.repo_root / document.relative_path)
+        file_path = self._rel_path(document)
+        abs_path = str(self.repo_root / file_path)
 
         nodes: list[CodeNode] = []
         edges: list[CodeEdge] = []

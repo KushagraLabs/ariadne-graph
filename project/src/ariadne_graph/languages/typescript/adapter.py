@@ -102,48 +102,62 @@ class TypeScriptLanguageAdapter:
             logger.debug("SCIP-TypeScript not enabled or unavailable")
             return
 
-        index_path = await indexer.ensure_index(
+        # Index every tsconfig project (root + subprojects like mobile/), not
+        # just the root — otherwise a subproject the root tsconfig doesn't
+        # `include` is silently uncovered.
+        project_indexes = await indexer.ensure_project_indexes(
             all_files,
             context.graph_id,
             force=False,
         )
-        if index_path is None:
+        if not project_indexes:
             self._scip_failure_message = "scip-typescript indexing failed or was skipped"
             logger.warning("SCIP-TypeScript indexing failed or was skipped for %s", context.repo_root)
             return
 
-        try:
-            parser = ScipIndexParser()
-            scip_index = parser.parse(index_path)
-        except Exception as exc:
-            self._scip_failure_message = f"Failed to parse SCIP index: {exc}"
-            logger.warning("Failed to parse SCIP index %s: %s", index_path, exc)
-            return
-
-        translator = ScipGraphTranslator(context.repo_root, context.graph_id)
         enricher = TreeSitterEnricher()
+        parser = ScipIndexParser()
 
-        for doc_path, document in scip_index.documents.items():
-            abs_path = context.repo_root / doc_path
-            if not abs_path.exists():
+        for project_dir, index_path in project_indexes:
+            # SCIP doc paths are relative to the project cwd; the prefix rebases
+            # subproject paths to repo-root-relative so file_path/abs_path stay
+            # unique and correct.
+            prefix = "" if project_dir == context.repo_root else str(
+                project_dir.relative_to(context.repo_root)
+            )
+            try:
+                scip_index = parser.parse(index_path)
+            except Exception as exc:
+                logger.warning("Failed to parse SCIP index %s: %s", index_path, exc)
                 continue
 
-            delta = translator.translate(document)
-            try:
-                _, call_ranges, enclosing_map = enricher.enrich(abs_path, delta)
-                delta = translator.translate(
-                    document,
-                    call_ranges=call_ranges,
-                    enclosing_map=enclosing_map,
-                )
-                # Enrich the final delta with Tree-sitter-only properties.
-                delta, _, _ = enricher.enrich(abs_path, delta)
-            except Exception as exc:
-                logger.debug("Tree-sitter enrichment failed for %s: %s", abs_path, exc)
+            translator = ScipGraphTranslator(
+                context.repo_root, context.graph_id, path_prefix=prefix
+            )
 
-            self._add_source_commit(delta, context.source_commit)
-            self._tag_owner_file(delta, abs_path)
-            self._scip_cache[abs_path] = delta
+            for doc_path, document in scip_index.documents.items():
+                # Resolve against the PROJECT dir (that is what doc_path is
+                # relative to), then keep only files that actually exist.
+                abs_path = project_dir / doc_path
+                if not abs_path.exists():
+                    continue
+
+                delta = translator.translate(document)
+                try:
+                    _, call_ranges, enclosing_map = enricher.enrich(abs_path, delta)
+                    delta = translator.translate(
+                        document,
+                        call_ranges=call_ranges,
+                        enclosing_map=enclosing_map,
+                    )
+                    # Enrich the final delta with Tree-sitter-only properties.
+                    delta, _, _ = enricher.enrich(abs_path, delta)
+                except Exception as exc:
+                    logger.debug("Tree-sitter enrichment failed for %s: %s", abs_path, exc)
+
+                self._add_source_commit(delta, context.source_commit)
+                self._tag_owner_file(delta, abs_path)
+                self._scip_cache[abs_path] = delta
 
         self._scip_enabled = bool(self._scip_cache)
         if self._scip_enabled:
