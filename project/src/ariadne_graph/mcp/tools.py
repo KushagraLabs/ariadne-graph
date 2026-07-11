@@ -1086,22 +1086,66 @@ class ToolRegistry:
                 message="Repository has not been indexed yet",
             )
 
+        # Neither CommunityAnalyzer.find_hotspots nor the GraphStoreFallbacks
+        # equivalent support offset+limit natively (only a top_n cutoff), and
+        # neither reports the true candidate count. Fetch one entry past the
+        # requested page to page/has_more here without changing either
+        # ranking implementation: an oversized result means more remain.
+        fetch_n = input.offset + input.top_n + 1
+
         if self.community_analyzer is not None:
             try:
                 analyzer_hotspots = await self.community_analyzer.find_hotspots(
-                    graph_id,
-                    top_n=input.top_n,
-                    metric=input.metric,
+                    graph_id, top_n=fetch_n, metric=input.metric
                 )
+                page = analyzer_hotspots[input.offset : input.offset + input.top_n]
+                has_more = len(analyzer_hotspots) > input.offset + len(page)
+                total = input.offset + len(analyzer_hotspots)
+                hotspots = [] if input.summary_only else [h.model_dump() for h in page]
                 return FindHotspotsOutput(
-                    hotspots=[h.model_dump() for h in analyzer_hotspots],
-                    message=f"Top {len(analyzer_hotspots)} hotspots by {input.metric}",
+                    hotspots=hotspots,
+                    total=total,
+                    has_more=has_more,
+                    message=f"Top {len(page)} hotspots by {input.metric}",
                 )
             except Exception as exc:
                 logger.warning("CommunityAnalyzer.find_hotspots failed: %s", exc)
 
-        return await GraphStoreFallbacks.find_hotspots(
-            self.graph_store, graph_id, input.top_n, input.metric
+        fallback = await GraphStoreFallbacks.find_hotspots(
+            self.graph_store, graph_id, fetch_n, input.metric
+        )
+        page = fallback.hotspots[input.offset : input.offset + input.top_n]
+        has_more = len(fallback.hotspots) > input.offset + len(page)
+        total = input.offset + len(fallback.hotspots)
+        return FindHotspotsOutput(
+            hotspots=[] if input.summary_only else page,
+            total=total,
+            has_more=has_more,
+            message=fallback.message,
+        )
+
+    def _paginate_architecture(
+        self, output: ArchitectureOutput, input: GetArchitectureInput
+    ) -> ArchitectureOutput:
+        """Apply offset/limit/summary_only to an ArchitectureOutput's communities list.
+
+        Both the CommunityAnalyzer and GraphStoreFallbacks code paths build a
+        ``summary`` dict with a ``"communities"`` list; paginating once here
+        (rather than in each producer) keeps the ranking/detection logic
+        untouched.
+        """
+        communities = output.summary.get("communities", [])
+        total = len(communities)
+        page = communities[input.offset : input.offset + input.limit]
+        has_more = input.offset + len(page) < total
+
+        summary = dict(output.summary)
+        summary["communities"] = [] if input.summary_only else page
+        return ArchitectureOutput(
+            summary=summary,
+            total=total,
+            has_more=has_more,
+            message=output.message,
         )
 
     async def handle_get_architecture(self, input: GetArchitectureInput) -> ArchitectureOutput:
@@ -1119,7 +1163,7 @@ class ToolRegistry:
         if self.community_analyzer is not None:
             try:
                 summary_obj = await self.community_analyzer.get_architecture_summary(graph_id)
-                return ArchitectureOutput(
+                output = ArchitectureOutput(
                     summary=summary_obj.model_dump(),
                     message=(
                         f"Architecture: {summary_obj.total_communities} communities, "
@@ -1127,10 +1171,12 @@ class ToolRegistry:
                         f"{summary_obj.total_entities} entities"
                     ),
                 )
+                return self._paginate_architecture(output, input)
             except Exception as exc:
                 logger.warning("CommunityAnalyzer architecture summary failed: %s", exc)
 
-        return await GraphStoreFallbacks.get_architecture(self.graph_store, graph_id)
+        fallback = await GraphStoreFallbacks.get_architecture(self.graph_store, graph_id)
+        return self._paginate_architecture(fallback, input)
 
     async def handle_list_communities(self, input: ListCommunitiesInput) -> CommunitiesOutput:
         """List communities in the code graph."""
@@ -1210,13 +1256,31 @@ class ToolRegistry:
                 message=f"File {file_path} not found in any indexed graph",
             )
 
-        nodes = await self._get_nodes_for_file(graph_id, file_path)
-        edges = await self._get_edges_for_file(graph_id, file_path)
+        all_nodes = await self._get_nodes_for_file(graph_id, file_path)
+        all_edges = (
+            await self._get_edges_for_file(graph_id, file_path) if input.include_edges else []
+        )
+
+        total_nodes = len(all_nodes)
+        total_edges = len(all_edges)
+
+        if input.summary_only:
+            nodes, edges = [], []
+        else:
+            nodes = all_nodes[input.offset : input.offset + input.limit]
+            edges = all_edges[input.offset : input.offset + input.limit]
+
+        has_more = (input.offset + len(nodes) < total_nodes) or (
+            input.offset + len(edges) < total_edges
+        )
 
         return InspectFileOutput(
             nodes=nodes,
             edges=edges,
-            message=f"Found {len(nodes)} nodes and {len(edges)} edges in {file_path}",
+            total_nodes=total_nodes,
+            total_edges=total_edges,
+            has_more=has_more,
+            message=f"Found {total_nodes} nodes and {total_edges} edges in {file_path}",
         )
 
     async def handle_list_diagnostics(

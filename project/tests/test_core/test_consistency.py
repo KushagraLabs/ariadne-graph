@@ -36,8 +36,13 @@ from ariadne_graph.graphstores.base import GraphStore, SearchableGraphStore
 from ariadne_graph.graphstores.memory import MemoryGraphStore
 from ariadne_graph.languages.base import LanguageAdapter
 from ariadne_graph.languages.python_ast.adapter import PythonLanguageAdapter
-from ariadne_graph.mcp.schemas import InspectFileInput, RetrieveInput
-from ariadne_graph.mcp.tools import ToolRegistry
+from ariadne_graph.mcp.schemas import (
+    FindHotspotsInput,
+    GetArchitectureInput,
+    InspectFileInput,
+    RetrieveInput,
+)
+from ariadne_graph.mcp.tools import ToolRegistry, _graph_id_from_repo_path
 
 pytestmark = pytest.mark.asyncio
 
@@ -344,3 +349,203 @@ async def test_retrieve_edge_direction_relative_to_requested_node(tmp_path: Path
     assert not any(e.get("source") == "EXT" for e in outgoing), (
         "EXT -> N edge incorrectly classified as 'outgoing' for node 'N'"
     )
+
+
+# ---------------------------------------------------------------------------
+# D (bead c7z): pagination + summary_only/include_edges + schema_version.
+# ---------------------------------------------------------------------------
+
+async def test_inspect_file_limit_bounds_payload(tmp_path: Path) -> None:
+    """``limit`` must cap the number of nodes/edges returned, not just rank them.
+
+    Acceptance criterion (bead c7z): requesting a small ``limit`` returns at
+    most that many nodes/edges while ``total_nodes``/``total_edges`` still
+    report the true counts and ``has_more`` is set.
+    """
+    graph_id = "g_paginate_inspect"
+    store = MemoryGraphStore()
+    registry = _make_registry(store, tmp_path)
+
+    file_path = str((tmp_path / "src" / "big.py").resolve())
+    module = CodeNode(
+        id="mod", graph_id=graph_id, labels=["CodeModule", "CodeFile"],
+        properties={"name": "mod", "file_path": file_path},
+    )
+    members = [
+        CodeNode(
+            id=f"member{i}", graph_id=graph_id, labels=["CodeFunction"],
+            properties={"name": f"member{i}", "file_path": file_path},
+        )
+        for i in range(10)
+    ]
+    edges = [
+        CodeEdge(
+            source="mod", target=f"member{i}", graph_id=graph_id, rel_type="CONTAINS",
+            properties={"owner_file_path": file_path},
+        )
+        for i in range(10)
+    ]
+    await store.add_nodes_batch(graph_id, [module, *members])
+    await store.add_edges_batch(graph_id, edges)
+
+    result = await registry.handle_inspect_file(
+        InspectFileInput(file_path=file_path, graph_id=graph_id, limit=3, offset=0)
+    )
+
+    assert len(result.nodes) == 3, f"expected 3 nodes with limit=3, got {len(result.nodes)}"
+    assert len(result.edges) == 3, f"expected 3 edges with limit=3, got {len(result.edges)}"
+    assert result.total_nodes == 11, f"expected total_nodes=11 (1 module + 10 members), got {result.total_nodes}"
+    assert result.total_edges == 10, f"expected total_edges=10, got {result.total_edges}"
+    assert result.has_more is True, "expected has_more=True when limit < total"
+
+
+async def test_inspect_file_summary_only_omits_lists(tmp_path: Path) -> None:
+    """``summary_only=True`` must omit the nodes/edges lists but keep counts."""
+    graph_id = "g_summary_inspect"
+    store = MemoryGraphStore()
+    registry = _make_registry(store, tmp_path)
+
+    file_path = str((tmp_path / "src" / "small.py").resolve())
+    module = CodeNode(
+        id="mod2", graph_id=graph_id, labels=["CodeModule", "CodeFile"],
+        properties={"name": "mod2", "file_path": file_path},
+    )
+    await store.add_nodes_batch(graph_id, [module])
+
+    result = await registry.handle_inspect_file(
+        InspectFileInput(file_path=file_path, graph_id=graph_id, summary_only=True)
+    )
+
+    assert result.nodes == [], "summary_only=True must omit the nodes list"
+    assert result.edges == [], "summary_only=True must omit the edges list"
+    assert result.total_nodes == 1, "summary_only=True must still report total_nodes"
+
+
+async def test_inspect_file_include_edges_false_omits_edges(tmp_path: Path) -> None:
+    """``include_edges=False`` must omit edges while still returning nodes."""
+    graph_id = "g_no_edges_inspect"
+    store = MemoryGraphStore()
+    registry = _make_registry(store, tmp_path)
+
+    file_path = str((tmp_path / "src" / "noedges.py").resolve())
+    module = CodeNode(
+        id="mod3", graph_id=graph_id, labels=["CodeModule", "CodeFile"],
+        properties={"name": "mod3", "file_path": file_path},
+    )
+    member = CodeNode(
+        id="member_x", graph_id=graph_id, labels=["CodeFunction"],
+        properties={"name": "member_x", "file_path": file_path},
+    )
+    edge = CodeEdge(
+        source="mod3", target="member_x", graph_id=graph_id, rel_type="CONTAINS",
+        properties={"owner_file_path": file_path},
+    )
+    await store.add_nodes_batch(graph_id, [module, member])
+    await store.add_edges_batch(graph_id, [edge])
+
+    result = await registry.handle_inspect_file(
+        InspectFileInput(file_path=file_path, graph_id=graph_id, include_edges=False)
+    )
+
+    assert len(result.nodes) == 2, "nodes must still be returned when include_edges=False"
+    assert result.edges == [], "include_edges=False must omit the edges list"
+    assert result.total_edges == 0, "include_edges=False must not count skipped edges as available"
+
+
+async def test_find_hotspots_limit_and_offset(tmp_path: Path) -> None:
+    """``top_n``/``offset`` on find_hotspots must page ranked results."""
+    repo_path = str(tmp_path)
+    graph_id = _graph_id_from_repo_path(repo_path)
+    store = MemoryGraphStore()
+    registry = _make_registry(store, tmp_path)
+
+    # Chain: n0 -> n1 -> n2 -> n3 -> n4 gives each node a distinct fan_in.
+    nodes = [
+        CodeNode(id=f"n{i}", graph_id=graph_id, labels=["CodeFunction"], properties={"name": f"n{i}"})
+        for i in range(5)
+    ]
+    edges = [
+        CodeEdge(source=f"n{i}", target=f"n{i+1}", graph_id=graph_id, rel_type="CALLS")
+        for i in range(4)
+    ]
+    await store.add_nodes_batch(graph_id, nodes)
+    await store.add_edges_batch(graph_id, edges)
+
+    page1 = await registry.handle_find_hotspots(
+        FindHotspotsInput(repo_path=repo_path, top_n=2, offset=0, metric="fan_in")
+    )
+    assert len(page1.hotspots) == 2, f"expected 2 hotspots on page 1, got {len(page1.hotspots)}"
+    assert page1.has_more is True
+
+    page2 = await registry.handle_find_hotspots(
+        FindHotspotsInput(repo_path=repo_path, top_n=2, offset=2, metric="fan_in")
+    )
+    assert len(page2.hotspots) == 2, f"expected 2 hotspots on page 2, got {len(page2.hotspots)}"
+
+    page1_ids = {h.get("node_id") for h in page1.hotspots}
+    page2_ids = {h.get("node_id") for h in page2.hotspots}
+    assert page1_ids.isdisjoint(page2_ids), "offset must move the window, not repeat entries"
+
+
+async def test_get_architecture_pagination_and_summary_only(tmp_path: Path) -> None:
+    """``limit``/``offset``/``summary_only`` must page and trim the communities list."""
+    repo_path = str(tmp_path)
+    graph_id = _graph_id_from_repo_path(repo_path)
+    store = MemoryGraphStore()
+    registry = _make_registry(store, tmp_path)
+
+    # Three disjoint pairs -> three separate communities under the
+    # connected-component fallback.
+    nodes = []
+    edges = []
+    for i in range(3):
+        a, b = f"c{i}a", f"c{i}b"
+        nodes.append(CodeNode(id=a, graph_id=graph_id, labels=["CodeFunction"], properties={"name": a}))
+        nodes.append(CodeNode(id=b, graph_id=graph_id, labels=["CodeFunction"], properties={"name": b}))
+        edges.append(CodeEdge(source=a, target=b, graph_id=graph_id, rel_type="CALLS"))
+    await store.add_nodes_batch(graph_id, nodes)
+    await store.add_edges_batch(graph_id, edges)
+
+    paged = await registry.handle_get_architecture(
+        GetArchitectureInput(repo_path=repo_path, limit=1, offset=0)
+    )
+    assert len(paged.summary.get("communities", [])) == 1, "limit=1 must cap communities to 1"
+    assert paged.total == 3, f"expected total=3 communities, got {paged.total}"
+    assert paged.has_more is True
+
+    summarized = await registry.handle_get_architecture(
+        GetArchitectureInput(repo_path=repo_path, summary_only=True)
+    )
+    assert summarized.summary.get("communities") == [], "summary_only=True must omit the communities list"
+    assert summarized.total == 3, "summary_only=True must still report the total"
+
+
+async def test_shared_outputs_carry_schema_version(tmp_path: Path) -> None:
+    """Every shared output (retrieve/inspect_file/architecture/hotspots) carries schema_version."""
+    graph_id = "g_schema_version"
+    repo_path = str(tmp_path)
+    store = MemoryGraphStore()
+    registry = _make_registry(store, tmp_path)
+
+    node = CodeNode(id="only_node", graph_id=graph_id, labels=["CodeFunction"], properties={"name": "only_node"})
+    await store.add_nodes_batch(graph_id, [node])
+
+    retrieve_result = await registry.handle_retrieve(
+        RetrieveInput(query="only_node", graph_id=graph_id)
+    )
+    assert retrieve_result.schema_version, "RetrieveOutput must carry schema_version"
+
+    inspect_result = await registry.handle_inspect_file(
+        InspectFileInput(file_path="/does/not/exist.py", graph_id=graph_id)
+    )
+    assert inspect_result.schema_version, "InspectFileOutput must carry schema_version"
+
+    hotspots_result = await registry.handle_find_hotspots(
+        FindHotspotsInput(repo_path=repo_path)
+    )
+    assert hotspots_result.schema_version, "FindHotspotsOutput must carry schema_version"
+
+    architecture_result = await registry.handle_get_architecture(
+        GetArchitectureInput(repo_path=repo_path)
+    )
+    assert architecture_result.schema_version, "ArchitectureOutput must carry schema_version"
