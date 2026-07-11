@@ -86,35 +86,43 @@ class TestScipGraphTranslator:
         module_nodes = [n for n in delta.nodes if "CodeModule" in n.labels]
         assert module_nodes
 
-    def test_path_prefix_rebases_file_path_to_repo_relative(
+    def test_file_path_is_absolute_for_incremental_sync_lookup(
         self, parsed_index: ScipIndex
     ) -> None:
-        """A subproject's SCIP doc paths are project-relative ('src/dog.ts').
-        With path_prefix='mobile' they must become repo-relative
-        ('mobile/src/dog.ts') so files don't collide or lose their directory.
+        """CodeFile.file_path must be the ABSOLUTE path.
+
+        file_path is the lookup key incremental_sync/delete_file_facts match in
+        absolute form (str(path.resolve())). If SCIP stores it repo-relative,
+        re-syncing a SCIP file can't find its old nodes to delete -> stale-node
+        leak. So SCIP must agree with the extractors and store absolute paths;
+        display layers call _rel() to render repo-relative.
         """
+        repo_root = Path(__file__).parent.parent / "fixtures" / "ts_scip_project"
+        translator = ScipGraphTranslator(repo_root=repo_root, graph_id="test-graph")
+        doc = parsed_index.documents[Path("src/dog.ts")]
+        delta = translator.translate(doc)
+
+        code_files = [n for n in delta.nodes if "CodeFile" in n.labels]
+        assert code_files[0].properties["file_path"] == str(repo_root / "src/dog.ts")
+
+    def test_file_path_absolute_includes_subproject_prefix(
+        self, parsed_index: ScipIndex
+    ) -> None:
+        """A subproject's project-relative doc path ('src/dog.ts') must still be
+        rebased under the prefix so the absolute path points at the real file
+        ('<repo>/mobile/src/dog.ts'), keeping subproject files unique.
+        """
+        repo_root = Path(__file__).parent.parent / "fixtures" / "ts_scip_project"
         translator = ScipGraphTranslator(
-            repo_root=Path(__file__).parent.parent / "fixtures" / "ts_scip_project",
-            graph_id="test-graph",
-            path_prefix="mobile",
+            repo_root=repo_root, graph_id="test-graph", path_prefix="mobile"
         )
         doc = parsed_index.documents[Path("src/dog.ts")]
         delta = translator.translate(doc)
 
         code_files = [n for n in delta.nodes if "CodeFile" in n.labels]
-        assert code_files
-        assert code_files[0].properties["file_path"] == "mobile/src/dog.ts"
-
-    def test_no_prefix_keeps_project_relative_path(self, parsed_index: ScipIndex) -> None:
-        translator = ScipGraphTranslator(
-            repo_root=Path(__file__).parent.parent / "fixtures" / "ts_scip_project",
-            graph_id="test-graph",
+        assert code_files[0].properties["file_path"] == str(
+            repo_root / "mobile" / "src" / "dog.ts"
         )
-        doc = parsed_index.documents[Path("src/dog.ts")]
-        delta = translator.translate(doc)
-
-        code_files = [n for n in delta.nodes if "CodeFile" in n.labels]
-        assert code_files[0].properties["file_path"] == "src/dog.ts"
 
     def test_class_labels(self, parsed_index: ScipIndex) -> None:
         translator = ScipGraphTranslator(

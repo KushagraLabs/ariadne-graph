@@ -84,7 +84,7 @@ class ScipGraphTranslator:
             properties={
                 "name": document.relative_path.stem,
                 "qualname": file_path,
-                "file_path": file_path,
+                "file_path": abs_path,
                 "language": document.language or "typescript",
                 "scip_symbol": module_symbol or "",
                 "scip_kind": "File",
@@ -94,7 +94,7 @@ class ScipGraphTranslator:
 
         # Definition nodes from SymbolInformation.
         for sym in document.symbols.values():
-            node = self._symbol_to_node(sym, file_path)
+            node = self._symbol_to_node(sym, abs_path)
             add_node(node)
             # CONTAINS edge from module to top-level symbols.
             add_edge(
@@ -142,7 +142,7 @@ class ScipGraphTranslator:
                     properties={
                         "name": self._symbol_name(occ.symbol),
                         "scip_symbol": occ.symbol,
-                        "file_path": file_path,
+                        "file_path": abs_path,
                         "line_start": occ.start_line + 1,
                         "line_end": occ.end_line + 1,
                     },
@@ -209,7 +209,7 @@ class ScipGraphTranslator:
     # Symbol → node conversion
     # ------------------------------------------------------------------
 
-    def _symbol_to_node(self, sym: ScipSymbolInfo, file_path: str) -> CodeNode:
+    def _symbol_to_node(self, sym: ScipSymbolInfo, abs_path: str) -> CodeNode:
         labels = self._labels_for_symbol(sym)
         name = sym.display_name or self._symbol_name(sym.symbol)
         qualname = self._symbol_qualname(sym.symbol)
@@ -227,7 +227,7 @@ class ScipGraphTranslator:
                 "qualname": qualname,
                 "scip_symbol": sym.symbol,
                 "scip_kind": sym.kind_name,
-                "file_path": file_path,
+                "file_path": abs_path,
                 "line_start": line_start,
                 "line_end": line_end,
                 "documentation": "\n".join(sym.documentation),
