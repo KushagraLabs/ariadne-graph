@@ -19,9 +19,7 @@ logger = logging.getLogger(__name__)
 class ScipGraphTranslator:
     """Convert one :class:`ScipDocument` into a :class:`CodeGraphDelta`."""
 
-    def __init__(
-        self, repo_root: Path, graph_id: str, path_prefix: str = ""
-    ) -> None:
+    def __init__(self, repo_root: Path, graph_id: str, path_prefix: str = "") -> None:
         self.repo_root = repo_root.resolve()
         self.graph_id = graph_id
         # Repo-relative directory of the subproject this index was produced in
@@ -34,6 +32,21 @@ class ScipGraphTranslator:
         """Repo-root-relative path of *document*, applying the subproject prefix."""
         rel = str(document.relative_path)
         return f"{self.path_prefix}/{rel}" if self.path_prefix else rel
+
+    @staticmethod
+    def _node_id(symbol: str, file_path: str) -> str:
+        """Map a SCIP *symbol* to its global graph node id.
+
+        ``scip-typescript`` emits ``local N`` symbols that are unique only
+        within their owning document. Using them verbatim as global ids makes
+        same-named locals in different files collide (phantom cross-file
+        edges), so we namespace them by *file_path*. Non-local (npm/global)
+        symbols already carry their file path inside the symbol string and are
+        returned unchanged.
+        """
+        if symbol.startswith("local "):
+            return f"{file_path}::{symbol}"
+        return symbol
 
     def translate(
         self,
@@ -94,8 +107,12 @@ class ScipGraphTranslator:
 
         # Definition nodes from SymbolInformation.
         for sym in document.symbols.values():
-            node = self._symbol_to_node(sym, abs_path)
+            node = self._symbol_to_node(sym, abs_path, file_path)
             add_node(node)
+            # The file-module symbol is both the module node and a member; skip
+            # the module->module CONTAINS/DEFINES self-loop (bead 0ef).
+            if node.id == module_id:
+                continue
             # CONTAINS edge from module to top-level symbols.
             add_edge(
                 CodeEdge(
@@ -125,27 +142,54 @@ class ScipGraphTranslator:
             is_definition = bool(occ.symbol_roles & SymbolRole.DEFINITION)
             is_import = bool(occ.symbol_roles & SymbolRole.IMPORT)
 
-            # Ensure the target node exists (external symbols may be referenced
-            # but not defined in this document).
-            target_id = occ.symbol
-            if target_id not in seen_node_ids:
-                target_node = self._external_symbol_node(target_id)
-                add_node(target_node)
+            # Resolve the edge target node.
+            #   * Third-party/npm-package symbols collapse to one lightweight
+            #     per-package external-module node (never one node per library
+            #     internal).
+            #   * Otherwise the target is the symbol's own node; if it is not
+            #     defined in this document a lightweight stub is emitted so the
+            #     edge has a target. The stub deliberately carries no CodeFile/
+            #     CodeModule label; the owning file's authoritative node is
+            #     merged in via label union at persist time (see
+            #     add_nodes_batch), which is also what keeps a cross-file
+            #     import from stripping the owner's CodeFile label.
+            defined_here = occ.symbol in document.symbols
+            if not defined_here and self._is_external_package_symbol(occ.symbol):
+                external_node = self._external_module_node(occ.symbol)
+                target_id = external_node.id
+                add_node(external_node)
+            else:
+                target_id = self._node_id(occ.symbol, file_path)
+                if target_id not in seen_node_ids:
+                    add_node(self._external_symbol_node(occ.symbol, file_path))
 
             if is_import:
                 # Create a CodeImport node for this import site.
                 import_id = f"{file_path}:import:{occ.start_line}:{occ.start_col}"
+                import_props: dict[str, object] = {
+                    "name": self._symbol_name(occ.symbol),
+                    "scip_symbol": occ.symbol,
+                    "file_path": abs_path,
+                    "line_start": occ.start_line + 1,
+                    "line_end": occ.end_line + 1,
+                }
+                edge_props: dict[str, object] = {
+                    "owner_file_path": abs_path,
+                    "import_site": import_id,
+                }
+                # Resolve a local (relative) import to its target file. The
+                # imported SCIP symbol embeds the owning file path, so no raw
+                # specifier string is needed; store the absolute target path
+                # under ``resolved_source`` to match the Tree-sitter extractor.
+                resolved = self._resolved_import_target(occ.symbol)
+                if resolved is not None:
+                    import_props["resolved_source"] = resolved
+                    edge_props["resolved_source"] = resolved
                 import_node = CodeNode(
                     id=import_id,
                     graph_id=self.graph_id,
                     labels=["KnowledgeNode", "CodeImport"],
-                    properties={
-                        "name": self._symbol_name(occ.symbol),
-                        "scip_symbol": occ.symbol,
-                        "file_path": abs_path,
-                        "line_start": occ.start_line + 1,
-                        "line_end": occ.end_line + 1,
-                    },
+                    properties=import_props,
                 )
                 add_node(import_node)
                 add_edge(
@@ -154,10 +198,7 @@ class ScipGraphTranslator:
                         target=target_id,
                         graph_id=self.graph_id,
                         rel_type="IMPORTS_SYMBOL",
-                        properties={
-                            "owner_file_path": abs_path,
-                            "import_site": import_id,
-                        },
+                        properties=edge_props,
                     )
                 )
                 continue
@@ -166,7 +207,7 @@ class ScipGraphTranslator:
                 # Update definition node location if we have a matching symbol.
                 if occ.symbol in document.symbols:
                     for node in nodes:
-                        if node.id == occ.symbol:
+                        if node.id == target_id:
                             node.properties["line_start"] = occ.start_line + 1
                             node.properties["line_end"] = occ.end_line + 1
                 continue
@@ -209,7 +250,7 @@ class ScipGraphTranslator:
     # Symbol → node conversion
     # ------------------------------------------------------------------
 
-    def _symbol_to_node(self, sym: ScipSymbolInfo, abs_path: str) -> CodeNode:
+    def _symbol_to_node(self, sym: ScipSymbolInfo, abs_path: str, file_path: str) -> CodeNode:
         labels = self._labels_for_symbol(sym)
         name = sym.display_name or self._symbol_name(sym.symbol)
         qualname = self._symbol_qualname(sym.symbol)
@@ -219,7 +260,7 @@ class ScipGraphTranslator:
         # The translator does not keep document occurrences here; line numbers
         # are best-effort from the symbol metadata.
         return CodeNode(
-            id=sym.symbol,
+            id=self._node_id(sym.symbol, file_path),
             graph_id=self.graph_id,
             labels=labels,
             properties={
@@ -236,10 +277,10 @@ class ScipGraphTranslator:
             },
         )
 
-    def _external_symbol_node(self, symbol: str) -> CodeNode:
+    def _external_symbol_node(self, symbol: str, file_path: str) -> CodeNode:
         """Create a stub node for an externally referenced symbol."""
         return CodeNode(
-            id=symbol,
+            id=self._node_id(symbol, file_path),
             graph_id=self.graph_id,
             labels=["KnowledgeNode", "CodeImport"],
             properties={
@@ -249,6 +290,108 @@ class ScipGraphTranslator:
                 "is_external": True,
             },
         )
+
+    def _external_module_node(self, symbol: str) -> CodeNode:
+        """Collapse a third-party symbol to one lightweight per-package node.
+
+        All internals of an npm library share a single ``CodeExternalModule``
+        node keyed by ``<package>@<version>`` so we never inflate the graph with
+        a first-class node per library symbol.
+        """
+        package = self._external_package(symbol)
+        return CodeNode(
+            id=f"external:{package}",
+            graph_id=self.graph_id,
+            labels=["KnowledgeNode", "CodeExternalModule"],
+            properties={
+                "name": package,
+                "qualname": package,
+                "is_external": True,
+            },
+        )
+
+    def _resolved_import_target(self, symbol: str) -> str | None:
+        """Absolute path of the repo file an imported *symbol* is defined in.
+
+        Local/relative imports name a real repo source file inside the SCIP
+        symbol; this resolves that to an absolute path (the ``resolved_source``
+        the file-to-file dependency layer consumes). Returns ``None`` for
+        third-party or unresolvable imports.
+        """
+        if symbol.startswith("local "):
+            return None
+        return self._resolve_symbol_file(symbol)
+
+    def _resolve_symbol_file(self, symbol: str) -> str | None:
+        """Absolute path of the real repo file a SCIP *symbol* is defined in.
+
+        SCIP symbol paths are project-relative; for a subproject index they are
+        rebased under the same prefix as the document path so mobile/.tsx
+        symbols resolve to the real subproject file (bead c66). Returns ``None``
+        when the symbol carries no file path or the file does not exist.
+        """
+        source_file = self._symbol_source_file(symbol)
+        if source_file is None:
+            return None
+        candidates = [self.repo_root / source_file]
+        if self.path_prefix:
+            candidates.insert(0, self.repo_root / self.path_prefix / source_file)
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        return None
+
+    def _is_external_package_symbol(self, symbol: str) -> bool:
+        """Return True if *symbol* belongs to a third-party package.
+
+        A local-project symbol names a real source file inside the repo
+        (backtick-escaped path, e.g. ``src/`util.ts```). A third-party symbol
+        either references ``node_modules``/a ``.d.ts`` declaration file, or a
+        path that does not exist under the repo root. ``local N`` symbols are
+        document-scoped, never external.
+        """
+        if symbol.startswith("local ") or not symbol:
+            return False
+        source_file = self._symbol_source_file(symbol)
+        if source_file is None:
+            return False
+        if "node_modules" in source_file or source_file.endswith(".d.ts"):
+            return True
+        # Local-project symbols point at a real repo source file (prefix-aware).
+        return self._resolve_symbol_file(symbol) is None
+
+    @staticmethod
+    def _external_package(symbol: str) -> str:
+        """Return ``<package>@<version>`` for an npm-manager SCIP symbol."""
+        parts = symbol.split(" ")
+        if len(parts) >= 4:
+            return f"{parts[2]}@{parts[3]}"
+        return parts[2] if len(parts) >= 3 else symbol
+
+    @staticmethod
+    def _symbol_source_file(symbol: str) -> str | None:
+        """Extract the repo-relative source path a SCIP symbol is defined in.
+
+        SCIP file descriptors escape path segments with backticks, e.g.
+        ``src/`util.ts`/helper().`` -> ``src/util.ts``. Returns ``None`` when
+        the descriptor carries no file path.
+        """
+        # The descriptor is the portion after '<scheme> <manager> <name>
+        # <version>' (the first four space-separated fields).
+        parts = symbol.split(" ")
+        descriptor = " ".join(parts[4:]) if len(parts) >= 5 else ""
+        if "`" not in descriptor:
+            return None
+        # Concatenate the components up to and including the file segment,
+        # stripping backticks. The file segment is the one carrying an
+        # extension (a '.').
+        rebuilt: list[str] = []
+        for component in descriptor.split("/"):
+            unquoted = component.strip("`")
+            rebuilt.append(unquoted)
+            if "`" in component and "." in unquoted:
+                return "/".join(rebuilt)
+        return None
 
     # ------------------------------------------------------------------
     # Label mapping
@@ -309,18 +452,20 @@ class ScipGraphTranslator:
     def _relationship_to_edge(
         self, sym: ScipSymbolInfo, rel: ScipRelationship, file_path: str
     ) -> CodeEdge | None:
+        source = self._node_id(sym.symbol, file_path)
+        target = self._node_id(rel.symbol, file_path)
         if rel.is_implementation:
             return CodeEdge(
-                source=sym.symbol,
-                target=rel.symbol,
+                source=source,
+                target=target,
                 graph_id=self.graph_id,
                 rel_type="IMPLEMENTS",
                 properties={"owner_file_path": str(self.repo_root / file_path)},
             )
         if rel.is_type_definition:
             return CodeEdge(
-                source=sym.symbol,
-                target=rel.symbol,
+                source=source,
+                target=target,
                 graph_id=self.graph_id,
                 rel_type="USES_TYPE",
                 properties={"owner_file_path": str(self.repo_root / file_path)},
@@ -328,8 +473,8 @@ class ScipGraphTranslator:
         if rel.is_reference and rel.is_definition:
             # Reference + definition usually means override or alias.
             return CodeEdge(
-                source=sym.symbol,
-                target=rel.symbol,
+                source=source,
+                target=target,
                 graph_id=self.graph_id,
                 rel_type="OVERRIDES",
                 properties={"owner_file_path": str(self.repo_root / file_path)},
@@ -397,4 +542,3 @@ class ScipGraphTranslator:
         this flag later using package-level information from the index metadata.
         """
         return symbol.startswith("local ") is False and "node_modules" in symbol
-

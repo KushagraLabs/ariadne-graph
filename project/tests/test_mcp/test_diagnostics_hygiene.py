@@ -26,11 +26,12 @@ from pathlib import Path
 import pytest
 
 from ariadne_graph.core.config import AnalyzerConfig
+from ariadne_graph.core.models import CodeNode
 from ariadne_graph.core.snippets import SnippetExtractor
 from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
 from ariadne_graph.languages.python_ast.adapter import PythonLanguageAdapter
 from ariadne_graph.mcp.schemas import IndexInput, ListDiagnosticsInput
-from ariadne_graph.mcp.tools import ToolRegistry
+from ariadne_graph.mcp.tools import ToolRegistry, _graph_id_from_repo_path
 from ariadne_graph.web.queries import full_graph
 
 
@@ -45,18 +46,11 @@ def _write_layered_repo(repo_root: Path) -> None:
     (repo_root / "lib" / "deep").mkdir(parents=True)
     (repo_root / "lib" / "__init__.py").write_text("")
     (repo_root / "lib" / "deep" / "__init__.py").write_text("")
-    (repo_root / "lib" / "deep" / "engine.py").write_text(
-        "def run(x):\n    return x + 1\n"
-    )
+    (repo_root / "lib" / "deep" / "engine.py").write_text("def run(x):\n    return x + 1\n")
     (repo_root / "app").mkdir()
     (repo_root / "app" / "__init__.py").write_text("")
     (repo_root / "app" / "main.py").write_text(
-        "import os\n"
-        "from lib.deep.engine import run\n"
-        "\n"
-        "\n"
-        "def go():\n"
-        "    return run(1)\n"
+        "import os\nfrom lib.deep.engine import run\n\n\ndef go():\n    return run(1)\n"
     )
     (repo_root / "tests").mkdir()
     (repo_root / "tests" / "__init__.py").write_text("")
@@ -80,7 +74,7 @@ def _make_registry(store: SQLiteGraphStore, repo_root: Path) -> ToolRegistry:
 def _rel(abs_or_rel: str, repo_root: str) -> str:
     """Repo-relative form (mirror of the analysis/web ``_rel`` used to compare)."""
     root = repo_root.rstrip("/") + "/"
-    return abs_or_rel[len(root):] if abs_or_rel.startswith(root) else abs_or_rel
+    return abs_or_rel[len(root) :] if abs_or_rel.startswith(root) else abs_or_rel
 
 
 @pytest.mark.asyncio
@@ -98,10 +92,7 @@ async def test_deep_import_equivalence_mcp_vs_pink_edges(tmp_path: Path) -> None
         diag = await registry.handle_list_diagnostics(
             ListDiagnosticsInput(repo_path=str(repo), rule="deep_import")
         )
-        mcp_edges = {
-            (d["properties"]["from"], d["properties"]["to"])
-            for d in diag.diagnostics
-        }
+        mcp_edges = {(d["properties"]["from"], d["properties"]["to"]) for d in diag.diagnostics}
         assert mcp_edges, "expected a deep_import diagnostic for app -> lib/deep"
 
         graph = await full_graph(store, index.graph_id, repo_root=repo_root)
@@ -127,9 +118,7 @@ async def test_list_diagnostics_returns_aggregate_counts(tmp_path: Path) -> None
     try:
         await registry.handle_index(IndexInput(repo_path=str(repo)))
 
-        result = await registry.handle_list_diagnostics(
-            ListDiagnosticsInput(repo_path=str(repo))
-        )
+        result = await registry.handle_list_diagnostics(ListDiagnosticsInput(repo_path=str(repo)))
 
         # NEW: an aggregate rollup over ALL matching diagnostics (not just the
         # page returned in `diagnostics`). Grouped by rule and by prod/test.
@@ -157,11 +146,56 @@ async def test_list_diagnostics_production_only_filter(tmp_path: Path) -> None:
             ListDiagnosticsInput(repo_path=str(repo), production_only=True)  # type: ignore[call-arg]
         )
 
-        organs = {
-            _rel(d["file_path"], repo_root).split("/", 1)[0]
-            for d in prod.diagnostics
-        }
+        organs = {_rel(d["file_path"], repo_root).split("/", 1)[0] for d in prod.diagnostics}
         assert "tests" not in organs
         assert "app" in organs  # production diagnostics survive
+    finally:
+        await store.close()
+
+
+def _diag_node(graph_id: str, abs_file_path: str, rule: str) -> CodeNode:
+    """A CodeDiagnostic node the same shape ``persist_architecture_diagnostics``
+    writes, so ``handle_list_diagnostics`` classifies it exactly as in prod."""
+    return CodeNode(
+        id=f"diag::{abs_file_path}::{rule}",
+        graph_id=graph_id,
+        labels=["CodeDiagnostic"],
+        properties={"file_path": abs_file_path, "rule": rule, "level": "warning"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_colocated_test_diagnostic_counted_as_test_not_production(
+    tmp_path: Path,
+) -> None:
+    """kj3 hard case: a co-located ``*.test.ts`` under a production organ
+    (``server``) must roll up as TEST, not production, in ``by_production``.
+
+    Organ-only classification calls both files ``production`` (organ == 'server'),
+    inflating the production count. The SSOT ``is_peripheral_path`` recognizes the
+    ``.test.ts`` suffix, so exactly one production + one test finding is expected.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = SQLiteGraphStore(str(tmp_path / "graph.db"))
+    registry = _make_registry(store, repo)
+    graph_id = _graph_id_from_repo_path(str(repo))
+    root = str(repo.resolve())
+    try:
+        await store.add_nodes_batch(
+            graph_id,
+            [
+                _diag_node(graph_id, f"{root}/server/routes/foo.ts", "deep_import"),
+                _diag_node(graph_id, f"{root}/server/routes/foo.test.ts", "deep_import"),
+            ],
+        )
+
+        result = await registry.handle_list_diagnostics(
+            ListDiagnosticsInput(repo_path=str(repo), rule="deep_import")
+        )
+
+        by_prod = result.counts["by_production"]  # type: ignore[attr-defined]
+        assert by_prod["production"] == 1  # only foo.ts
+        assert by_prod["test"] == 1  # foo.test.ts is a test, not production
     finally:
         await store.close()

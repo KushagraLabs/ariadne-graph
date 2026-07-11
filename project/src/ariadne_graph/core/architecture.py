@@ -17,6 +17,7 @@ browser paint all consume these for free.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -38,17 +39,21 @@ if TYPE_CHECKING:
 # the web layer imports it from this module rather than keeping its own copy.
 PERIPHERAL_ORGANS = frozenset(
     {
-        "tests", "test", "__tests__", "spec", "specs", "e2e",
-        "scripts", "script",
+        "tests",
+        "test",
+        "__tests__",
+        "spec",
+        "specs",
+        "e2e",
+        "scripts",
+        "script",
     }
 )
 
 # File *stems* that are legitimately unreferenced: package/module entry points,
 # test fixtures, and packaging glue. An unreferenced file with one of these stems
 # is not dead code, so it is never reported as an orphan.
-_ENTRY_POINT_STEMS = frozenset(
-    {"__main__", "__init__", "cli", "conftest", "main", "setup"}
-)
+_ENTRY_POINT_STEMS = frozenset({"__main__", "__init__", "cli", "conftest", "main", "setup"})
 
 
 def _stem(rel_path: str) -> str:
@@ -65,7 +70,7 @@ def _rel(file_path: str, repo_root: str) -> str:
     """
     root = repo_root.rstrip("/") + "/"
     if file_path.startswith(root):
-        return file_path[len(root):]
+        return file_path[len(root) :]
     if file_path.startswith("/"):
         return "(external)" + file_path
     return file_path
@@ -80,6 +85,46 @@ def _dir_of(rel_path: str) -> str:
 def _organ(rel_dir: str) -> str:
     """Top-level organ (first path segment) of a repo-relative directory."""
     return rel_dir.split("/", 1)[0] if rel_dir else ""
+
+
+# A co-located test file lives under a production organ ('server', 'mobile', …)
+# yet is still peripheral. Matches Jest/Vitest/Mocha naming (foo.test.ts,
+# foo_spec.js) — the '(.|_)(test|spec)' before the extension is what distinguishes
+# 'foo.test.ts' from a production 'contest.ts'.
+_TEST_FILENAME_RE = re.compile(r"[._](test|spec)\.[jt]sx?$")
+
+# Path segments that mark a directory (at any depth) as peripheral even when the
+# top-level organ is production, e.g. 'server/__tests__/x.ts'.
+_PERIPHERAL_SEGMENTS = frozenset({"__tests__", "__mocks__", "tests", "test", "spec", "e2e"})
+
+
+def is_peripheral_path(rel_path: str) -> bool:
+    """SSOT for "is this repo-relative path peripheral (test/script) code?".
+
+    Peripheral if ANY of:
+      * its top-level organ is a :data:`PERIPHERAL_ORGANS` (tests/scripts at root),
+      * its filename matches ``(.|_)(test|spec).[jt]sx?`` (co-located JS/TS tests),
+      * any path segment is a peripheral segment (``__tests__``, ``__mocks__``, …).
+
+    This exists because organ-only classification misses co-located tests
+    (``server/routes/foo.test.ts`` has organ ``server`` == production). Every
+    prod/test decision — :func:`_is_production`, the deep-import/orphan/matrix
+    exemptions here, and ``list_diagnostics`` in the MCP layer — routes through
+    this so they all agree.
+    """
+    if _organ(_dir_of(rel_path)) in PERIPHERAL_ORGANS:
+        return True
+    filename = rel_path.rsplit("/", 1)[-1]
+    if _TEST_FILENAME_RE.search(filename):
+        return True
+    # Check every segment against the peripheral-dir set. Including the last
+    # segment is intentional and safe for BOTH inputs this helper receives:
+    #   * a file path (a/b/foo.ts) — the last segment is a filename, which never
+    #     equals a bare dir name like ``__tests__``/``tests`` (those have no ext);
+    #   * a directory/module group key (server/__tests__ or bare ``tests``) — the
+    #     last segment IS a real directory and must be matched.
+    segments = rel_path.split("/")
+    return any(seg in _PERIPHERAL_SEGMENTS for seg in segments)
 
 
 def is_deep_import(src_dir: str, dst_dir: str) -> bool:
@@ -134,7 +179,7 @@ def explain_edge(src_rel: str, dst_rel: str) -> EdgeExplanation:
 
     if not src_organ or not dst_organ:
         reason = "top_level"
-    elif src_organ in PERIPHERAL_ORGANS:
+    elif is_peripheral_path(src_rel):
         reason = "peripheral_source"
     elif src_organ == dst_organ:
         reason = "same_organ"
@@ -190,11 +235,14 @@ def _is_production(node_id: str, group_by: str) -> bool:
     (tests, scripts) and, for file-level nodes, entry-point/packaging stems are
     not production.
     """
-    if _module_of_key(node_id, group_by) in PERIPHERAL_ORGANS:
-        return False
-    if group_by == "file" and _stem(node_id) in _ENTRY_POINT_STEMS:
-        return False
-    return True
+    if group_by == "file":
+        if is_peripheral_path(node_id):
+            return False
+        return _stem(node_id) not in _ENTRY_POINT_STEMS
+    # directory/module nodes: id is a dir/organ path — organ + segment checks
+    # in is_peripheral_path still apply (the co-located filename regex won't
+    # match a directory, so it is a no-op there).
+    return not is_peripheral_path(node_id)
 
 
 def _group_key(rel_path: str, group_by: str) -> str:
@@ -259,9 +307,7 @@ def dependency_matrix(
         if src_key == dst_key:
             continue
         src_dir, dst_dir = _dir_of(src), _dir_of(dst)
-        is_violation = (
-            _organ(src_dir) not in PERIPHERAL_ORGANS and is_deep_import(src_dir, dst_dir)
-        )
+        is_violation = not is_peripheral_path(src) and is_deep_import(src_dir, dst_dir)
         counts = edge_agg.setdefault((src_key, dst_key), [0, 0])
         counts[0] += 1
         counts[1] += 1 if is_violation else 0
@@ -354,7 +400,7 @@ def _orphan_modules(
     for rel in files:
         if rel in referenced:
             continue
-        if _organ(_dir_of(rel)) in PERIPHERAL_ORGANS:
+        if is_peripheral_path(rel):
             continue
         if _stem(rel) in _ENTRY_POINT_STEMS:
             continue
@@ -394,7 +440,7 @@ def _deep_imports(
     findings: list[CodeDiagnostic] = []
     for src, dst in dep_edges:
         src_dir, dst_dir = _dir_of(src), _dir_of(dst)
-        if _organ(src_dir) in PERIPHERAL_ORGANS:
+        if is_peripheral_path(src):
             continue  # edges from tests/scripts are exempt
         if not is_deep_import(src_dir, dst_dir):
             continue
@@ -405,7 +451,10 @@ def _deep_imports(
                 message=f"Deep import into '{_organ(dst_dir)}' internals: {src} -> {dst}",
                 rule="deep_import",
                 properties={
-                    "file_path": src, "from": src, "to": dst, "organ": _organ(dst_dir),
+                    "file_path": src,
+                    "from": src,
+                    "to": dst,
+                    "organ": _organ(dst_dir),
                 },
             )
         )
@@ -425,7 +474,7 @@ def _layer_violations(
     findings: list[CodeDiagnostic] = []
     for src, dst in dep_edges:
         src_dir, dst_dir = _dir_of(src), _dir_of(dst)
-        if _organ(src_dir) in PERIPHERAL_ORGANS:
+        if is_peripheral_path(src):
             continue  # edges from tests/scripts are exempt
         src_mod = arch_config.module_of(src)
         dst_mod = arch_config.module_of(dst)
@@ -438,7 +487,10 @@ def _layer_violations(
                         message=f"Deep import into '{_organ(dst_dir)}' internals: {src} -> {dst}",
                         rule="deep_import",
                         properties={
-                            "file_path": src, "from": src, "to": dst, "organ": _organ(dst_dir),
+                            "file_path": src,
+                            "from": src,
+                            "to": dst,
+                            "organ": _organ(dst_dir),
                         },
                     )
                 )
@@ -452,8 +504,11 @@ def _layer_violations(
                 message=f"Layer violation: '{src_mod}' -> '{dst_mod}' is not declared in may_depend_on: {src} -> {dst}",
                 rule="layer_violation",
                 properties={
-                    "file_path": src, "from": src, "to": dst,
-                    "from_module": src_mod, "to_module": dst_mod,
+                    "file_path": src,
+                    "from": src,
+                    "to": dst,
+                    "from_module": src_mod,
+                    "to_module": dst_mod,
                 },
             )
         )
@@ -577,7 +632,10 @@ WHERE graph_id = ? AND labels LIKE '%"CodeFile"%'
 # rules whose findings this pass owns — cleared before each re-run so re-indexing
 # replaces rather than appends.
 _ARCH_RULES = (
-    "dependency_cycle", "deep_import", "orphan_module", "upward_import",
+    "dependency_cycle",
+    "deep_import",
+    "orphan_module",
+    "upward_import",
     "layer_violation",
 )
 
@@ -616,9 +674,7 @@ async def persist_architecture_diagnostics(
         _rel(abs_path, repo_root): abs_path for abs_path in abs_to_file_id
     }
     files = list(rel_to_abs)
-    dep_edges = [
-        (_rel(r["sf"], repo_root), _rel(r["tf"], repo_root)) for r in dep_rows
-    ]
+    dep_edges = [(_rel(r["sf"], repo_root), _rel(r["tf"], repo_root)) for r in dep_rows]
 
     arch_config = load_architecture_config(Path(repo_root))
     findings = analyze(files, dep_edges, arch_config=arch_config)
@@ -657,8 +713,11 @@ async def persist_architecture_diagnostics(
         )
         edges.append(
             CodeEdge(
-                source=file_id, target=diag_id, graph_id=graph_id,
-                rel_type="HAS_DIAGNOSTIC", properties={},
+                source=file_id,
+                target=diag_id,
+                graph_id=graph_id,
+                rel_type="HAS_DIAGNOSTIC",
+                properties={},
             )
         )
 
@@ -691,9 +750,7 @@ async def read_dependency_matrix(
         await db.close()
 
     files = [_rel(r["file_path"], repo_root) for r in file_rows]
-    dep_edges = [
-        (_rel(r["sf"], repo_root), _rel(r["tf"], repo_root)) for r in dep_rows
-    ]
+    dep_edges = [(_rel(r["sf"], repo_root), _rel(r["tf"], repo_root)) for r in dep_rows]
     return dependency_matrix(files, dep_edges, group_by=group_by)
 
 

@@ -58,19 +58,19 @@ def _node_by_id(delta: CodeGraphDelta, node_id: str) -> CodeNode | None:
     return None
 
 
-def _edges_from(
-    delta: CodeGraphDelta, source: str, rel_type: str | None = None
-) -> list[CodeEdge]:
+def _edges_from(delta: CodeGraphDelta, source: str, rel_type: str | None = None) -> list[CodeEdge]:
     return [
-        e for e in delta.edges if e.source == source and (rel_type is None or e.rel_type == rel_type)
+        e
+        for e in delta.edges
+        if e.source == source and (rel_type is None or e.rel_type == rel_type)
     ]
 
 
-def _edges_to(
-    delta: CodeGraphDelta, target: str, rel_type: str | None = None
-) -> list[CodeEdge]:
+def _edges_to(delta: CodeGraphDelta, target: str, rel_type: str | None = None) -> list[CodeEdge]:
     return [
-        e for e in delta.edges if e.target == target and (rel_type is None or e.rel_type == rel_type)
+        e
+        for e in delta.edges
+        if e.target == target and (rel_type is None or e.rel_type == rel_type)
     ]
 
 
@@ -83,7 +83,7 @@ def _labels_for(delta: CodeGraphDelta, node_id: str) -> list[str]:
 # Basic extraction
 # ---------------------------------------------------------------------------
 
-SAMPLE_TS = '''
+SAMPLE_TS = """
 import { helper } from "./helpers";
 import * as utils from "./utils";
 import React from "react";
@@ -119,7 +119,7 @@ export const useCounter = (initial: number) => {
 };
 
 const unused = require("fs");
-'''
+"""
 
 
 class TestBasicExtraction:
@@ -178,8 +178,7 @@ class TestBasicExtraction:
 
         assert any(e == ("mymodule", "CONTAINS", "mymodule.BaseService") for e in edges)
         assert any(
-            e == ("mymodule.BaseService", "CONTAINS", "mymodule.BaseService.fetch")
-            for e in edges
+            e == ("mymodule.BaseService", "CONTAINS", "mymodule.BaseService.fetch") for e in edges
         )
 
     def test_defines_edges(self):
@@ -204,26 +203,47 @@ class TestBasicExtraction:
         delta = _extract(SAMPLE_TS)
         edges = _edge_labels(delta)
 
-        assert any(
-            e[0] == "mymodule.UserService.fetch" and e[1] == "OVERRIDES" for e in edges
-        )
+        assert any(e[0] == "mymodule.UserService.fetch" and e[1] == "OVERRIDES" for e in edges)
 
-    def test_calls_edges(self):
+    def test_no_ast_calls_edges(self):
+        # Bead code_hygiene_mcp-0b9 (+ codex): the AST path emits NO CALLS edge.
+        # A raw-string target dangles; an import-site target is semantically
+        # wrong (calls the import declaration, not the target symbol). This
+        # single-file extractor cannot know the target symbol's node id in
+        # another file -- SCIP supplies resolved CALLS. Better no edge than a
+        # misleading one for dependency tracing.
         delta = _extract(SAMPLE_TS)
-        edges = _edge_labels(delta)
+        assert not [e for e in delta.edges if e.rel_type == "CALLS"]
 
-        assert any(e == ("mymodule.createUser", "CALLS", "UserService") for e in edges)
+    def test_call_and_new_still_mark_imports_used(self):
+        # The reason the extractor still walks callees despite emitting no CALLS
+        # edge: value-position uses (helper(), new UserService via createUser)
+        # must mark their imports used so unused-import detection stays correct.
+        source = """
+import { helper } from "./helpers";
+import { widget } from "./widget";
+
+export function run(): void {
+  helper();
+  new widget();
+}
+"""
+        delta = _extract(source, file_name="uses.ts")
+        unused = [
+            n
+            for n in delta.nodes
+            if "CodeDiagnostic" in n.labels and n.properties.get("rule") == "unused_import"
+        ]
+        unused_names = {n.properties.get("message", "") for n in unused}
+        assert not any("helper" in m for m in unused_names), "helper() call should mark import used"
+        assert not any("widget" in m for m in unused_names), "new widget() should mark import used"
 
     def test_exports_detected(self):
         delta = _extract(SAMPLE_TS)
         edges = _edge_labels(delta)
 
-        assert any(
-            e == ("mymodule", "EXPORTS", "mymodule.UserService") for e in edges
-        )
-        assert any(
-            e == ("mymodule", "EXPORTS", "mymodule.createUser") for e in edges
-        )
+        assert any(e == ("mymodule", "EXPORTS", "mymodule.UserService") for e in edges)
+        assert any(e == ("mymodule", "EXPORTS", "mymodule.createUser") for e in edges)
 
     def test_export_star_from_detected(self):
         source = """
@@ -250,14 +270,13 @@ export { foo } from "./api";
         types = {n.properties.get("export_type") for n in export_nodes}
         assert types == {"reexport_all", "reexport_named"}
 
-    def test_type_edges(self):
+    def test_no_ast_type_edges(self):
+        # Bead code_hygiene_mcp-0b9: USES_TYPE/RETURNS_TYPE AST edges removed
+        # (unresolved string targets). The return_type node property remains.
         delta = _extract(SAMPLE_TS)
-        edges = _edge_labels(delta)
-
-        assert any(
-            e[0] == "mymodule.BaseService.fetch" and e[1] == "RETURNS_TYPE"
-            for e in edges
-        )
+        assert not [e for e in delta.edges if e.rel_type in ("USES_TYPE", "RETURNS_TYPE")]
+        fetch = _node_by_id(delta, "mymodule.BaseService.fetch")
+        assert fetch is not None and fetch.properties.get("return_type") == "Promise<string>"
 
     def test_unused_import_diagnostic(self):
         delta = _extract(SAMPLE_TS)
@@ -271,7 +290,7 @@ export { foo } from "./api";
 # React / TSX extraction
 # ---------------------------------------------------------------------------
 
-SAMPLE_TSX = '''
+SAMPLE_TSX = """
 import React, { useState } from "react";
 
 export const Counter: React.FC = () => {
@@ -283,7 +302,7 @@ export function useToggle(initial: boolean) {
   const [value, setValue] = useState(initial);
   return [value, setValue];
 }
-'''
+"""
 
 
 class TestTsxExtraction:
@@ -308,7 +327,7 @@ class TestTsxExtraction:
 class TestUniqueNodeIds:
     """Ensure the extractor emits one distinct ID per node in a file."""
 
-    SOURCE_WITH_COLLISIONS = '''
+    SOURCE_WITH_COLLISIONS = """
 const outer = () => {
   const p = 1;
   const cb = () => {};
@@ -336,7 +355,7 @@ export interface IBox {
   p: number;
   p: string;
 }
-'''
+"""
 
     def test_all_node_ids_are_unique(self):
         delta = _extract(self.SOURCE_WITH_COLLISIONS, file_name="collisions.ts")
@@ -357,7 +376,9 @@ export interface IBox {
 
     def test_repeated_variable_names_are_not_collapsed(self):
         delta = _extract(self.SOURCE_WITH_COLLISIONS, file_name="collisions.ts")
-        p_vars = [n for n in delta.nodes if "CodeVariable" in n.labels and n.properties.get("name") == "p"]
+        p_vars = [
+            n for n in delta.nodes if "CodeVariable" in n.labels and n.properties.get("name") == "p"
+        ]
         assert len(p_vars) >= 2, f"expected at least 2 'p' variables, got {len(p_vars)}"
         ids = {n.id for n in p_vars}
         assert len(ids) == len(p_vars), "variable IDs collide"
@@ -406,18 +427,27 @@ function run() {
             f"duplicate node ids emitted: {len(ids)} total, {len(distinct)} distinct"
         )
 
-    def test_nested_function_calls_are_tracked(self):
-        """Ensure the traversal fix does not drop nested call edges."""
+    def test_nested_function_calls_are_visited(self):
+        """The traversal fix must reach every nested callee.
+
+        AST CALLS edges were removed (bead code_hygiene_mcp-0b9), so we assert
+        traversal completeness via unused-import marking instead: each nested
+        callee is an import, and all three must be marked used (none reported
+        unused), which only happens if the visitor descends into every nesting
+        level.
+        """
         source = """
+import { inner, helper, nested } from "./calls";
+
 function outer() {
   inner(helper(nested()));
 }
 """
         delta = _extract(source, file_name="nested_call_edges.ts")
-        edges = _edge_labels(delta)
-        assert any(e == ("nested_call_edges.outer", "CALLS", "inner") for e in edges)
-        assert any(e == ("nested_call_edges.outer", "CALLS", "helper") for e in edges)
-        assert any(e == ("nested_call_edges.outer", "CALLS", "nested") for e in edges)
+        unused = _unused_import_names(delta)
+        assert "inner" not in unused
+        assert "helper" not in unused
+        assert "nested" not in unused
 
     def test_realistic_nested_fixture_has_no_duplicate_ids(self):
         """Belt-and-suspenders: a realistic, nested file must emit each id once.
@@ -462,6 +492,145 @@ export function buildStore() {
 
 
 # ---------------------------------------------------------------------------
+# Bead code_hygiene_mcp-0b9: AST CALLS/USES_TYPE/RETURNS_TYPE are dangling noise
+# ---------------------------------------------------------------------------
+
+
+class TestNoDanglingRelationEdges:
+    """CALLS/USES_TYPE/RETURNS_TYPE must never target an unresolved raw string.
+
+    The tree-sitter AST path used to emit these edges with the callee/type
+    literal source text as the target (e.g. 'console.error'), which resolves to
+    no node -- 100% dangling. The SCIP translator emits the resolved forms, so
+    the AST forms are removed. Every emitted edge target must resolve to a node
+    the extractor also emits, or the relation must be absent.
+    """
+
+    _FIXTURE = """
+import { UserService } from "./services";
+import type { Config } from "./config";
+
+export class Store {
+  cache: Map<string, number> = new Map();
+
+  load(cfg: Config): Promise<UserService> {
+    console.error("boom");
+    process.exit(1);
+    return new UserService(cfg).fetch();
+  }
+}
+
+export function make(): Store {
+  return new Store();
+}
+"""
+
+    def test_no_calls_uses_returns_edges_with_string_targets(self):
+        delta = _extract(self._FIXTURE, file_name="store.ts")
+        node_ids = _node_ids(delta)
+        offenders = [
+            (e.source, e.rel_type, e.target)
+            for e in delta.edges
+            if e.rel_type in ("CALLS", "USES_TYPE", "RETURNS_TYPE") and e.target not in node_ids
+        ]
+        assert not offenders, f"dangling relation edges: {offenders}"
+
+    def test_extraction_does_not_error(self):
+        # Fixture with member-expression callees exercised the deleted path.
+        delta = _extract(self._FIXTURE, file_name="store.ts")
+        assert "store.Store" in _node_ids(delta)
+
+
+# ---------------------------------------------------------------------------
+# Bead code_hygiene_mcp-df7: type-position usage counts against unused-import
+# ---------------------------------------------------------------------------
+
+
+def _unused_import_names(delta: CodeGraphDelta) -> set[str]:
+    return {
+        n.properties.get("name")
+        for n in delta.nodes
+        if "CodeDiagnostic" in n.labels and n.properties.get("rule") == "unused_import"
+    }
+
+
+class TestTypePositionImportUsage:
+    """Imports used only in type positions must not be flagged unused."""
+
+    def test_import_type_used_as_annotation(self):
+        source = """
+import type { LifeDomain } from "./domains";
+
+export function classify(d: LifeDomain): string {
+  return String(d);
+}
+"""
+        delta = _extract(source, file_name="classify.ts")
+        assert "LifeDomain" not in _unused_import_names(delta)
+
+    def test_inline_type_specifier_used_as_indexed_access(self):
+        source = """
+import { type SecondaryProgressionsResult } from "./astro";
+
+export type Sun = SecondaryProgressionsResult["sun"];
+"""
+        delta = _extract(source, file_name="astro.ts")
+        assert "SecondaryProgressionsResult" not in _unused_import_names(delta)
+
+    def test_import_used_only_as_cast(self):
+        source = """
+import { Foo } from "./foo";
+
+export function coerce(x: unknown) {
+  return x as Foo;
+}
+"""
+        delta = _extract(source, file_name="coerce.ts")
+        assert "Foo" not in _unused_import_names(delta)
+
+    def test_import_used_only_as_class_extends(self):
+        source = """
+import { BaseWidget } from "./base";
+
+export class Widget extends BaseWidget {}
+"""
+        delta = _extract(source, file_name="widget.ts")
+        assert "BaseWidget" not in _unused_import_names(delta)
+
+    def test_import_used_only_as_class_implements(self):
+        source = """
+import { Renderable } from "./iface";
+
+export class View implements Renderable {}
+"""
+        delta = _extract(source, file_name="view.ts")
+        assert "Renderable" not in _unused_import_names(delta)
+
+    def test_import_used_only_as_generic_argument(self):
+        source = """
+import { Widget } from "./widget";
+
+export function first(items: Array<Widget>): Widget {
+  return items[0];
+}
+"""
+        delta = _extract(source, file_name="generic.ts")
+        assert "Widget" not in _unused_import_names(delta)
+
+    def test_genuinely_unused_import_still_flagged(self):
+        source = """
+import type { Unused } from "./unused";
+import { AlsoUnused } from "./also";
+
+export const x = 1;
+"""
+        delta = _extract(source, file_name="dead.ts")
+        flagged = _unused_import_names(delta)
+        assert "Unused" in flagged
+        assert "AlsoUnused" in flagged
+
+
+# ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
 
@@ -486,7 +655,6 @@ class TestTypeScriptLanguageAdapter:
         assert delta.content_hash != ""
         assert delta.parser_version.startswith("tree-sitter-typescript_")
         assert any("CodeFunction" in n.labels for n in delta.nodes)
-
 
     def test_extract_file_resolves_tsconfig_alias(self, tmp_path: Path):
         """Imports using a tsconfig path alias record a resolved_source."""

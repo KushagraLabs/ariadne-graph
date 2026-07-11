@@ -7,6 +7,7 @@ variables, imports, exports, call relationships, and diagnostics.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,11 @@ except ImportError:
 from ariadne_graph.core.models import CodeEdge, CodeGraphDelta, CodeNode
 from ariadne_graph.languages.base import UniqueIdMixin
 from ariadne_graph.languages.typescript.tsconfig import TsConfigResolver
+
+# Identifier tokens inside a rendered type expression (e.g. "Array<Widget>").
+# Used to attribute type-position usage back to imports (bead
+# code_hygiene_mcp-df7).
+_TYPE_IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
 
 
 def _text_str(node: Any) -> str:
@@ -361,9 +367,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         if resolved_source:
             properties["resolved_source"] = resolved_source
             try:
-                resolved_module = _module_name_from_path(
-                    Path(resolved_source), self.repo_root
-                )
+                resolved_module = _module_name_from_path(Path(resolved_source), self.repo_root)
             except Exception:
                 resolved_module = resolved_source
             properties["resolved_module"] = resolved_module
@@ -401,10 +405,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         line_info = self._line_range(node)
 
         # export * from "..."
-        if (
-            _child_by_type(node, "*") is not None
-            and _child_by_type(node, "string") is not None
-        ):
+        if _child_by_type(node, "*") is not None and _child_by_type(node, "string") is not None:
             source_node = _child_by_type(node, "string")
             source = _string_value(source_node) if source_node else ""
             node_id = f"{self.module_name}:export:*:{source}"
@@ -475,21 +476,15 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         elif declaration.type == "type_alias_declaration":
             self._process_type_alias(declaration, exported=True, is_default=is_default)
         elif declaration.type in ("function_declaration", "generator_function_declaration"):
-            self._process_function(
-                declaration, exported=True, is_default=is_default
-            )
+            self._process_function(declaration, exported=True, is_default=is_default)
         elif declaration.type in ("lexical_declaration", "variable_declaration"):
-            self._process_variable_declaration(
-                declaration, exported=True, is_default=is_default
-            )
+            self._process_variable_declaration(declaration, exported=True, is_default=is_default)
 
     # ------------------------------------------------------------------
     # Classes
     # ------------------------------------------------------------------
 
-    def _process_class(
-        self, node: Any, exported: bool = False, is_default: bool = False
-    ) -> None:
+    def _process_class(self, node: Any, exported: bool = False, is_default: bool = False) -> None:
         name_node = _child_by_type(node, "type_identifier")
         if name_node is None:
             name_node = _child_by_type(node, "identifier")
@@ -520,6 +515,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
                 if base_type is not None:
                     base_name = _text_str(base_type)
                     base_names.append(base_name)
+                    self._mark_import_used(base_name)
                     self._add_edge(
                         qualname,
                         base_name,
@@ -533,6 +529,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
                     if child.type in ("identifier", "type_identifier"):
                         iface_name = _text_str(child)
                         implements.append(iface_name)
+                        self._mark_import_used(iface_name)
                         self._add_edge(
                             qualname,
                             iface_name,
@@ -602,6 +599,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
                 if child.type in ("identifier", "type_identifier"):
                     base_name = _text_str(child)
                     extends_types.append(base_name)
+                    self._mark_import_used(base_name)
                     self._add_edge(
                         qualname,
                         base_name,
@@ -669,13 +667,12 @@ class TypeScriptFactExtractor(UniqueIdMixin):
             props["type_text"] = self._node_text(value_node)
             used_types = _collect_type_identifiers(value_node)
             props["used_types"] = used_types
+            # No AST USES_TYPE edge (target would be a raw type name, never a
+            # resolved node -- bead code_hygiene_mcp-0b9); SCIP emits the
+            # resolved form. Still mark type-position imports used (bead
+            # code_hygiene_mcp-df7).
             for used_type in used_types:
-                self._add_edge(
-                    node_id,
-                    used_type,
-                    "USES_TYPE",
-                    {"type": used_type},
-                )
+                self._mark_import_used(used_type)
 
         self._add_node(node_id, ["CodeTypeAlias"], props)
         self._add_edge(self._parent_module_id(), node_id, "CONTAINS")
@@ -705,11 +702,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         name_node = _child_by_type(node, "identifier")
         if name_node is None:
             name_node = _child_by_type(node, "property_identifier")
-        func_name = (
-            forced_name
-            or (_text_str(name_node) if name_node else None)
-            or "<anonymous>"
-        )
+        func_name = forced_name or (_text_str(name_node) if name_node else None) or "<anonymous>"
 
         is_method = parent_class_id is not None
         is_async = _child_by_type(node, "async") is not None
@@ -717,9 +710,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         is_arrow = node.type == "arrow_function"
 
         if is_method and parent_class_id:
-            qualname = _qualname(
-                self.module_name, parent_class_name, func_name
-            )
+            qualname = _qualname(self.module_name, parent_class_name, func_name)
             labels = ["CodeMethod"]
         else:
             qualname = _qualname(self.module_name, func_name=func_name)
@@ -769,24 +760,14 @@ class TypeScriptFactExtractor(UniqueIdMixin):
                     param_name, type_name = _extract_parameter_info(param)
                     if type_name:
                         arg_types.append(type_name)
-                        self._add_edge(
-                            node_id,
-                            type_name,
-                            "USES_TYPE",
-                            {"parameter": param_name, "type": type_name},
-                        )
+                        self._mark_type_used(type_name)
 
         return_type_node = _child_by_type(node, "type_annotation")
         if return_type_node is not None:
             return_type = _type_annotation_name(return_type_node)
             if return_type:
                 props["return_type"] = return_type
-                self._add_edge(
-                    node_id,
-                    return_type,
-                    "RETURNS_TYPE",
-                    {"return_type": return_type},
-                )
+                self._mark_type_used(return_type)
 
         if arg_types:
             props["arg_types"] = arg_types
@@ -827,8 +808,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         method_name = _text_str(name_node) if name_node else "<anonymous>"
         parent_class_name = parent_class_id.split(".")[-1]
         is_static = any(
-            child.type in ("static", "readonly", "accessor", "async")
-            for child in node.children
+            child.type in ("static", "readonly", "accessor", "async") for child in node.children
         )
 
         node_id = self._process_function(
@@ -908,7 +888,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         self._add_node(attr_id, ["CodeAttribute"], props)
         self._add_edge(parent_class_id, attr_id, "CONTAINS")
         if type_name:
-            self._add_edge(attr_id, type_name, "USES_TYPE", {"type": type_name})
+            self._mark_type_used(type_name)
 
     def _process_interface_property(self, node: Any, parent_interface_id: str) -> None:
         name_node = _child_by_type(node, "property_identifier")
@@ -935,7 +915,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         self._add_node(attr_id, ["CodeAttribute"], props)
         self._add_edge(parent_interface_id, attr_id, "CONTAINS")
         if type_name:
-            self._add_edge(attr_id, type_name, "USES_TYPE", {"type": type_name})
+            self._mark_type_used(type_name)
 
     # ------------------------------------------------------------------
     # Variables / lexical declarations
@@ -972,9 +952,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
                     declarator,
                 )
 
-            var_id = self._unique_node_id(
-                f"{self.module_name}:var:{var_name}", declarator
-            )
+            var_id = self._unique_node_id(f"{self.module_name}:var:{var_name}", declarator)
             snippet = self._make_snippet(declarator)
             line_info = self._line_range(declarator)
 
@@ -995,7 +973,7 @@ class TypeScriptFactExtractor(UniqueIdMixin):
             self._add_node(var_id, ["CodeVariable"], props)
             self._add_edge(self._parent_module_id(), var_id, "CONTAINS")
             if type_name:
-                self._add_edge(var_id, type_name, "USES_TYPE", {"type": type_name})
+                self._mark_type_used(type_name)
 
             if exported:
                 self._add_edge(
@@ -1064,12 +1042,18 @@ class TypeScriptFactExtractor(UniqueIdMixin):
             self._process_variable_declaration(node)
             return
 
-        # Call/new expressions only emit edges; recursion into their children
-        # is handled by the single loop below.
+        # Call/new expressions mark their callee's import used; recursion into
+        # their children is handled by the single loop below.
         if node_type == "call_expression":
             self._process_call(node)
         elif node_type == "new_expression":
             self._process_new_expression(node)
+        elif node_type in ("as_expression", "satisfies_expression"):
+            # `x as Foo` / `x satisfies Foo`: the type operand is a
+            # type-position use of an import (bead code_hygiene_mcp-df7).
+            for child in node.children:
+                if child.type in ("type_identifier", "generic_type", "nested_type_identifier"):
+                    self._mark_type_used(_text_str(child))
 
         for child in node.children:
             self._visit_expression(child)
@@ -1079,13 +1063,21 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         if func is None:
             return
         callee = _expression_name(func)
-        caller = self._current_function
-        if callee and caller:
-            self._add_edge(caller, callee, "CALLS", {"callee": callee})
+        # No AST CALLS edge is emitted (bead code_hygiene_mcp-0b9). Its target
+        # would be either the raw callee string (dangling) or the local
+        # CodeImport site (semantically wrong -- "calls the import declaration",
+        # not the target symbol). This is a single-file extractor: it cannot
+        # know the imported symbol's node id in another file. Resolved CALLS are
+        # supplied by the SCIP translator when scip-typescript runs; in the
+        # Tree-sitter-only fallback the call graph is degraded (a
+        # scip_typescript diagnostic already flags this) rather than populated
+        # with misleading edges. We still walk callees to mark imports used.
+        if callee:
             self._mark_import_used(callee)
 
     def _process_new_expression(self, node: Any) -> None:
-        # new Foo() -> CALLS Foo (best effort)
+        # new Foo(): no AST CALLS edge (see _process_call, bead 0b9), but Foo's
+        # import is still marked used for unused-import detection.
         callee = None
         for child in node.children:
             if child.type == "new":
@@ -1093,17 +1085,25 @@ class TypeScriptFactExtractor(UniqueIdMixin):
             if child.type in ("identifier", "type_identifier", "member_expression"):
                 callee = _expression_name(child)
                 break
-        caller = self._current_function
-        if callee and caller:
-            self._add_edge(caller, callee, "CALLS", {"callee": callee})
+        if callee:
             self._mark_import_used(callee)
 
     def _mark_import_used(self, name: str) -> None:
-        """Mark an import as used based on a name reference."""
+        """Mark an import as used based on a value-position name reference."""
         for imp in self._imports:
             if imp["name"] == name or name.startswith(imp["name"] + "."):
                 imp["used"] = True
                 break
+
+    def _mark_type_used(self, type_text: str) -> None:
+        """Mark imports used from a type-position reference (bead df7).
+
+        A rendered type such as ``Array<Widget>`` or ``Config["x"]`` may embed
+        several imported names, so every identifier token is checked -- unlike
+        value positions, which reference a single callee/constructor name.
+        """
+        for token in _TYPE_IDENT_RE.findall(type_text):
+            self._mark_import_used(token)
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -1174,9 +1174,7 @@ def _module_name_from_path(file_path: Path, repo_root: Path) -> str:
     return ".".join(parts)
 
 
-def _qualname(
-    module_name: str, class_name: str | None = None, func_name: str | None = None
-) -> str:
+def _qualname(module_name: str, class_name: str | None = None, func_name: str | None = None) -> str:
     """Build a dot-separated qualified name."""
     parts = [module_name]
     if class_name:

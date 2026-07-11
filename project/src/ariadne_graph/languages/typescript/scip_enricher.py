@@ -48,7 +48,9 @@ class TreeSitterEnricher:
         self,
         file_path: Path,
         scip_delta: CodeGraphDelta,
-    ) -> tuple[CodeGraphDelta, set[tuple[int, int, int, int]], dict[tuple[int, int, int, int], str]]:
+    ) -> tuple[
+        CodeGraphDelta, set[tuple[int, int, int, int]], dict[tuple[int, int, int, int], str]
+    ]:
         """Return an enriched delta plus call ranges and an enclosing map.
 
         Args:
@@ -82,6 +84,12 @@ class TreeSitterEnricher:
             if name:
                 scip_lookup[(name, line_start, line_end)] = node
 
+        # The module/file node id is the fallback enclosing id: when a
+        # Tree-sitter scope has no matching SCIP definition node, reference
+        # edges must still originate from a real node (the file), not a bare
+        # display name that matches nothing in the graph.
+        module_id = self._module_id(scip_delta)
+
         # Walk the tree to collect call ranges, enclosing definitions, and
         # extra properties.
         self._walk(
@@ -91,6 +99,7 @@ class TreeSitterEnricher:
             scip_lookup,
             call_ranges,
             enclosing_map,
+            module_id,
         )
 
         return scip_delta, call_ranges, enclosing_map
@@ -105,6 +114,15 @@ class TreeSitterEnricher:
         parser = Parser(language)
         return parser.parse(source_bytes)
 
+    @staticmethod
+    def _module_id(scip_delta: CodeGraphDelta) -> str:
+        """Return the module/file node id used as the enclosing fallback."""
+        for node in scip_delta.nodes:
+            if "CodeModule" in node.labels or "CodeFile" in node.labels:
+                return node.id
+        # Fallback to the delta's file_path key if no module node was emitted.
+        return scip_delta.file_path
+
     def _walk(
         self,
         node: Any,
@@ -113,6 +131,7 @@ class TreeSitterEnricher:
         scip_lookup: dict[tuple[str, int, int], CodeNode],
         call_ranges: set[tuple[int, int, int, int]],
         enclosing_map: dict[tuple[int, int, int, int], str],
+        module_id: str,
     ) -> None:
         """Recursively walk the Tree-sitter AST."""
         start_line, start_col = node.start_point
@@ -137,7 +156,9 @@ class TreeSitterEnricher:
                 # enclosing definition. Fallback to the raw name.
                 key = (name, start_line + 1, end_line + 1)
                 scip_node = scip_lookup.get(key)
-                scope_id = scip_node.id if scip_node else name
+                # Fall back to the module/file node id (a real node) rather than
+                # the bare display name, which matches no node in the graph.
+                scope_id = scip_node.id if scip_node else module_id
                 scope_info = (name, start_line, end_line, scope_id)
                 scope_stack.append(scope_info)
 
@@ -162,6 +183,7 @@ class TreeSitterEnricher:
                 scip_lookup,
                 call_ranges,
                 enclosing_map,
+                module_id,
             )
 
         if scope_info:

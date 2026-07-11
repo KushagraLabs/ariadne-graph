@@ -16,10 +16,10 @@ import xxhash
 from ariadne_graph.core.architecture import (
     _DEP_EDGE_SQL,
     _FILE_SQL,
-    PERIPHERAL_ORGANS,
     _dir_of,
     _rel,
     explain_edge,
+    is_peripheral_path,
     persist_architecture_diagnostics,
     read_dependency_matrix,
 )
@@ -93,6 +93,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _graph_id_from_repo_path(repo_path: str) -> str:
     """Derive a stable graph_id from a repository path."""
@@ -170,13 +171,13 @@ def _module_name_candidates(rel_path: str) -> set[str]:
     ``from core import x`` occur in the wild depending on how the package is
     installed/run).
     """
-    stem = rel_path[:-len(".py")] if rel_path.endswith(".py") else rel_path
+    stem = rel_path[: -len(".py")] if rel_path.endswith(".py") else rel_path
     if stem.endswith("/__init__"):
         stem = stem[: -len("/__init__")]
     dotted = stem.replace("/", ".")
     candidates = {dotted}
     if dotted.startswith("src."):
-        candidates.add(dotted[len("src."):])
+        candidates.add(dotted[len("src.") :])
     return candidates
 
 
@@ -290,13 +291,13 @@ def _audit_public_surfaces(
         # public_surfaces entries are glob patterns (mirrors ModuleSpec.paths),
         # so membership is a glob match, not exact-string containment.
         surface_files = sorted(
-            f for f in all_files
+            f
+            for f in all_files
             if arch_config.module_of(f) == mod_name
             and any(fnmatch.fnmatch(f, pat) for pat in spec.public_surfaces)
         )
         internal_files = sorted(
-            f for f in all_files
-            if arch_config.module_of(f) == mod_name and f not in surface_files
+            f for f in all_files if arch_config.module_of(f) == mod_name and f not in surface_files
         )
         surface_set, internal_set = set(surface_files), set(internal_files)
 
@@ -357,6 +358,7 @@ def _audit_public_surfaces(
 # ---------------------------------------------------------------------------
 # ToolRegistry
 # ---------------------------------------------------------------------------
+
 
 class ToolRegistry:
     """Holds all 14 MCP tool handlers and their shared resources."""
@@ -538,9 +540,7 @@ class ToolRegistry:
         else:
             from ariadne_graph.core.auto_sync import AutoSyncManager
 
-            self.auto_sync_manager = AutoSyncManager(
-                self, self.config.incremental_sync_interval
-            )
+            self.auto_sync_manager = AutoSyncManager(self, self.config.incremental_sync_interval)
         await self.auto_sync_manager.start()
 
     async def stop_auto_sync(self) -> None:
@@ -581,9 +581,7 @@ class ToolRegistry:
             try:
                 # Offload the synchronous filesystem walk so the daemon event
                 # loop keeps serving HTTP during discovery on large repos.
-                found = await asyncio.to_thread(
-                    adapter.discover_files, Path(repo_path), config
-                )
+                found = await asyncio.to_thread(adapter.discover_files, Path(repo_path), config)
                 all_current_files.extend(found)
             except Exception as exc:
                 logger.warning("File discovery failed: %s", exc)
@@ -619,7 +617,11 @@ class ToolRegistry:
                 logger.warning("Architecture analysis failed: %s", exc)
 
         # Also compute embeddings for changed files if a provider is available
-        if self.embedding_service is not None and self.searchable_store is not None and changed_files:
+        if (
+            self.embedding_service is not None
+            and self.searchable_store is not None
+            and changed_files
+        ):
             try:
                 nodes_to_embed: list[CodeNode] = []
                 for file_path in changed_files:
@@ -649,9 +651,7 @@ class ToolRegistry:
             total_indexed = changed_count
 
         sync_enabled = self.config.auto_sync
-        await self._record_index_meta(
-            repo_path, graph_id, total_indexed, sync_enabled=sync_enabled
-        )
+        await self._record_index_meta(repo_path, graph_id, total_indexed, sync_enabled=sync_enabled)
         try:
             await self.freshness_tracker.mark_indexed(
                 graph_id, repo_path, file_count=total_indexed, sync_enabled=sync_enabled
@@ -673,9 +673,7 @@ class ToolRegistry:
             message=message,
         )
 
-    async def handle_targeted_sync(
-        self, repo_path: str, changed_files: list[Path]
-    ) -> IndexOutput:
+    async def handle_targeted_sync(self, repo_path: str, changed_files: list[Path]) -> IndexOutput:
         """Sync a known set of changed files without rediscovering the repo.
 
         This is the entry point used by the filesystem watcher. It groups
@@ -684,9 +682,7 @@ class ToolRegistry:
         """
         resolved = str(Path(repo_path).resolve())
         graph_id = self._get_graph_id(resolved)
-        config = self.config.model_copy(
-            update={"repo_root": Path(resolved), "graph_id": graph_id}
-        )
+        config = self.config.model_copy(update={"repo_root": Path(resolved), "graph_id": graph_id})
 
         if not changed_files:
             return IndexOutput(
@@ -714,9 +710,7 @@ class ToolRegistry:
                 continue
             try:
                 sync = IncrementalSync(self.graph_store, config)
-                report = await sync.targeted_sync(
-                    adapter, owned, all_known_files=all_current_files
-                )
+                report = await sync.targeted_sync(adapter, owned, all_known_files=all_current_files)
                 changed_count += len(report.added) + len(report.modified)
             except Exception as exc:
                 errors.append(f"{lang_name} targeted sync failed: {exc}")
@@ -755,9 +749,7 @@ class ToolRegistry:
             total_indexed = changed_count
 
         # Mark sync as enabled because this path is only used by auto-sync.
-        await self._record_index_meta(
-            resolved, graph_id, total_indexed, sync_enabled=True
-        )
+        await self._record_index_meta(resolved, graph_id, total_indexed, sync_enabled=True)
         try:
             await self.freshness_tracker.mark_indexed(
                 graph_id, resolved, file_count=total_indexed, sync_enabled=True
@@ -987,7 +979,7 @@ class ToolRegistry:
                 hits=[],
                 message=(
                     "Semantic search requires the semantic extra. "
-                    "Install with: pip install -e \".[semantic]\""
+                    'Install with: pip install -e ".[semantic]"'
                 ),
             )
 
@@ -1028,7 +1020,8 @@ class ToolRegistry:
                 return node.get("labels", []) or []
 
             all_hits = [
-                hit for hit in all_hits
+                hit
+                for hit in all_hits
                 if any(label.lower() in type_set for label in _hit_labels(hit))
             ]
 
@@ -1076,9 +1069,7 @@ class ToolRegistry:
                 if rows:
                     return cast(dict[str, Any], rows[0].get("n", rows[0]))
             except Exception as exc:
-                logger.warning(
-                    "Failed to fetch node %s for language filter: %s", node_id, exc
-                )
+                logger.warning("Failed to fetch node %s for language filter: %s", node_id, exc)
             return None
 
         for graph_id in graph_ids:
@@ -1094,22 +1085,22 @@ class ToolRegistry:
                     for hit in hits:
                         node = hit.get("node")
                         if not node:
-                            node = await _fetch_hit_node(
-                                graph_id, hit.get("node_id", "")
-                            )
+                            node = await _fetch_hit_node(graph_id, hit.get("node_id", ""))
                         node = node or {}
                         props = node.get("properties", {}) if isinstance(node, dict) else {}
                         if input.language:
                             node_lang = _language_from_props(props)
                             if input.language.lower() not in node_lang.lower():
                                 continue
-                        matches.append({
-                            "graph_id": graph_id,
-                            "node_id": hit.get("node_id"),
-                            "labels": node.get("labels", []),
-                            "properties": props,
-                            "score": hit.get("score", 0.0),
-                        })
+                        matches.append(
+                            {
+                                "graph_id": graph_id,
+                                "node_id": hit.get("node_id"),
+                                "labels": node.get("labels", []),
+                                "properties": props,
+                                "score": hit.get("score", 0.0),
+                            }
+                        )
                         if len(matches) >= input.limit:
                             break
                     continue
@@ -1129,19 +1120,23 @@ class ToolRegistry:
                         if input.language.lower() not in node_lang.lower():
                             continue
 
-                    searchable = " ".join([
-                        str(props.get("name", "")),
-                        str(props.get("qualname", "")),
-                        str(props.get("file_path", "")),
-                    ]).lower()
+                    searchable = " ".join(
+                        [
+                            str(props.get("name", "")),
+                            str(props.get("qualname", "")),
+                            str(props.get("file_path", "")),
+                        ]
+                    ).lower()
 
                     if pattern in searchable:
-                        matches.append({
-                            "graph_id": graph_id,
-                            "node_id": node_data.get("id"),
-                            "labels": node_data.get("labels", []),
-                            "properties": props,
-                        })
+                        matches.append(
+                            {
+                                "graph_id": graph_id,
+                                "node_id": node_data.get("id"),
+                                "labels": node_data.get("labels", []),
+                                "properties": props,
+                            }
+                        )
                         if len(matches) >= input.limit:
                             return SearchCodeOutput(
                                 matches=matches,
@@ -1236,9 +1231,7 @@ class ToolRegistry:
                 except Exception as exc:
                     logger.warning("GraphRetriever impact analysis failed: %s", exc)
 
-            return await GraphStoreFallbacks.impact_analysis(
-                self.graph_store, graph_id, symbol
-            )
+            return await GraphStoreFallbacks.impact_analysis(self.graph_store, graph_id, symbol)
 
         return ImpactAnalysisOutput(
             target_symbol=symbol,
@@ -1254,13 +1247,13 @@ class ToolRegistry:
         exists = await self._graph_exists(graph_id)
         if not exists:
             return DetectChangesOutput(
-                added=[], modified=[], deleted=[],
+                added=[],
+                modified=[],
+                deleted=[],
                 message="Repository has not been indexed yet",
             )
 
-        config = self.config.model_copy(
-            update={"repo_root": Path(repo_path), "graph_id": graph_id}
-        )
+        config = self.config.model_copy(update={"repo_root": Path(repo_path), "graph_id": graph_id})
         sync = IncrementalSync(self.graph_store, config)
 
         if input.since_ref:
@@ -1273,9 +1266,7 @@ class ToolRegistry:
                         "File discovery failed for %s adapter: %s", adapter.language, exc
                     )
 
-            report = await sync.get_changed_files_since_ref(
-                graph_id, all_files, input.since_ref
-            )
+            report = await sync.get_changed_files_since_ref(graph_id, all_files, input.since_ref)
             return DetectChangesOutput(
                 added=report.added,
                 modified=report.modified,
@@ -1461,8 +1452,7 @@ class ToolRegistry:
         )
         return DependencyMatrixOutput(
             nodes=[
-                {"id": n.id, "module": n.module, "production": n.production}
-                for n in matrix.nodes
+                {"id": n.id, "module": n.module, "production": n.production} for n in matrix.nodes
             ],
             edges=[
                 {
@@ -1615,11 +1605,13 @@ class ToolRegistry:
         for comm_id, members in communities_data.items():
             if community_id_filter is not None and comm_id != community_id_filter:
                 continue
-            communities.append({
-                "community_id": comm_id,
-                "member_count": len(members),
-                "members": members[:50],  # Limit for output size
-            })
+            communities.append(
+                {
+                    "community_id": comm_id,
+                    "member_count": len(members),
+                    "members": members[:50],  # Limit for output size
+                }
+            )
 
         return CommunitiesOutput(
             communities=communities,
@@ -1646,7 +1638,8 @@ class ToolRegistry:
 
         if graph_id is None:
             return InspectFileOutput(
-                nodes=[], edges=[],
+                nodes=[],
+                edges=[],
                 message=f"File {file_path} not found in any indexed graph",
             )
 
@@ -1677,9 +1670,7 @@ class ToolRegistry:
             message=f"Found {total_nodes} nodes and {total_edges} edges in {file_path}",
         )
 
-    async def handle_list_diagnostics(
-        self, input: ListDiagnosticsInput
-    ) -> ListDiagnosticsOutput:
+    async def handle_list_diagnostics(self, input: ListDiagnosticsInput) -> ListDiagnosticsOutput:
         """List diagnostics for a repository, with optional filters."""
         repo_path = str(Path(input.repo_path).resolve())
         graph_id = self._get_graph_id(repo_path)
@@ -1716,15 +1707,15 @@ class ToolRegistry:
             except Exception as exc:
                 logger.warning("Failed to list diagnostics: %s", exc)
 
-        # Prod/test is decided by the diagnostic's *organ* — the first segment of
-        # its repo-relative path — being in PERIPHERAL_ORGANS. Reuse that SSOT
-        # (and the analysis `_rel`) rather than inventing a second test-path rule.
+        # Prod/test is decided by `is_peripheral_path` — the SSOT that classifies
+        # BOTH top-level test/script organs AND co-located tests
+        # (server/routes/foo.test.ts, server/__tests__/x.ts). Reuse it (with the
+        # analysis `_rel`) so counts here agree with the matrix/deep-import rules.
         def _is_test(props: dict[str, Any]) -> bool:
             fp = props.get("file_path")
             if not fp:
                 return False
-            organ = _rel(fp, repo_path).split("/", 1)[0]
-            return organ in PERIPHERAL_ORGANS
+            return is_peripheral_path(_rel(fp, repo_path))
 
         # First pass: every diagnostic matching level/rule/file_path (and, when
         # requested, production_only). Counts roll up over this FULL match set so
@@ -1751,16 +1742,18 @@ class ToolRegistry:
                 by_rule[rule] = by_rule.get(rule, 0) + 1
             by_production["test" if is_test else "production"] += 1
 
-            matched.append({
-                "node_id": node_data.get("id"),
-                "labels": node_data.get("labels", []),
-                "level": props.get("level"),
-                "rule": rule,
-                "message": props.get("message"),
-                "file_path": props.get("file_path"),
-                "timestamp": props.get("timestamp"),
-                "properties": props,
-            })
+            matched.append(
+                {
+                    "node_id": node_data.get("id"),
+                    "labels": node_data.get("labels", []),
+                    "level": props.get("level"),
+                    "rule": rule,
+                    "message": props.get("message"),
+                    "file_path": props.get("file_path"),
+                    "timestamp": props.get("timestamp"),
+                    "properties": props,
+                }
+            )
 
         results = matched[: input.limit]
 
