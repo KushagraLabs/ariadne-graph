@@ -110,6 +110,13 @@ class GetArchitectureInput(BaseModel):
     repo_path: str = Field(description="Absolute or relative path to repository root")
 
 
+class ExplainEdgeInput(BaseModel):
+    """Input for code_graph_explain_edge tool."""
+
+    src_path: str = Field(description="Repo-relative path of the importing file")
+    dst_path: str = Field(description="Repo-relative path of the imported file")
+
+
 class ListCommunitiesInput(BaseModel):
     """Input for code_graph_list_communities tool."""
 
@@ -265,6 +272,22 @@ class ArchitectureOutput(BaseModel):
     """Output for code_graph_get_architecture tool."""
 
     summary: dict[str, Any] = Field(default_factory=dict, description="Architecture summary")
+    message: str = Field(default="", description="Human-readable status message")
+
+
+class ExplainEdgeOutput(BaseModel):
+    """Output for code_graph_explain_edge tool."""
+
+    src: str = Field(default="", description="Repo-relative path of the importing file")
+    dst: str = Field(default="", description="Repo-relative path of the imported file")
+    src_organ: str = Field(default="", description="Top-level organ of the source file")
+    dst_organ: str = Field(default="", description="Top-level organ of the target file")
+    allowed: bool = Field(default=True, description="Whether the edge is a layering violation")
+    reason: str = Field(default="", description="Classification: top_level, peripheral_source, same_organ, front_door, cross_organ_internal")
+    rule: str | None = Field(default=None, description="Violated rule name, or None when allowed")
+    front_door_would_fix: bool = Field(
+        default=False, description="Whether routing through the target organ's front door would make the edge valid"
+    )
     message: str = Field(default="", description="Human-readable status message")
 
 

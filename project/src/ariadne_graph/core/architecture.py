@@ -17,6 +17,7 @@ browser paint all consume these for free.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -98,6 +99,61 @@ def is_deep_import(src_dir: str, dst_dir: str) -> bool:
     if src_organ == dst_organ:
         return False
     return "/" in dst_dir
+
+
+@dataclass(frozen=True)
+class EdgeExplanation:
+    """Why a single file->file edge is or isn't a layering violation."""
+
+    src: str
+    dst: str
+    src_organ: str
+    dst_organ: str
+    allowed: bool
+    reason: str
+    rule: str | None
+    front_door_would_fix: bool
+
+
+def explain_edge(src_rel: str, dst_rel: str) -> EdgeExplanation:
+    """Classify a single file->file edge using the directory-heuristic rule.
+
+    Reuses :func:`is_deep_import` (the SSOT for the layering rule) plus
+    :func:`_dir_of`/:func:`_organ` so the classification is byte-identical to
+    what :func:`_deep_imports` would decide for the same edge.
+
+    ``reason`` is one of:
+      * ``top_level`` — source or target has no organ (root-level file).
+      * ``peripheral_source`` — source organ is a peripheral organ (tests, scripts).
+      * ``same_organ`` — source and target share a top-level organ.
+      * ``front_door`` — cross-organ, but the target dir IS the organ root.
+      * ``cross_organ_internal`` — cross-organ deep import: the violation.
+    """
+    src_dir, dst_dir = _dir_of(src_rel), _dir_of(dst_rel)
+    src_organ, dst_organ = _organ(src_dir), _organ(dst_dir)
+
+    if not src_organ or not dst_organ:
+        reason = "top_level"
+    elif src_organ in PERIPHERAL_ORGANS:
+        reason = "peripheral_source"
+    elif src_organ == dst_organ:
+        reason = "same_organ"
+    elif is_deep_import(src_dir, dst_dir):
+        reason = "cross_organ_internal"
+    else:
+        reason = "front_door"
+
+    allowed = reason != "cross_organ_internal"
+    return EdgeExplanation(
+        src=src_rel,
+        dst=dst_rel,
+        src_organ=src_organ,
+        dst_organ=dst_organ,
+        allowed=allowed,
+        reason=reason,
+        rule=None if allowed else "deep_import",
+        front_door_would_fix=reason == "cross_organ_internal",
+    )
 
 
 def analyze(
