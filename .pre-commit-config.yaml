@@ -1,0 +1,21 @@
+# Pre-commit configuration for ariadne-graph (code_hygiene_mcp).
+#
+# This repo PUBLISHES the shared codex-review-gate hook (see .pre-commit-hooks.yaml
+# and check_codex_review.py) and also consumes it to gate its own commits. The
+# hook is referenced from the repo's own remote by rev so it stays version-locked
+# like every other consumer. Commits touching source code (.py/.ts/.js) must carry
+# a fresh codex approval at <git-dir>/codex-approved on SHIP; docs/config-only
+# commits are exempt; bypass a trivial change with CODEX_REVIEW_OK=1 git commit.
+#
+# Hook install is DECOUPLED from beads (the gate must outlive any single tool):
+# pre-commit owns the standard .git/hooks, and beads re-integrates there via its
+# own marker-section installer — no custom core.hooksPath coupling:
+#   git config --unset-all core.hooksPath
+#   pre-commit install
+#   bd hooks install --chain      # re-adds beads' marker-section into .git/hooks
+repos:
+  - repo: https://github.com/KushagraLabs/ariadne-graph
+    rev: codex-gate-v1.0.0
+    hooks:
+      - id: codex-review-gate
+        args: [--code-suffixes=py,ts,tsx,js,jsx,mjs,cjs]

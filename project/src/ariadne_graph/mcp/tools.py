@@ -17,6 +17,7 @@ from ariadne_graph.core.architecture import (
     _DEP_EDGE_SQL,
     _FILE_SQL,
     PERIPHERAL_ORGANS,
+    _dir_of,
     _rel,
     explain_edge,
     persist_architecture_diagnostics,
@@ -179,6 +180,58 @@ def _module_name_candidates(rel_path: str) -> set[str]:
     return candidates
 
 
+# Extension/index spellings a bare TS/JS import specifier can resolve to, in the
+# order tsc/node try them: exact file with each extension, then a directory
+# barrel `index.<ext>`. Mirrors TsConfigResolver's own extension list.
+_TS_MODULE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".d.ts")
+
+
+def _resolve_ts_specifier(specifier: str, consumer_rel: str, files: set[str]) -> str | None:
+    """Resolve a raw TS/JS import specifier to a repo-relative file in *files*.
+
+    Unlike Python's dotted ``from X import Y``, a TS ``from_module`` is the
+    literal specifier string (``'./engine'``, ``'../core'``, ``'../core/x'``).
+    Relative specifiers are resolved against the importing file's directory and
+    matched against the graph's known files by trying, in order: the path as
+    written, the path with each source extension, and the path's ``index.<ext>``
+    barrel. Bare specifiers that don't land on a known repo file are external
+    (an npm package) and return ``None`` -- they are not consumers of this
+    repo's own public surface.
+
+    tsconfig ``paths``/``baseUrl`` aliases are already resolved at extraction
+    time (:class:`TsConfigResolver`, surfaced as the edge's ``resolved_source``);
+    this handles the relative/bare specifiers that resolver leaves untouched.
+    """
+    if not specifier.startswith("."):
+        # Bare specifier: only a consumer if it happens to name a repo file
+        # (rare, but honor an explicit in-repo bare path); otherwise external.
+        base = specifier
+    else:
+        consumer_dir = _dir_of(consumer_rel)
+        parts = consumer_dir.split("/") if consumer_dir else []
+        for segment in specifier.split("/"):
+            if segment in ("", "."):
+                continue
+            if segment == "..":
+                if parts:
+                    parts.pop()
+            else:
+                parts.append(segment)
+        base = "/".join(parts)
+
+    if base in files:
+        return base
+    for ext in _TS_MODULE_EXTS:
+        candidate = base + ext
+        if candidate in files:
+            return candidate
+    for ext in _TS_MODULE_EXTS:
+        candidate = f"{base}/index{ext}" if base else f"index{ext}"
+        if candidate in files:
+            return candidate
+    return None
+
+
 def _audit_public_surfaces(
     files: list[str],
     dep_edges: list[tuple[str, str]],
@@ -209,8 +262,13 @@ def _audit_public_surfaces(
     reports: list[dict[str, Any]] = []
 
     # module-name -> file path, built once over every file the graph knows about.
+    # Keyed by both the file's dotted Python module spellings AND its own
+    # repo-relative path, so an ``import_edges`` target may be either a dotted
+    # module (Python `from X import Y`) or an already-resolved file path (a TS
+    # specifier resolved by _resolve_ts_specifier at the handler edge).
     name_to_file: dict[str, str] = {}
     for f in all_files:
+        name_to_file[f] = f
         for name in _module_name_candidates(f):
             name_to_file[name] = f
 
@@ -1483,17 +1541,26 @@ class ToolRegistry:
             await db.close()
 
         files = [_rel(r["file_path"], repo_path) for r in file_rows]
+        file_set = set(files)
         dep_edges = [(_rel(r["sf"], repo_path), _rel(r["tf"], repo_path)) for r in dep_rows]
-        # (importing file, dotted from_module) -- the literal `from X import Y`
-        # module path, the ONLY signal that survives past symbol resolution to
-        # tell a via-surface import from a deep one (see _audit_public_surfaces
+        # (importing file, import target) -- the literal module path the consumer
+        # WROTE, the only signal that survives past symbol resolution to tell a
+        # via-surface import from a deep one (see _audit_public_surfaces
         # docstring: the resolved CALLS edge target is the symbol's *definition*
         # site regardless of which module path the caller imported through).
-        import_edges = [
-            (_rel(r["file_path"], repo_path), r["from_module"])
-            for r in import_rows
-            if r["from_module"]
-        ]
+        #
+        # Python `from_module` is already a dotted module the core matches
+        # directly. A TS `from_module` is a raw relative/bare specifier
+        # ('./x', '../core'); resolve it to a repo-relative file path here so
+        # the core sees a target it can match (bead code_hygiene_mcp-pzl).
+        import_edges: list[tuple[str, str]] = []
+        for r in import_rows:
+            if not r["from_module"]:
+                continue
+            consumer = _rel(r["file_path"], repo_path)
+            specifier = r["from_module"]
+            resolved = _resolve_ts_specifier(specifier, consumer, file_set)
+            import_edges.append((consumer, resolved if resolved is not None else specifier))
 
         modules = _audit_public_surfaces(
             files, dep_edges, import_edges, modules_with_surfaces, arch_config

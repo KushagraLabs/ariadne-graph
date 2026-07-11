@@ -37,6 +37,7 @@ from ariadne_graph.core.config import AnalyzerConfig
 from ariadne_graph.core.snippets import SnippetExtractor
 from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
 from ariadne_graph.languages.python_ast.adapter import PythonLanguageAdapter
+from ariadne_graph.languages.typescript.adapter import TypeScriptLanguageAdapter
 from ariadne_graph.mcp.schemas import AuditPublicSurfacesInput, IndexInput
 from ariadne_graph.mcp.tools import ToolRegistry
 
@@ -237,5 +238,114 @@ async def test_audit_requires_architecture_config(tmp_path: Path) -> None:
         assert result.modules == []
         assert "public_surfaces" in result.message.lower()
         assert "architecture.yml" in result.message.lower()
+    finally:
+        await store.close()
+
+
+# ---------------------------------------------------------------------------
+# TypeScript via-surface / deep-import split (bead code_hygiene_mcp-pzl)
+# ---------------------------------------------------------------------------
+#
+# HARD CASE the Python-shaped resolver gets wrong: TS `from_module` is a RAW
+# specifier ('./engine', '../core' , '../core/deep_helper'), not a dotted
+# module path, so `_module_name_candidates` never matches it and EVERY
+# import-edge consumer collapses to 'deep'. The via-surface consumer below
+# imports from the barrel `index.ts`; the deep consumer reaches straight into
+# an internal. They must be told apart.
+
+_TS_ARCH_YML = textwrap.dedent(
+    """\
+    version: 1
+    modules:
+      core:
+        paths: ["src/core/**"]
+        public_surfaces: ["src/core/index.ts"]
+      app:
+        paths: ["src/app/**"]
+        may_depend_on: ["core"]
+    """
+)
+
+
+def _write_ts_layered_repo(repo_root: Path) -> None:
+    (repo_root / ".ariadne").mkdir(parents=True)
+    (repo_root / ".ariadne" / "architecture.yml").write_text(_TS_ARCH_YML)
+
+    core = repo_root / "src" / "core"
+    core.mkdir(parents=True)
+    (core / "engine.ts").write_text(
+        "export function run(x: number): number {\n  return x + 1;\n}\n"
+    )
+    (core / "deep_helper.ts").write_text(
+        "export function helper(x: number): number {\n  return x - 1;\n}\n"
+    )
+    # index.ts is the declared public surface: a barrel that re-exports `run`
+    # only (NOT deep_helper) -- a real facade.
+    (core / "index.ts").write_text(
+        'export { run } from "./engine";\n'
+    )
+
+    app = repo_root / "src" / "app"
+    app.mkdir(parents=True)
+    # via_surface.ts imports THROUGH the barrel (specifier resolves to the
+    # directory's index.ts).
+    (app / "via_surface.ts").write_text(
+        'import { run } from "../core";\n'
+        "\n"
+        "export function go(): number {\n  return run(1);\n}\n"
+    )
+    # deep_consumer.ts bypasses the surface and imports the internal directly.
+    (app / "deep_consumer.ts").write_text(
+        'import { helper } from "../core/deep_helper";\n'
+        "\n"
+        "export function go2(): number {\n  return helper(1);\n}\n"
+    )
+
+
+def _make_ts_registry(store: SQLiteGraphStore, repo_root: Path) -> ToolRegistry:
+    config = AnalyzerConfig(repo_root=repo_root)
+    return ToolRegistry(
+        graph_store=store,
+        searchable_store=store,
+        adapters={"typescript": TypeScriptLanguageAdapter()},
+        config=config,
+        snippet_extractor=SnippetExtractor(repo_root=repo_root),
+        embedding_provider=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_audit_ts_distinguishes_via_surface_from_deep_import(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _write_ts_layered_repo(repo)
+    store = SQLiteGraphStore(str(tmp_path / "graph.db"))
+    registry = _make_ts_registry(store, repo)
+    try:
+        index = await registry.handle_index(IndexInput(repo_path=str(repo)))
+        assert index.status == "success"
+
+        result = await registry.handle_audit_public_surfaces(
+            AuditPublicSurfacesInput(repo_path=str(repo))
+        )
+
+        by_name = {m["module"]: m for m in result.modules}
+        assert "core" in by_name
+        core = by_name["core"]
+        assert core["public_exports"] == ["src/core/index.ts"]
+
+        via_surface_consumers = {
+            c["consumer"] for c in core["via_surface_consumers"]
+        }
+        deep_import_consumers = {
+            c["consumer"] for c in core["deep_import_consumers"]
+        }
+
+        # barrel import ("../core" -> src/core/index.ts) is via-surface.
+        assert "src/app/via_surface.ts" in via_surface_consumers
+        # deep import ("../core/deep_helper") is deep, and NOT via-surface.
+        assert "src/app/deep_consumer.ts" in deep_import_consumers
+        assert "src/app/deep_consumer.ts" not in via_surface_consumers
     finally:
         await store.close()

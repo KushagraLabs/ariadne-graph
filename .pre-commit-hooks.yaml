@@ -1,0 +1,18 @@
+# Published pre-commit hooks from this repo. Consumers reference by URL + rev:
+#
+#   - repo: https://github.com/KushagraLabs/ariadne-graph
+#     rev: codex-gate-v1.0.0
+#     hooks:
+#       - id: codex-review-gate
+#         args: [--code-suffixes=py,ts,tsx,js,jsx,mjs,cjs]   # match repo's languages
+#
+# See check_codex_review.py for the gate's contract (per-worktree marker,
+# CODEX_REVIEW_OK=1 bypass, docs-only exemption).
+- id: codex-review-gate
+  name: Codex review gate (fresh codex approval required for code)
+  description: Block commits touching source code unless the staged diff carries a fresh codex approval.
+  entry: check_codex_review.py
+  language: script
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit]
