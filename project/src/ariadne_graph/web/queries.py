@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from ariadne_graph.core.architecture import (
+    _DEP_EDGE_SQL,
     PERIPHERAL_ORGANS,
     is_deep_import,
 )
@@ -33,30 +34,10 @@ async def _rows(store: SQLiteGraphStore, sql: str, params: tuple[Any, ...]) -> l
         await db.close()  # releases the store lock; underlying conn stays open
 
 
-# SCIP-resolved cross-file dependency edges, per language:
-#   * TypeScript: the `REFERENCES` rel_type (every symbol occurrence that the
-#     SCIP translator resolves to its definition in another file).
-#   * Python: SCIP does not emit REFERENCES; it refines the target of `CALLS`
-#     edges in place, tagging the resolved ones ``resolved_by=scip-python``.
-#     Bare-name (unresolved) CALLS keep fuzzy targets, so they are excluded.
-# Both are real, definition-resolved file→file links; import-level edges are
-# deliberately NOT used (they would bypass SCIP resolution entirely).
-_XREF_SQL = """
-SELECT json_extract(sn.properties, '$.file_path') AS sf,
-       json_extract(tn.properties, '$.file_path') AS tf
-FROM edges e
-JOIN nodes sn ON sn.graph_id = e.graph_id AND sn.id = e.source
-JOIN nodes tn ON tn.graph_id = e.graph_id AND tn.id = e.target
-WHERE e.graph_id = ?
-  AND (
-        e.rel_type = 'REFERENCES'
-        OR (e.rel_type = 'CALLS'
-            AND json_extract(e.properties, '$.resolved_by') = 'scip-python')
-      )
-  AND json_extract(sn.properties, '$.file_path') IS NOT NULL
-  AND json_extract(tn.properties, '$.file_path') IS NOT NULL
-  AND json_extract(sn.properties, '$.file_path') != json_extract(tn.properties, '$.file_path')
-"""
+# SCIP-resolved cross-file dependency edges: shared with the core architecture
+# pass as ``_DEP_EDGE_SQL`` (core/architecture.py) — same query, same aliases
+# (``sf``/``tf``). See that module's docstring for the TypeScript/Python
+# resolution semantics.
 
 
 def _rel(file_path: str, repo_root: str) -> str:
@@ -103,7 +84,7 @@ async def full_graph(store: SQLiteGraphStore, graph_id: str, *, repo_root: str) 
     Two edge kinds:
       * ``tree`` — file→parent-dir and dir→parent-dir containment (the skeleton;
         the link force pulls each directory's files into a cluster around its hub).
-      * ``dep``  — the SCIP-resolved file→file references from ``_XREF_SQL``.
+      * ``dep``  — the SCIP-resolved file→file references from ``_DEP_EDGE_SQL``.
 
     Every file is kept (its tree edge is its reason to exist — a dependency-free
     file is still an "employee" of its directory), unlike the flat view which
@@ -190,7 +171,7 @@ async def full_graph(store: SQLiteGraphStore, graph_id: str, *, repo_root: str) 
             dir_id = "/".join(segments[: depth + 1])
             nodes[dir_id]["worst_level"] = _worse(nodes[dir_id]["worst_level"], diag["worst"])
 
-    xref = await _rows(store, _XREF_SQL, (graph_id,))
+    xref = await _rows(store, _DEP_EDGE_SQL, (graph_id,))
     weights: dict[tuple[str, str], int] = {}
     for r in xref:
         sf, tf = r["sf"], r["tf"]
