@@ -15,6 +15,7 @@ import xxhash
 from ariadne_graph.core.architecture import (
     PERIPHERAL_ORGANS,
     _rel,
+    explain_edge,
     persist_architecture_diagnostics,
 )
 from ariadne_graph.core.auto_sync import AutoSyncManager
@@ -44,6 +45,8 @@ from ariadne_graph.mcp.schemas import (
     DeleteProjectOutput,
     DetectChangesInput,
     DetectChangesOutput,
+    ExplainEdgeInput,
+    ExplainEdgeOutput,
     FindHotspotsInput,
     FindHotspotsOutput,
     GetArchitectureInput,
@@ -1135,6 +1138,24 @@ class ToolRegistry:
                 logger.warning("CommunityAnalyzer architecture summary failed: %s", exc)
 
         return await GraphStoreFallbacks.get_architecture(self.graph_store, graph_id)
+
+    async def handle_explain_edge(self, input: ExplainEdgeInput) -> ExplainEdgeOutput:
+        """Explain why a single file->file edge is or isn't a layering violation."""
+        explanation = explain_edge(input.src_path, input.dst_path)
+        return ExplainEdgeOutput(
+            src=explanation.src,
+            dst=explanation.dst,
+            src_organ=explanation.src_organ,
+            dst_organ=explanation.dst_organ,
+            allowed=explanation.allowed,
+            reason=explanation.reason,
+            rule=explanation.rule,
+            front_door_would_fix=explanation.front_door_would_fix,
+            message=(
+                f"{explanation.src} -> {explanation.dst}: {explanation.reason}"
+                + ("" if explanation.allowed else " (violation)")
+            ),
+        )
 
     async def handle_list_communities(self, input: ListCommunitiesInput) -> CommunitiesOutput:
         """List communities in the code graph."""

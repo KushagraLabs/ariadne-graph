@@ -17,8 +17,14 @@ browser paint all consume these for free.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ariadne_graph.core.architecture_config import (
+    ArchitectureConfig,
+    load_architecture_config,
+)
 from ariadne_graph.core.diagnostics import CodeDiagnostic
 from ariadne_graph.core.models import CodeEdge, CodeNode
 
@@ -95,9 +101,66 @@ def is_deep_import(src_dir: str, dst_dir: str) -> bool:
     return "/" in dst_dir
 
 
+@dataclass(frozen=True)
+class EdgeExplanation:
+    """Why a single file->file edge is or isn't a layering violation."""
+
+    src: str
+    dst: str
+    src_organ: str
+    dst_organ: str
+    allowed: bool
+    reason: str
+    rule: str | None
+    front_door_would_fix: bool
+
+
+def explain_edge(src_rel: str, dst_rel: str) -> EdgeExplanation:
+    """Classify a single file->file edge using the directory-heuristic rule.
+
+    Reuses :func:`is_deep_import` (the SSOT for the layering rule) plus
+    :func:`_dir_of`/:func:`_organ` so the classification is byte-identical to
+    what :func:`_deep_imports` would decide for the same edge.
+
+    ``reason`` is one of:
+      * ``top_level`` — source or target has no organ (root-level file).
+      * ``peripheral_source`` — source organ is a peripheral organ (tests, scripts).
+      * ``same_organ`` — source and target share a top-level organ.
+      * ``front_door`` — cross-organ, but the target dir IS the organ root.
+      * ``cross_organ_internal`` — cross-organ deep import: the violation.
+    """
+    src_dir, dst_dir = _dir_of(src_rel), _dir_of(dst_rel)
+    src_organ, dst_organ = _organ(src_dir), _organ(dst_dir)
+
+    if not src_organ or not dst_organ:
+        reason = "top_level"
+    elif src_organ in PERIPHERAL_ORGANS:
+        reason = "peripheral_source"
+    elif src_organ == dst_organ:
+        reason = "same_organ"
+    elif is_deep_import(src_dir, dst_dir):
+        reason = "cross_organ_internal"
+    else:
+        reason = "front_door"
+
+    allowed = reason != "cross_organ_internal"
+    return EdgeExplanation(
+        src=src_rel,
+        dst=dst_rel,
+        src_organ=src_organ,
+        dst_organ=dst_organ,
+        allowed=allowed,
+        reason=reason,
+        rule=None if allowed else "deep_import",
+        front_door_would_fix=reason == "cross_organ_internal",
+    )
+
+
 def analyze(
     files: list[str],
     dep_edges: list[tuple[str, str]],
+    *,
+    arch_config: ArchitectureConfig | None = None,
 ) -> list[CodeDiagnostic]:
     """Run every architecture rule and return the combined findings.
 
@@ -105,6 +168,13 @@ def analyze(
         files: Repo-relative paths of every ``CodeFile`` in the graph.
         dep_edges: Resolved file->file dependency edges as
             ``(source_rel, target_rel)`` repo-relative path pairs.
+        arch_config: Optional declared module map (from
+            ``.ariadne/architecture.yml``). When set, cross-module layering is
+            checked against the declared ``may_depend_on`` graph instead of the
+            directory-depth heuristic, and violations are emitted as
+            ``layer_violation`` rather than ``deep_import``. When None (the
+            default), behavior is identical to the directory-heuristic-only
+            analysis.
 
     Returns:
         One ``CodeDiagnostic`` per finding, ``node_id`` = the offending file's
@@ -113,7 +183,7 @@ def analyze(
     """
     diagnostics: list[CodeDiagnostic] = []
     diagnostics.extend(_dependency_cycles(files, dep_edges))
-    diagnostics.extend(_deep_imports(dep_edges))
+    diagnostics.extend(_deep_imports(dep_edges, arch_config))
     diagnostics.extend(_orphan_modules(files, dep_edges))
     diagnostics.extend(_upward_imports(dep_edges))
     return diagnostics
@@ -183,7 +253,10 @@ def _orphan_modules(
     return findings
 
 
-def _deep_imports(dep_edges: list[tuple[str, str]]) -> list[CodeDiagnostic]:
+def _deep_imports(
+    dep_edges: list[tuple[str, str]],
+    arch_config: ArchitectureConfig | None = None,
+) -> list[CodeDiagnostic]:
     """Flag imports that reach into a *different* organ's internals.
 
     Allowed: same-organ imports (any direction — the organ is the unit of
@@ -191,7 +264,16 @@ def _deep_imports(dep_edges: list[tuple[str, str]]) -> list[CodeDiagnostic]:
     dir IS an organ root). A VIOLATION is reaching one or more levels below
     another organ's root, e.g. ``src/x -> lib/deep/y``. Edges originating from a
     peripheral organ (tests, scripts) are exempt entirely.
+
+    When ``arch_config`` is provided, the declared module map (paths +
+    ``may_depend_on``) is the source of truth instead of the directory-depth
+    heuristic, and violations are emitted as ``layer_violation``. Edges whose
+    endpoints don't resolve to a declared module fall back to the directory
+    heuristic so undeclared parts of the repo keep working.
     """
+    if arch_config is not None:
+        return _layer_violations(dep_edges, arch_config)
+
     findings: list[CodeDiagnostic] = []
     for src, dst in dep_edges:
         src_dir, dst_dir = _dir_of(src), _dir_of(dst)
@@ -207,6 +289,54 @@ def _deep_imports(dep_edges: list[tuple[str, str]]) -> list[CodeDiagnostic]:
                 rule="deep_import",
                 properties={
                     "file_path": src, "from": src, "to": dst, "organ": _organ(dst_dir),
+                },
+            )
+        )
+    return findings
+
+
+def _layer_violations(
+    dep_edges: list[tuple[str, str]],
+    arch_config: ArchitectureConfig,
+) -> list[CodeDiagnostic]:
+    """Config-driven counterpart to the directory-heuristic deep-import check.
+
+    Edges whose source or target does not resolve to a declared module fall
+    back to the directory heuristic (undeclared parts of the repo are not left
+    unchecked just because a config file exists).
+    """
+    findings: list[CodeDiagnostic] = []
+    for src, dst in dep_edges:
+        src_dir, dst_dir = _dir_of(src), _dir_of(dst)
+        if _organ(src_dir) in PERIPHERAL_ORGANS:
+            continue  # edges from tests/scripts are exempt
+        src_mod = arch_config.module_of(src)
+        dst_mod = arch_config.module_of(dst)
+        if src_mod is None or dst_mod is None:
+            if is_deep_import(src_dir, dst_dir):
+                findings.append(
+                    CodeDiagnostic(
+                        node_id=src,
+                        level="warning",
+                        message=f"Deep import into '{_organ(dst_dir)}' internals: {src} -> {dst}",
+                        rule="deep_import",
+                        properties={
+                            "file_path": src, "from": src, "to": dst, "organ": _organ(dst_dir),
+                        },
+                    )
+                )
+            continue
+        if arch_config.allows(src_mod, dst_mod):
+            continue
+        findings.append(
+            CodeDiagnostic(
+                node_id=src,
+                level="warning",
+                message=f"Layer violation: '{src_mod}' -> '{dst_mod}' is not declared in may_depend_on: {src} -> {dst}",
+                rule="layer_violation",
+                properties={
+                    "file_path": src, "from": src, "to": dst,
+                    "from_module": src_mod, "to_module": dst_mod,
                 },
             )
         )
@@ -329,7 +459,10 @@ WHERE graph_id = ? AND labels LIKE '%"CodeFile"%'
 
 # rules whose findings this pass owns — cleared before each re-run so re-indexing
 # replaces rather than appends.
-_ARCH_RULES = ("dependency_cycle", "deep_import", "orphan_module", "upward_import")
+_ARCH_RULES = (
+    "dependency_cycle", "deep_import", "orphan_module", "upward_import",
+    "layer_violation",
+)
 
 
 async def persist_architecture_diagnostics(
@@ -370,7 +503,8 @@ async def persist_architecture_diagnostics(
         (_rel(r["sf"], repo_root), _rel(r["tf"], repo_root)) for r in dep_rows
     ]
 
-    findings = analyze(files, dep_edges)
+    arch_config = load_architecture_config(Path(repo_root))
+    findings = analyze(files, dep_edges, arch_config=arch_config)
 
     # Clear this pass's prior findings (idempotent re-index).
     await _delete_arch_diagnostics(store, graph_id)

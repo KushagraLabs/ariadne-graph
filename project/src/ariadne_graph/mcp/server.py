@@ -28,6 +28,7 @@ from ariadne_graph.mcp.schemas import (
     CapabilitiesInput,
     DeleteProjectInput,
     DetectChangesInput,
+    ExplainEdgeInput,
     FindHotspotsInput,
     GetArchitectureInput,
     ImpactAnalysisInput,
@@ -368,6 +369,23 @@ async def code_graph_get_architecture(repo_path: str) -> dict[str, Any]:
     registry = _get_registry()
     input_data = GetArchitectureInput(repo_path=repo_path)
     result = await registry.handle_get_architecture(input_data)
+    return result.model_dump()
+
+
+@mcp.tool()
+async def code_graph_explain_edge(src_path: str, dst_path: str) -> dict[str, Any]:
+    """Explain why a single file->file edge is or isn't a layering violation.
+
+    Args:
+        src_path: Repo-relative path of the importing file.
+        dst_path: Repo-relative path of the imported file.
+
+    Returns:
+        Dict with allowed, reason, rule, and whether a front-door import would fix it.
+    """
+    registry = _get_registry()
+    input_data = ExplainEdgeInput(src_path=src_path, dst_path=dst_path)
+    result = await registry.handle_explain_edge(input_data)
     return result.model_dump()
 
 
