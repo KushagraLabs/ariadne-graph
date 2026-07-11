@@ -1125,7 +1125,9 @@ class ToolRegistry:
 
         if self.community_analyzer is not None:
             try:
-                summary_obj = await self.community_analyzer.get_architecture_summary(graph_id)
+                summary_obj = await self.community_analyzer.get_architecture_summary(
+                    graph_id, granularity=input.granularity
+                )
                 return ArchitectureOutput(
                     summary=summary_obj.model_dump(),
                     message=(
@@ -1179,7 +1181,9 @@ class ToolRegistry:
         # On-demand detection if none stored and analyzer is available
         if not communities_data and self.community_analyzer is not None:
             try:
-                assignments = await self.community_analyzer.detect_communities(graph_id)
+                assignments = await self.community_analyzer.detect_communities(
+                    graph_id, granularity=input.granularity
+                )
                 communities_data = {}
                 for node_id, comm_id in assignments.items():
                     communities_data.setdefault(comm_id, []).append(node_id)
