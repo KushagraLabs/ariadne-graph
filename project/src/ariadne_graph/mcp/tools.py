@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import xxhash
 
+from ariadne_graph.core.architecture import persist_architecture_diagnostics
 from ariadne_graph.core.auto_sync import AutoSyncManager
 
 if TYPE_CHECKING:
@@ -27,6 +28,7 @@ from ariadne_graph.core.retrieval import GraphRetriever
 from ariadne_graph.core.search import HybridSearcher
 from ariadne_graph.core.snippets import SnippetExtractor
 from ariadne_graph.graphstores.base import GraphStore, SearchableGraphStore
+from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
 from ariadne_graph.languages.base import LanguageAdapter
 from ariadne_graph.mcp.fallbacks import GraphStoreFallbacks
 from ariadne_graph.mcp.schemas import (
@@ -345,6 +347,19 @@ class ToolRegistry:
                 changed_files.update(report.modified)
             except Exception as exc:
                 errors.append(f"{lang_name} sync failed: {exc}")
+
+        # Whole-graph architecture analysis — runs once, after every adapter has
+        # synced and SCIP has resolved dep edges. Persists cycle/deep-import/
+        # orphan/upward-import findings as CodeDiagnostic nodes. Requires the
+        # SQLite store (the dep-edge join is SQL); other stores skip it.
+        if isinstance(self.graph_store, SQLiteGraphStore):
+            try:
+                written = await persist_architecture_diagnostics(
+                    self.graph_store, graph_id, repo_path
+                )
+                logger.info("Architecture analysis wrote %d findings", written)
+            except Exception as exc:
+                logger.warning("Architecture analysis failed: %s", exc)
 
         # Also compute embeddings for changed files if a provider is available
         if self.embedding_service is not None and self.searchable_store is not None and changed_files:
