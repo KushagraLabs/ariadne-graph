@@ -49,6 +49,12 @@ def repo(tmp_path: Path) -> Path:
     (root / "_tmp").mkdir()
     (root / "_tmp" / "scratch.py").write_text("pass\n")
 
+    # Archived/legacy code: kept in-tree for reference but not part of the live
+    # codebase — must not be indexed (it duplicates real modules and inflates
+    # the graph, as seen in cosmic_lens/archive).
+    (root / "archive" / "old").mkdir(parents=True)
+    (root / "archive" / "old" / "legacy.py").write_text("pass\n")
+
     (root / "README.md").write_text("# readme\n")
     return root
 
@@ -117,6 +123,7 @@ def test_ignores_throwaway_worktree_and_agent_dirs(repo: Path) -> None:
     assert "worktrees/wt-1/copy.py" not in paths
     assert ".gc/system/hook.py" not in paths
     assert "_tmp/scratch.py" not in paths
+    assert "archive/old/legacy.py" not in paths
     # core files still discovered
     assert "src/main.py" in paths
 
