@@ -33,3 +33,9 @@ htmlcov/
 
 # Git worktrees (isolated feature workspaces — must never be indexed or committed)
 .worktrees/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/

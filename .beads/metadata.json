@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "code_hygiene_mcp",
+  "project_id": "9e964c97-b5e7-48a6-8a9d-9452e173db5d"
+}
