@@ -300,8 +300,9 @@ def _strongly_connected_components(
     return components
 
 
-# File->file dependency edges, definition-resolved. Same semantics as the web
-# layer's _XREF_SQL: TypeScript REFERENCES + SCIP-resolved Python CALLS only.
+# File->file dependency edges, definition-resolved: TypeScript REFERENCES +
+# SCIP-resolved Python CALLS only. Shared SSOT — the web layer's
+# full_graph() (web/queries.py) imports this same query for its dep edges.
 _DEP_EDGE_SQL = """
 SELECT json_extract(sn.properties, '$.file_path') AS sf,
        json_extract(tn.properties, '$.file_path') AS tf
