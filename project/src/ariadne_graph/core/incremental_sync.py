@@ -439,8 +439,11 @@ class IncrementalSync:
         if graph_id is None:
             raise ValueError("AnalyzerConfig.graph_id must be set before syncing")
 
-        # 1. Discover all source files
-        all_files = adapter.discover_files(repo_root, cfg)
+        # 1. Discover all source files. This is a synchronous, potentially slow
+        # filesystem walk (scandir over the whole repo tree) — offload it to a
+        # worker thread so the daemon's event loop stays free to serve HTTP
+        # (/graph, /api/graph/*) while a large repo is being (re)discovered.
+        all_files = await asyncio.to_thread(adapter.discover_files, repo_root, cfg)
         logger.info(
             "Discovered %d %s files in %s",
             len(all_files),

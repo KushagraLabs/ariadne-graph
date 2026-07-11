@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import logging
@@ -319,7 +320,12 @@ class ToolRegistry:
         all_current_files: list[Path] = []
         for adapter in self.adapters.values():
             try:
-                all_current_files.extend(adapter.discover_files(Path(repo_path), config))
+                # Offload the synchronous filesystem walk so the daemon event
+                # loop keeps serving HTTP during discovery on large repos.
+                found = await asyncio.to_thread(
+                    adapter.discover_files, Path(repo_path), config
+                )
+                all_current_files.extend(found)
             except Exception as exc:
                 logger.warning("File discovery failed: %s", exc)
 

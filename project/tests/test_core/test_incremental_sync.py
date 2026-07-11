@@ -197,3 +197,53 @@ async def test_detect_changes_renamed_file(tmp_path: Path) -> None:
     assert report.comparison_mode == "git_ref"
     assert str(new_file.resolve()) in report.added
     assert str(old_file.resolve()) in report.deleted
+
+
+async def test_full_sync_discovery_does_not_block_event_loop(tmp_path: Path) -> None:
+    """A slow synchronous discover_files must not stall the event loop.
+
+    Hard case (root cause of the daemon HTTP hang): file discovery runs on the
+    event loop thread. If it blocks (a large repo's scandir walk), the daemon
+    can't serve /graph. This test gives an adapter whose discover_files sleeps
+    synchronously for 300ms and asserts a concurrent heartbeat keeps ticking
+    during the sync — only possible if discovery is offloaded to a thread.
+    """
+    import asyncio
+    import time
+
+    from ariadne_graph.core.models import CodeGraphDelta
+
+    class SlowAdapter:
+        language = "slow"
+        parser_version = "test"
+        extensions = (".slow",)
+
+        def discover_files(self, root: Path, config: AnalyzerConfig) -> list[Path]:
+            time.sleep(0.3)  # synchronous, blocks its own thread only if offloaded
+            return []
+
+        def extract_file(self, path: Path, context) -> CodeGraphDelta:  # pragma: no cover
+            return CodeGraphDelta(nodes=[], edges=[], content_hash="")
+
+        async def prepare_project(self, *args, **kwargs) -> None:
+            return None
+
+    config = AnalyzerConfig(repo_root=tmp_path)
+    store = MemoryGraphStore()
+    sync = IncrementalSync(store, config)
+
+    ticks = 0
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.02)
+
+    hb = asyncio.create_task(heartbeat())
+    await sync.full_sync(SlowAdapter(), config)  # ~300ms in discover_files
+    hb.cancel()
+
+    # If discovery blocked the loop, the heartbeat couldn't run during the 300ms
+    # sleep (0 ticks). Offloaded to a thread → many ~20ms ticks fit in 300ms.
+    assert ticks >= 5, f"event loop was blocked during discovery (only {ticks} ticks)"

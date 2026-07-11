@@ -342,7 +342,12 @@ async def _handle_mcp(args: argparse.Namespace) -> int:
     runner directly instead of spawning a nested event loop.
     """
     initialise_registry()
-    await _run_server_async(transport=args.transport, mount_path=None)
+    await _run_server_async(
+        transport=args.transport,
+        mount_path=None,
+        host=args.host,
+        port=args.port,
+    )
     return 0
 
 
@@ -552,6 +557,17 @@ examples:
         default="stdio",
         choices=["stdio", "sse", "streamable-http"],
         help="Transport protocol (default: stdio)",
+    )
+    mcp_parser.add_argument(
+        "--host",
+        default=None,
+        help="Bind host for HTTP transports (default: 127.0.0.1)",
+    )
+    mcp_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port for HTTP transports (default: 8000)",
     )
 
     # --- watch ---
