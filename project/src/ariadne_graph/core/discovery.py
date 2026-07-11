@@ -15,16 +15,21 @@ class FileDiscovery:
         self.config = config
 
     def _should_ignore(self, path: Path) -> bool:
-        """Check if a path matches any ignore pattern."""
-        path_str = str(path)
+        """Check if a path matches any ignore pattern.
+
+        Non-glob patterns match whole path *components* (directory or file
+        names), not arbitrary substrings — so ``_tmp`` ignores a ``_tmp/`` dir
+        but not ``my_tmp_helper.py``, and ``external`` ignores ``external/`` but
+        not ``external_api.py``. Glob patterns (``*.pyc``) match the file name.
+        """
+        parts = path.parts
         name = path.name
         for pattern in self.config.ignore_patterns:
             if pattern.startswith("*"):
                 if fnmatch.fnmatch(name, pattern):
                     return True
-            else:
-                if pattern in path_str or fnmatch.fnmatch(name, pattern):
-                    return True
+            elif pattern in parts or fnmatch.fnmatch(name, pattern):
+                return True
         return False
 
     def discover(

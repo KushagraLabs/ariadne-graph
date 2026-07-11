@@ -1,0 +1,343 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Ariadne — dependency graph</title>
+<style>
+  :root {
+    --bg: #0b0c10; --panel: #12141a; --ink: #e6e8ee; --dim: #8a90a0; --line: #232733;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font: 13px/1.4 -apple-system, system-ui, sans-serif; overflow: hidden; }
+  #top { position: fixed; inset: 0 0 auto 0; height: 46px; display: flex; align-items: center;
+    gap: 16px; padding: 0 16px; background: rgba(11,12,16,.85); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line); z-index: 5; }
+  #top b { letter-spacing: .3px; }
+  #top select { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 7px; padding: 5px 8px; font: inherit; }
+  #top .stat { color: var(--dim); font-variant-numeric: tabular-nums; }
+  #crumbs { display: flex; align-items: center; gap: 4px; font-size: 12px; }
+  #crumbs a { color: var(--ink); cursor: pointer; text-decoration: none; padding: 2px 6px;
+    border-radius: 6px; background: var(--panel); border: 1px solid var(--line); }
+  #crumbs a:hover { border-color: #3a4152; background: #1a1d26; }
+  #crumbs .sep { color: var(--dim); }
+  #crumbs .cur { color: var(--dim); }
+  #graph { position: fixed; inset: 46px 0 0 0; }
+  .label { fill: var(--dim); font-size: 9px; pointer-events: none;
+    paint-order: stroke; stroke: var(--bg); stroke-width: 2.5px; }
+  .label.dir { fill: var(--ink); font-size: 11px; font-weight: 600; }
+  #legend { position: fixed; right: 14px; top: 60px; width: 210px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; z-index: 5; }
+  #legend h4 { margin: 0 0 8px; font-size: 11px; letter-spacing: .8px; color: var(--dim); text-transform: uppercase; }
+  #legend .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  #legend .sw { width: 11px; height: 11px; border-radius: 50%; }
+  #legend .ring { width: 11px; height: 11px; border-radius: 50%; background: transparent; }
+  #legend .dot { display: inline-block; }
+  #tip { position: fixed; pointer-events: none; background: #000; border: 1px solid var(--line);
+    padding: 6px 9px; border-radius: 7px; font-size: 12px; opacity: 0; transition: opacity .1s; z-index: 9; max-width: 340px; }
+  #tip .n { color: var(--ink); font-weight: 600; } #tip .p { color: var(--dim); font-size: 11px; }
+  #msg { position: fixed; inset: 46px 0 0 0; display: flex; align-items: center; justify-content: center;
+    color: var(--dim); z-index: 4; }
+  .node circle { cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="top">
+  <b>Ariadne</b>
+  <select id="repo"></select>
+  <span id="crumbs"></span>
+  <span class="stat" id="counts"></span>
+  <span class="stat">click a directory to drill in · hover to trace · scroll to zoom · drag to pin</span>
+</div>
+<div id="legend">
+  <h4>Module (color)</h4>
+  <div id="mods"></div>
+  <h4 style="margin-top:12px">Hygiene (ring)</h4>
+  <div class="row"><span class="ring" style="border:2px solid #ef4444"></span> error</div>
+  <div class="row"><span class="ring" style="border:2px solid #f5a623"></span> warning</div>
+  <div class="row"><span class="ring" style="border:2px solid #4a90e2"></span> info</div>
+  <div class="row"><span class="ring" style="border:2px solid #3ecf8e"></span> clean</div>
+  <h4 style="margin-top:12px">Imports (→ points at the imported file)</h4>
+  <div class="row"><span class="dot" style="width:16px;height:0;border-top:2px solid #4a5a34"></span> allowed</div>
+  <div class="row"><span class="dot" style="width:16px;height:0;border-top:2px solid #f7768e"></span> layering violation</div>
+  <div style="margin-top:6px;color:var(--dim);font-size:11px;line-height:1.35">
+    Red = importing into another organ's internals. Same-organ or another organ's
+    top-level entry is fine.
+  </div>
+</div>
+<svg id="graph"></svg>
+<div id="msg">loading…</div>
+<script src="/graph/d3.min.js"></script>
+<script>
+const HYGIENE = { error:"#ef4444", warning:"#f5a623", info:"#4a90e2", null:"#3ecf8e" };
+// Distinct hues per top-level module — the "which organ" color channel.
+const PALETTE = ["#7c9cff","#f78fb3","#63d2b1","#f6c453","#c78fff","#5ad1e6","#ff9f6e",
+                 "#9fd356","#e57373","#b0bec5","#ba8fff","#4dd0e1","#ffb74d","#81c784"];
+
+const svg = d3.select("#graph"), tip = d3.select("#tip"), msg = d3.select("#msg");
+let sim = null;
+let FULL = null;      // the whole-graph payload (nodes + edges), unfiltered
+let SCOPE = null;     // current drill root: a dir id (rel-path), or null = full graph
+
+async function j(url) { const r = await fetch(url); if (!r.ok) throw new Error(await r.text()); return r.json(); }
+
+// True if a repo-relative path `p` is inside the scope subtree (or scope is root).
+function inScope(p, scope) {
+  return scope === null || p === scope || p.startsWith(scope + "/");
+}
+
+// Filter the full graph to the current SCOPE subtree. Dep edges that cross the
+// boundary are redirected to a synthetic "external" stub node (one per outside
+// top-level organ) so coupling — and violations — to the rest stay visible.
+function subtree(full, scope) {
+  const nodes = full.nodes.filter(n =>
+    n.kind === "dir" ? inScope(n.id, scope) : inScope(n.dir, scope));
+  const kept = new Set(nodes.map(n => n.id));
+  const stubs = new Map();   // organ -> stub node
+  const edges = [];
+  // Emit FRESH edge objects with string endpoints — a prior forceLink pass may
+  // have mutated full.edges' source/target into (now-stale) node object refs.
+  for (const e of full.edges) {
+    const s = idOf(e.source), t = idOf(e.target);
+    if (e.kind === "tree") {
+      if (kept.has(s) && kept.has(t)) edges.push({ source: s, target: t, kind: "tree" });
+      continue;
+    }
+    const sIn = kept.has(s), tIn = kept.has(t);
+    if (sIn && tIn) {
+      edges.push({ source: s, target: t, weight: e.weight, kind: "dep", violation: e.violation });
+      continue;
+    }
+    if (!sIn && !tIn) continue;                 // wholly outside the subtree
+    // One endpoint outside: redirect it to an external stub for its organ.
+    const outsideNode = FILE_BY_ID.get(sIn ? t : s);
+    const organ = outsideNode ? outsideNode.module : "external";
+    const stubId = "→ " + organ;
+    if (!stubs.has(stubId))
+      stubs.set(stubId, { id: stubId, kind: "stub", name: stubId, module: organ, worst_level: null });
+    edges.push({ source: sIn ? s : stubId, target: sIn ? stubId : t,
+                 weight: e.weight, kind: "dep", violation: e.violation });
+  }
+  return { nodes: nodes.concat([...stubs.values()]), edges };
+}
+
+const idOf = n => typeof n === "object" ? n.id : n;
+let FILE_BY_ID = new Map();
+
+function drillTo(scope) { SCOPE = scope; renderScope(); }
+
+function renderCrumbs() {
+  const c = d3.select("#crumbs"); c.html("");
+  const segs = SCOPE ? SCOPE.split("/") : [];
+  const mk = (label, scope) => c.append("a").text(label).on("click", () => drillTo(scope));
+  mk("root", null);
+  let acc = "";
+  segs.forEach((seg, i) => {
+    acc = acc ? acc + "/" + seg : seg;
+    c.append("span").attr("class", "sep").text("›");
+    if (i === segs.length - 1) c.append("span").attr("class", "cur").text(seg);
+    else { const s = acc; mk(seg, s); }
+  });
+}
+
+function renderScope() {
+  renderCrumbs();
+  render(subtree(FULL, SCOPE));
+}
+
+function render(data) {
+  if (sim) sim.stop();
+  svg.selectAll("*").remove();
+  const W = window.innerWidth, H = window.innerHeight - 46;
+  svg.attr("viewBox", [0,0,W,H]);
+
+  const mods = [...new Set(data.nodes.filter(n => n.kind !== "stub").map(n => n.module))].sort();
+  const color = d3.scaleOrdinal().domain(mods).range(PALETTE);
+  d3.select("#mods").selectAll("div").data(mods).join("div").attr("class","row")
+    .html(m => `<span class="sw" style="background:${color(m)}"></span>${m}`);
+  const nFiles = data.nodes.filter(n => n.kind === "file").length;
+  const nDirs = data.nodes.filter(n => n.kind === "dir").length;
+  const nDeps = data.edges.filter(e => e.kind === "dep").length;
+  d3.select("#counts").text(`${nFiles} files · ${nDirs} dirs · ${nDeps} deps · ${mods.length} modules`);
+
+  // TOTAL subtree size per dir (all nested files + sub-dirs), not just direct
+  // children — a parent must never render smaller than a child it contains. Dir
+  // ids and file `dir`s are path prefixes, so a node is inside dir D iff its path
+  // equals D or starts with "D/". kids[] also feeds the hover tooltip.
+  const kids = new Map(data.nodes.filter(n => n.kind === "dir").map(n => [n.id, 0]));
+  const add = id => kids.set(id, kids.get(id) + 1);
+  data.nodes.forEach(n => {
+    for (const [id] of kids) {
+      // A FILE counts toward its own dir + every ancestor; a DIR toward each
+      // STRICT ancestor (not itself). Both use path-prefix containment.
+      if (n.kind === "file" ? (n.dir === id || n.dir.startsWith(id + "/")) : n.id.startsWith(id + "/"))
+        add(id);
+    }
+  });
+  const R = d => d.kind === "dir" ? 5 + Math.sqrt(kids.get(d.id)||0) * 1.7 : 3.5;
+
+  // Neighbor index (over BOTH edge kinds) for hover-trace.
+  const nbr = new Map(data.nodes.map(n => [n.id, new Set()]));
+  data.edges.forEach(e => { nbr.get(e.source)?.add(e.target); nbr.get(e.target)?.add(e.source); });
+
+  const g = svg.append("g");
+  svg.call(d3.zoom().scaleExtent([0.05, 6]).on("zoom", ev => g.attr("transform", ev.transform)));
+
+  // Tree edges are the rigid skeleton (short, strong) so files orbit their dir hub;
+  // dep edges are a soft overlay (longer, weak) that only nudges cross-file coupling.
+  sim = d3.forceSimulation(data.nodes)
+    .force("link", d3.forceLink(data.edges).id(d => d.id)
+      .distance(e => e.kind === "tree" ? 22 : 60)
+      .strength(e => e.kind === "tree" ? 0.7 : 0.05))
+    .force("charge", d3.forceManyBody().strength(d => d.kind === "dir" ? -220 : -30).distanceMax(500))
+    .force("center", d3.forceCenter(W/2, H/2))
+    .force("x", d3.forceX(W/2).strength(0.05))
+    .force("y", d3.forceY(H/2).strength(0.05))
+    .force("collide", d3.forceCollide(d => R(d) + 2))
+    // Cool to a hard stop so the layout settles and hover-targeting is stable
+    // (a warm sim drifts nodes out from under the cursor).
+    .alphaDecay(0.035).alphaMin(0.004);
+
+  // Arrowhead markers so dep edges show import DIRECTION (source -> target).
+  // One per color state (ok / violation / highlighted) since a marker's fill is fixed.
+  const defs = svg.append("defs");
+  const arrow = (id, fill) => defs.append("marker")
+    .attr("id", id).attr("viewBox", "0 -3 6 6").attr("refX", 6).attr("refY", 0)
+    .attr("markerWidth", 5).attr("markerHeight", 5).attr("orient", "auto")
+    .append("path").attr("d", "M0,-3L6,0L0,3").attr("fill", fill);
+  arrow("arr-ok", "#6b7a52"); arrow("arr-vio", "#f7768e"); arrow("arr-hi", "#f5a623");
+
+  const DEP_OK = "#4a5a34", DEP_VIO = "#f7768e";   // olive = allowed, red = layering violation
+  // Draw dep edges first (under), tree edges over them.
+  const dep = g.append("g").selectAll("line")
+    .data(data.edges.filter(e => e.kind === "dep")).join("line")
+    .attr("stroke", e => e.violation ? DEP_VIO : DEP_OK)
+    .attr("stroke-width", e => e.violation ? 0.9 : 0.5)
+    .attr("stroke-opacity", e => e.violation ? 0.75 : 0.4)
+    .attr("marker-end", e => e.violation ? "url(#arr-vio)" : "url(#arr-ok)");
+  const tree = g.append("g").selectAll("line")
+    .data(data.edges.filter(e => e.kind === "tree")).join("line")
+    .attr("stroke", "#2f3546").attr("stroke-width", 0.8);
+
+  const node = g.append("g").selectAll("g.node").data(data.nodes).join("g").attr("class","node");
+  node.append("circle")
+    .attr("r", R)
+    // Dir hubs read as containers (darkened module hue + bright hygiene ring);
+    // stubs are hollow grey markers for "the outside world".
+    .attr("fill", d => d.kind === "stub" ? "none"
+                     : d.kind === "dir" ? d3.rgb(color(d.module)).darker(1.1) : color(d.module))
+    .attr("stroke", d => d.kind === "stub" ? "#6b7280" : HYGIENE[d.worst_level])
+    .attr("stroke-width", d => d.kind === "dir" ? 2.2 : d.kind === "stub" ? 1.4 : 1.4)
+    .attr("stroke-dasharray", d => d.kind === "stub" ? "2,2" : null)
+    .attr("fill-opacity", d => d.kind === "dir" ? 0.85 : 1)
+    // A dir hub is drillable — cursor + click filters to its subtree.
+    .style("cursor", d => d.kind === "dir" ? "pointer" : "default");
+
+  // Directory hubs (except the current scope root itself) drill into their subtree.
+  node.filter(d => d.kind === "dir" && d.id !== SCOPE)
+    .on("click", (ev, d) => { ev.stopPropagation(); drillTo(d.id); });
+
+  // Standing labels for dirs + stubs only; file names appear on hover (consistent
+  // across scopes — a drilled subtree must not switch file labels on).
+  const labelData = data.nodes.filter(d => d.kind !== "file");
+  const label = g.append("g").selectAll("text").data(labelData)
+    .join("text").attr("class","label")
+    .classed("dir", d => d.kind === "dir").text(d => d.name);
+
+  node.filter(d => d.kind !== "stub").call(d3.drag()
+    .on("start", (ev,d) => { if(!ev.active) sim.alphaTarget(.3).restart(); d.fx=d.x; d.fy=d.y; })
+    .on("drag", (ev,d) => { d.fx=ev.x; d.fy=ev.y; })
+    .on("end", (ev,d) => { if(!ev.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }));
+
+  const touches = (e, id) => e.source.id === id || e.target.id === id;
+  // On-demand labels for the hovered node + its neighbors (so a file's name shows
+  // on hover even in big graphs where standing file labels are suppressed).
+  let hoverLabel = g.append("g").selectAll("text");
+
+  // Hover-to-trace: dim all but the node, its direct neighbors, and connecting edges.
+  // Directional: an edge is OUTGOING (this file imports it) vs INCOMING (imported by).
+  node.on("mouseenter", (ev,d) => {
+    const keep = new Set(nbr.get(d.id)); keep.add(d.id);
+    node.style("opacity", n => keep.has(n.id) ? 1 : 0.07);
+    tree.style("stroke", e => touches(e,d.id) ? "#f5a623" : "#2f3546")
+        .style("stroke-opacity", e => touches(e,d.id) ? 0.95 : 0.05);
+    dep.style("stroke", e => touches(e,d.id) ? (e.violation ? DEP_VIO : "#f5a623")
+                                             : (e.violation ? DEP_VIO : DEP_OK))
+       .style("stroke-opacity", e => touches(e,d.id) ? 0.95 : 0.04)
+       .attr("marker-end", e => !touches(e,d.id) ? (e.violation ? "url(#arr-vio)" : "url(#arr-ok)")
+                                : (e.violation ? "url(#arr-vio)" : "url(#arr-hi)"));
+    label.style("opacity", n => keep.has(n.id) ? 1 : 0.05);
+
+    // Reveal FILE names on top — but only when hovering a file (so its name and
+    // the files it wires to are readable). Hovering a dir must NOT dump every
+    // child file's name; its standing dir label is enough.
+    const named = d.kind === "file"
+      ? data.nodes.filter(n => keep.has(n.id) && n.kind === "file")
+      : [];
+    hoverLabel = hoverLabel.data(named, n => n.id).join("text")
+      .attr("class", "label")
+      .style("opacity", 1).text(n => n.name)
+      .attr("x", n => n.x + 6).attr("y", n => n.y + 3);
+
+    const out = data.edges.filter(e => e.kind==="dep" && idOf(e.source)===d.id).length;
+    const inc = data.edges.filter(e => e.kind==="dep" && idOf(e.target)===d.id).length;
+    const kind = d.kind === "dir" ? `dir · ${kids.get(d.id)||0} items in subtree`
+      : `${d.module} · imports ${out} · imported by ${inc}`;
+    tip.style("opacity",1).html(`<div class="n">${d.name}</div>`+
+      `<div class="p">${kind} · ${d.worst_level||"clean"}</div>`);
+  }).on("mousemove", ev => tip.style("left",(ev.clientX+14)+"px").style("top",(ev.clientY+14)+"px"))
+    .on("mouseleave", () => {
+      node.style("opacity",1); label.style("opacity",1);
+      tree.style("stroke","#2f3546").style("stroke-opacity",1);
+      dep.style("stroke", e => e.violation ? DEP_VIO : DEP_OK)
+         .style("stroke-opacity", e => e.violation ? 0.75 : 0.4)
+         .attr("marker-end", e => e.violation ? "url(#arr-vio)" : "url(#arr-ok)");
+      hoverLabel = hoverLabel.data([], n => n.id).join("text");   // clear
+      tip.style("opacity",0);
+    });
+
+  // Stop a dep line just short of the target circle so its arrowhead is visible.
+  const shorten = (e, axis) => {
+    const dx = e.target.x - e.source.x, dy = e.target.y - e.source.y;
+    const len = Math.hypot(dx, dy) || 1, back = R(e.target) + 3;
+    const t = Math.max(0, (len - back) / len);
+    return axis === "x" ? e.source.x + dx * t : e.source.y + dy * t;
+  };
+
+  sim.on("tick", () => {
+    dep.attr("x1",e=>e.source.x).attr("y1",e=>e.source.y)
+       .attr("x2",e=>shorten(e,"x")).attr("y2",e=>shorten(e,"y"));
+    tree.attr("x1",e=>e.source.x).attr("y1",e=>e.source.y).attr("x2",e=>e.target.x).attr("y2",e=>e.target.y);
+    node.attr("transform", d => `translate(${d.x},${d.y})`);
+    label.attr("x", d=>d.x+6).attr("y", d=>d.y+3);
+    hoverLabel.attr("x", d=>d.x+6).attr("y", d=>d.y+3);
+  });
+}
+
+async function loadRepo(repo) {
+  msg.style("display","flex").text("loading…");
+  try {
+    const data = await j(`/api/graph/full?graph=${repo.graph_id}&repo_root=${encodeURIComponent(repo.repo_root)}`);
+    if (!data.nodes.length) { msg.text("no dependency edges in this graph yet"); return; }
+    msg.style("display","none");
+    FULL = data;
+    FILE_BY_ID = new Map(data.nodes.filter(n => n.kind === "file").map(n => [n.id, n]));
+    SCOPE = null;                 // new repo resets to the full graph
+    renderScope();
+  } catch (e) { msg.text("error: " + e.message); }
+}
+
+(async () => {
+  try {
+    const { repos } = await j("/api/graph/repos");
+    if (!repos.length) { msg.text("no indexed repos"); return; }
+    d3.select("#repo").selectAll("option").data(repos).join("option")
+      .attr("value", (_,i) => i).text(r => `${r.repo_root.split("/").pop()} (${r.file_count} files)`);
+    d3.select("#repo").on("change", function(){ loadRepo(repos[this.value]); });
+    loadRepo(repos[0]);
+  } catch (e) { msg.text("error: " + e.message); }
+})();
+</script>
+</body>
+</html>

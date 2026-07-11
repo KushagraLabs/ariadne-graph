@@ -39,6 +39,22 @@ def repo(tmp_path: Path) -> Path:
     (root / ".claude" / "worktrees" / "agent-1").mkdir()
     (root / ".claude" / "worktrees" / "agent-1" / "main.py").write_text("pass\n")
 
+    # Throwaway/agent dirs that previously leaked into the index:
+    # a top-level `worktrees` (NO leading dot — the old `.worktrees` pattern
+    # missed it), a `.gc` agent overlay, and a `_tmp` scratch dir.
+    (root / "worktrees" / "wt-1").mkdir(parents=True)
+    (root / "worktrees" / "wt-1" / "copy.py").write_text("pass\n")
+    (root / ".gc" / "system").mkdir(parents=True)
+    (root / ".gc" / "system" / "hook.py").write_text("pass\n")
+    (root / "_tmp").mkdir()
+    (root / "_tmp" / "scratch.py").write_text("pass\n")
+
+    # Archived/legacy code: kept in-tree for reference but not part of the live
+    # codebase — must not be indexed (it duplicates real modules and inflates
+    # the graph, as seen in cosmic_lens/archive).
+    (root / "archive" / "old").mkdir(parents=True)
+    (root / "archive" / "old" / "legacy.py").write_text("pass\n")
+
     (root / "README.md").write_text("# readme\n")
     return root
 
@@ -91,6 +107,41 @@ def test_default_ignore_patterns(repo: Path) -> None:
     assert "src/helper.pyc" not in paths
     assert "node_modules/pkg/index.ts" not in paths
     assert ".claude/worktrees/agent-1/main.py" not in paths
+
+
+def test_ignores_throwaway_worktree_and_agent_dirs(repo: Path) -> None:
+    """Hard case: a top-level `worktrees` dir (no leading dot), `.gc` agent
+    overlay, and `_tmp` scratch must NOT be indexed. These leaked before because
+    the default pattern was `.worktrees` (with a dot) which never matched
+    `worktrees/`.
+    """
+    config = AnalyzerConfig(repo_root=repo)
+    discovery = FileDiscovery(config)
+
+    paths = {str(p.relative_to(repo)) for p in discovery.discover((".py",))}
+
+    assert "worktrees/wt-1/copy.py" not in paths
+    assert ".gc/system/hook.py" not in paths
+    assert "_tmp/scratch.py" not in paths
+    assert "archive/old/legacy.py" not in paths
+    # core files still discovered
+    assert "src/main.py" in paths
+
+
+def test_ignore_patterns_match_components_not_substrings(repo: Path) -> None:
+    """Component-level matching: `_tmp`/`external` ignore dirs of that name but
+    NOT files whose names merely contain the pattern as a substring.
+    """
+    (repo / "src" / "my_tmp_helper.py").write_text("pass\n")
+    (repo / "src" / "external_api.py").write_text("pass\n")
+    config = AnalyzerConfig(repo_root=repo)
+    discovery = FileDiscovery(config)
+
+    paths = {str(p.relative_to(repo)) for p in discovery.discover((".py",))}
+
+    assert "src/my_tmp_helper.py" in paths  # not eaten by the `_tmp` pattern
+    assert "src/external_api.py" in paths   # not eaten by the `external` pattern
+    assert "_tmp/scratch.py" not in paths   # the real _tmp dir is still ignored
 
 
 def test_custom_ignore_patterns(repo: Path) -> None:

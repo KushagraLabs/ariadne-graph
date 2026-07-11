@@ -163,6 +163,75 @@ async def test_delete_file_facts(
     assert await store.get_stored_hash("g1", "/repo/mod.py") is None
 
 
+async def test_scip_translated_file_is_deletable_by_absolute_path(
+    store: SQLiteGraphStore,
+) -> None:
+    """Regression: SCIP CodeFile nodes must be removable via delete_file_facts.
+
+    incremental_sync calls delete_file_facts with str(path.resolve()) — an
+    ABSOLUTE path. Previously the SCIP translator stored a repo-relative
+    file_path, so the delete found nothing and stale nodes leaked on every
+    re-sync. This drives a real SCIP delta through the store and re-syncs it.
+    """
+    from pathlib import Path
+
+    from ariadne_graph.languages.typescript.scip_parser import ScipIndexParser
+    from ariadne_graph.languages.typescript.scip_translator import ScipGraphTranslator
+
+    repo_root = Path(__file__).parent.parent / "fixtures" / "ts_scip_project"
+    index = ScipIndexParser().parse(repo_root / "index.scip")
+    translator = ScipGraphTranslator(repo_root=repo_root, graph_id="g1")
+    doc = index.documents[Path("src/dog.ts")]
+    delta = translator.translate(doc)
+    await store.add_nodes_batch("g1", delta.nodes)
+
+    abs_path = str((repo_root / "src" / "dog.ts").resolve())
+    before = await store.query("g1", "nodes_by_label", {"label": "CodeFile"})
+    assert before, "expected the SCIP CodeFile to be stored"
+
+    # incremental_sync deletes by the absolute resolved path.
+    await store.delete_file_facts("g1", abs_path)
+
+    after = await store.query("g1", "nodes_by_label", {"label": "CodeFile"})
+    assert after == [], "SCIP CodeFile nodes leaked — not deleted by absolute key"
+
+
+async def test_delete_file_facts_preserves_cross_file_edge(
+    store: SQLiteGraphStore,
+) -> None:
+    """A cross-file edge owned by ``a.py`` must survive a reindex of ``b.py``.
+
+    Regression: once call resolution targets the real callee node (``b.save``)
+    instead of a bare name, deleting edges by endpoint membership wrongly
+    removed the caller-owned edge when only the callee file was reindexed.
+    Deletion is now keyed on ``owner_file_path``.
+    """
+    await store.add_nodes_batch(
+        "g1",
+        [
+            CodeNode(id="a.caller", graph_id="g1", labels=["CodeFunction", "KnowledgeNode"],
+                     properties={"name": "caller", "file_path": "/repo/a.py"}),
+            CodeNode(id="b.save", graph_id="g1", labels=["CodeFunction", "KnowledgeNode"],
+                     properties={"name": "save", "file_path": "/repo/b.py"}),
+        ],
+    )
+    await store.add_edges_batch(
+        "g1",
+        [CodeEdge(source="a.caller", target="b.save", graph_id="g1", rel_type="CALLS",
+                  properties={"owner_file_path": "/repo/a.py"})],
+    )
+
+    # Reindex only the callee file: the caller-owned edge must remain.
+    await store.delete_file_facts("g1", "/repo/b.py")
+    calls = [r for r in await store.query("g1", "edges") if r["r"]["rel_type"] == "CALLS"]
+    assert len(calls) == 1
+    assert calls[0]["r"]["target"] == "b.save"
+
+    # Reindexing the owner file removes it.
+    await store.delete_file_facts("g1", "/repo/a.py")
+    assert not [r for r in await store.query("g1", "edges") if r["r"]["rel_type"] == "CALLS"]
+
+
 async def test_delete_graph(store: SQLiteGraphStore, sample_nodes: list[CodeNode]) -> None:
     await store.add_nodes_batch("g1", sample_nodes)
     await store.update_hash("g1", "/repo/mod.py", "hash")

@@ -87,7 +87,9 @@ async def _run_adapter(repo: Path) -> FakeSearchableGraphStore:
     fixture_scip = FIXTURE / "index.scip"
     real_parse = ScipIndexParser.parse
 
-    async def fake_run(self: ScipTypeScriptIndexer, output_path: Path) -> tuple[int, str, str]:
+    async def fake_run(
+        self: ScipTypeScriptIndexer, output_path: Path, cwd: Path | None = None
+    ) -> tuple[int, str, str]:
         # Inject the committed index instead of shelling out to scip-typescript.
         shutil.copyfile(fixture_scip, output_path)
         return (0, "", "")

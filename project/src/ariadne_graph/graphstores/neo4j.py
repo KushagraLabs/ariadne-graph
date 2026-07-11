@@ -170,6 +170,18 @@ class Neo4jGraphStore:
             """,
             {"g": graph_id, "p": file_path},
         )
+        # 1b. Legacy fallback: relationships predating owner tracking have no
+        #     owner_file_path. Remove those touching this file's nodes (the old
+        #     endpoint-membership behaviour) so they cannot keep stale nodes
+        #     alive in a persistent DB.
+        await self._execute_write(
+            """
+            MATCH (n:KnowledgeNode {_graph_id: $g})-[r]-()
+            WHERE n.file_path = $p AND r.owner_file_path IS NULL
+            DELETE r
+            """,
+            {"g": graph_id, "p": file_path},
+        )
         # 2. Delete this file's nodes that are now isolated; keep nodes still
         #    referenced by a surviving edge owned by another file.
         await self._execute_write(

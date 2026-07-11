@@ -30,3 +30,6 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+
+# Git worktrees (isolated feature workspaces — must never be indexed or committed)
+.worktrees/
