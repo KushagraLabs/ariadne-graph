@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Any, cast
 
 import xxhash
 
-from ariadne_graph.core.architecture import persist_architecture_diagnostics
+from ariadne_graph.core.architecture import (
+    PERIPHERAL_ORGANS,
+    _rel,
+    persist_architecture_diagnostics,
+)
 from ariadne_graph.core.auto_sync import AutoSyncManager
 
 if TYPE_CHECKING:
@@ -1258,7 +1262,22 @@ class ToolRegistry:
             except Exception as exc:
                 logger.warning("Failed to list diagnostics: %s", exc)
 
-        results: list[dict[str, Any]] = []
+        # Prod/test is decided by the diagnostic's *organ* — the first segment of
+        # its repo-relative path — being in PERIPHERAL_ORGANS. Reuse that SSOT
+        # (and the analysis `_rel`) rather than inventing a second test-path rule.
+        def _is_test(props: dict[str, Any]) -> bool:
+            fp = props.get("file_path")
+            if not fp:
+                return False
+            organ = _rel(fp, repo_path).split("/", 1)[0]
+            return organ in PERIPHERAL_ORGANS
+
+        # First pass: every diagnostic matching level/rule/file_path (and, when
+        # requested, production_only). Counts roll up over this FULL match set so
+        # they are not distorted by the `limit` page returned in `diagnostics`.
+        matched: list[dict[str, Any]] = []
+        by_rule: dict[str, int] = {}
+        by_production: dict[str, int] = {"production": 0, "test": 0}
         for node_data in diagnostic_nodes:
             props = node_data.get("properties", {})
 
@@ -1269,21 +1288,30 @@ class ToolRegistry:
             if input.file_path and props.get("file_path") != input.file_path:
                 continue
 
-            results.append({
+            is_test = _is_test(props)
+            if input.production_only and is_test:
+                continue
+
+            rule = props.get("rule")
+            if rule:
+                by_rule[rule] = by_rule.get(rule, 0) + 1
+            by_production["test" if is_test else "production"] += 1
+
+            matched.append({
                 "node_id": node_data.get("id"),
                 "labels": node_data.get("labels", []),
                 "level": props.get("level"),
-                "rule": props.get("rule"),
+                "rule": rule,
                 "message": props.get("message"),
                 "file_path": props.get("file_path"),
                 "timestamp": props.get("timestamp"),
                 "properties": props,
             })
 
-            if len(results) >= input.limit:
-                break
+        results = matched[: input.limit]
 
         return ListDiagnosticsOutput(
             diagnostics=results,
-            message=f"Found {len(results)} diagnostics",
+            counts={"by_rule": by_rule, "by_production": by_production},
+            message=f"Found {len(matched)} diagnostics ({len(results)} returned)",
         )

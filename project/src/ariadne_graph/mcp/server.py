@@ -419,19 +419,32 @@ async def code_graph_list_diagnostics(
     level: str | None = None,
     rule: str | None = None,
     file_path: str | None = None,
+    production_only: bool = False,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """List diagnostics for an indexed repository.
+    """List code-hygiene diagnostics for an indexed repository.
+
+    Surfaces both **architecture / layering violations** — deep cross-organ
+    imports, dependency cycles, orphan modules, and upward imports (the same
+    findings the browser graph view paints as pink edges) — and per-file lint
+    findings such as unused imports and missing type annotations. This is the
+    tool for auditing architectural hygiene and reproducing the graph UI's
+    violations programmatically.
 
     Args:
         repo_path: Absolute or relative path to the repository root.
-        level: Optional severity filter (e.g. 'error', 'warning', 'info').
-        rule: Optional rule filter (e.g. 'unused_import').
+        level: Optional severity filter ('error', 'warning', 'info').
+        rule: Optional rule filter. Architecture rules: 'deep_import',
+            'dependency_cycle', 'orphan_module', 'upward_import'. Lint rules:
+            'unused_import', 'missing_type_annotation'.
         file_path: Optional source file path filter.
+        production_only: Exclude diagnostics owned by peripheral organs
+            (tests/scripts), leaving only production-code findings.
         limit: Maximum number of diagnostics to return (1-1000).
 
     Returns:
-        Dict with diagnostic entries.
+        Dict with diagnostic entries plus a ``counts`` rollup (``by_rule`` and
+        ``by_production``) aggregated over all matching diagnostics.
     """
     registry = _get_registry()
     input_data = ListDiagnosticsInput(
@@ -439,6 +452,7 @@ async def code_graph_list_diagnostics(
         level=level,
         rule=rule,
         file_path=file_path,
+        production_only=production_only,
         limit=limit,
     )
     result = await registry.handle_list_diagnostics(input_data)

@@ -288,8 +288,19 @@ class ListDiagnosticsInput(BaseModel):
 
     repo_path: str = Field(description="Absolute or relative path to repository root")
     level: str | None = Field(default=None, description="Filter by severity level")
-    rule: str | None = Field(default=None, description="Filter by rule identifier")
+    rule: str | None = Field(
+        default=None,
+        description=(
+            "Filter by rule identifier, e.g. architecture/layering rules "
+            "'deep_import', 'dependency_cycle', 'orphan_module', 'upward_import' "
+            "or per-file lint rules 'unused_import', 'missing_type_annotation'"
+        ),
+    )
     file_path: str | None = Field(default=None, description="Filter by source file path")
+    production_only: bool = Field(
+        default=False,
+        description="Exclude diagnostics owned by peripheral organs (tests/scripts)",
+    )
     limit: int = Field(default=100, ge=1, le=1000, description="Maximum diagnostics to return")
 
 
@@ -297,6 +308,14 @@ class ListDiagnosticsOutput(BaseModel):
     """Output for code_graph_list_diagnostics tool."""
 
     diagnostics: list[dict[str, Any]] = Field(
-        default_factory=list, description="Diagnostic entries"
+        default_factory=list, description="Diagnostic entries (truncated to limit)"
+    )
+    counts: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Aggregate rollup over ALL matching diagnostics (before the limit "
+            "truncation): 'by_rule' (per-rule totals) and 'by_production' "
+            "(production vs test split)"
+        ),
     )
     message: str = Field(default="", description="Human-readable status message")
