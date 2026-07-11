@@ -48,6 +48,7 @@ class TreeSitterEnricher:
         self,
         file_path: Path,
         scip_delta: CodeGraphDelta,
+        repo_root: Path | None = None,
     ) -> tuple[
         CodeGraphDelta, set[tuple[int, int, int, int]], dict[tuple[int, int, int, int], str]
     ]:
@@ -56,6 +57,9 @@ class TreeSitterEnricher:
         Args:
             file_path: Absolute path to the TypeScript source file.
             scip_delta: Delta produced by :class:`ScipGraphTranslator`.
+            repo_root: True repository root, used so grafted import node ids stay
+                rooted at the repo (not a subproject dir). Falls back to the
+                file's parent when unknown.
 
         Returns:
             A tuple of (enriched_delta, call_ranges, enclosing_map).
@@ -74,6 +78,12 @@ class TreeSitterEnricher:
 
         call_ranges: set[tuple[int, int, int, int]] = set()
         enclosing_map: dict[tuple[int, int, int, int], str] = {}
+
+        # scip-typescript (v0.4.0) never sets the IMPORT symbol-role bit, so the
+        # SCIP translator emits no import nodes/edges for any file it covers
+        # (bead c66). Supply them from the Tree-sitter extractor, re-sourcing the
+        # edges to the SCIP module node so they attach to the file's real node.
+        self._merge_imports(file_path, source_bytes, scip_delta, repo_root)
 
         # Build a lookup from (name, start_line, end_line) to SCIP node.
         scip_lookup: dict[tuple[str, int, int], CodeNode] = {}
@@ -103,6 +113,124 @@ class TreeSitterEnricher:
         )
 
         return scip_delta, call_ranges, enclosing_map
+
+    def _merge_imports(
+        self,
+        file_path: Path,
+        source_bytes: bytes,
+        scip_delta: CodeGraphDelta,
+        repo_root: Path | None = None,
+    ) -> None:
+        """Add Tree-sitter import nodes/edges to a SCIP delta.
+
+        ``scip-typescript`` does not emit IMPORT-role occurrences, so a
+        SCIP-covered file has no CodeImport nodes or IMPORTS_SYMBOL/IMPORTS
+        edges. The Tree-sitter extractor already parses imports (with tsconfig
+        alias/relative resolution); we run it, take only its import facts, and
+        re-source the edges to the SCIP module node so they hang off the file's
+        authoritative node rather than the extractor's dotted module id.
+
+        Node identity (module id, import node ids) is derived from the TRUE
+        ``repo_root`` so files with the same subpath in different subprojects
+        (``mobile/src/x.ts`` vs ``web/src/x.ts``) don't collide. Alias (``@/``)
+        resolution, which is a separate concern, uses the nearest tsconfig dir.
+
+        Idempotent: import nodes/edges already present in the delta are skipped,
+        so the adapter's repeated ``enrich`` calls don't duplicate them.
+        """
+        module_id = self._module_id(scip_delta)
+        # Identity: true repo root (fall back to file parent only if unknown).
+        identity_root = repo_root or file_path.parent
+        # Alias (@/...) imports resolve against the nearest tsconfig, which for a
+        # subproject file is the subproject dir, not the repo root. This is
+        # independent of node identity.
+        tsconfig_root = self._nearest_tsconfig_dir(file_path) or identity_root
+
+        # Import the extractor lazily to avoid a module-level import cycle.
+        from ariadne_graph.languages.typescript.extractor import TypeScriptFactExtractor
+        from ariadne_graph.languages.typescript.tsconfig import TsConfigResolver
+
+        extractor = TypeScriptFactExtractor(
+            source=source_bytes.decode("utf-8", errors="replace"),
+            file_path=file_path,
+            repo_root=identity_root,
+            graph_id=scip_delta.graph_id,
+            parser_version="scip-enricher-imports",
+        )
+        # Point alias resolution at the subproject tsconfig without changing the
+        # repo-rooted node identity the extractor already computed.
+        if tsconfig_root != identity_root:
+            extractor._tsconfig_resolver = TsConfigResolver(tsconfig_root)
+        ts_delta = extractor.extract()
+
+        import_nodes = {n.id: n for n in ts_delta.nodes if "CodeImport" in n.labels}
+        if not import_nodes:
+            return
+        existing_ids = {n.id for n in scip_delta.nodes}
+        abs_path = str(file_path)
+
+        for node_id, node in import_nodes.items():
+            # The extractor only resolves tsconfig aliases; add relative-import
+            # resolution here so file-to-file dependency queries work for
+            # ``./x`` imports too.
+            self._resolve_relative(node, file_path)
+            if node_id not in existing_ids:
+                node.properties["file_path"] = abs_path
+                scip_delta.nodes.append(node)
+                existing_ids.add(node_id)
+
+        # Identities of edges already in the delta, so a repeated enrich() call
+        # doesn't append the same import edge twice (idempotency for edges, not
+        # just nodes).
+        existing_edges = {(e.source, e.target, e.rel_type) for e in scip_delta.edges}
+        for edge in ts_delta.edges:
+            # Keep only edges into an import node (IMPORTS_SYMBOL / IMPORTS),
+            # re-sourced to the SCIP module node so they hang off the file node.
+            target_node = import_nodes.get(edge.target)
+            if target_node is None:
+                continue
+            edge.source = module_id
+            edge.properties["owner_file_path"] = abs_path
+            resolved = target_node.properties.get("resolved_source")
+            if resolved is not None:
+                edge.properties["resolved_source"] = resolved
+            identity = (edge.source, edge.target, edge.rel_type)
+            if identity in existing_edges:
+                continue
+            existing_edges.add(identity)
+            scip_delta.edges.append(edge)
+
+    @staticmethod
+    def _nearest_tsconfig_dir(file_path: Path) -> Path | None:
+        """Nearest ancestor directory of *file_path* containing a tsconfig.json."""
+        for parent in file_path.parents:
+            if (parent / "tsconfig.json").exists():
+                return parent
+        return None
+
+    @staticmethod
+    def _resolve_relative(import_node: CodeNode, file_path: Path) -> None:
+        """Fill ``resolved_source`` for a relative (``./``/``../``) import.
+
+        The Tree-sitter extractor only resolves tsconfig aliases; a relative
+        specifier resolves against the importing file's directory. Records the
+        real target path (trying the common TS/JS extensions) so file-level
+        dependency queries see the edge.
+        """
+        if import_node.properties.get("resolved_source"):
+            return
+        source = str(import_node.properties.get("source", ""))
+        if not source.startswith("."):
+            return
+        base = (file_path.parent / source).resolve()
+        candidates = [base]
+        for ext in (".ts", ".tsx", ".js", ".jsx"):
+            candidates.append(base.with_suffix(ext))
+            candidates.append(base / f"index{ext}")
+        for candidate in candidates:
+            if candidate.is_file():
+                import_node.properties["resolved_source"] = str(candidate)
+                return
 
     def _parse(self, file_path: Path, source_bytes: bytes) -> Any | None:
         """Parse the file with Tree-sitter."""

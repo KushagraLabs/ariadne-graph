@@ -112,7 +112,9 @@ class TypeScriptLanguageAdapter:
         )
         if not project_indexes:
             self._scip_failure_message = "scip-typescript indexing failed or was skipped"
-            logger.warning("SCIP-TypeScript indexing failed or was skipped for %s", context.repo_root)
+            logger.warning(
+                "SCIP-TypeScript indexing failed or was skipped for %s", context.repo_root
+            )
             return
 
         enricher = TreeSitterEnricher()
@@ -122,8 +124,10 @@ class TypeScriptLanguageAdapter:
             # SCIP doc paths are relative to the project cwd; the prefix rebases
             # subproject paths to repo-root-relative so file_path/abs_path stay
             # unique and correct.
-            prefix = "" if project_dir == context.repo_root else str(
-                project_dir.relative_to(context.repo_root)
+            prefix = (
+                ""
+                if project_dir == context.repo_root
+                else str(project_dir.relative_to(context.repo_root))
             )
             try:
                 scip_index = parser.parse(index_path)
@@ -144,14 +148,16 @@ class TypeScriptLanguageAdapter:
 
                 delta = translator.translate(document)
                 try:
-                    _, call_ranges, enclosing_map = enricher.enrich(abs_path, delta)
+                    _, call_ranges, enclosing_map = enricher.enrich(
+                        abs_path, delta, context.repo_root
+                    )
                     delta = translator.translate(
                         document,
                         call_ranges=call_ranges,
                         enclosing_map=enclosing_map,
                     )
                     # Enrich the final delta with Tree-sitter-only properties.
-                    delta, _, _ = enricher.enrich(abs_path, delta)
+                    delta, _, _ = enricher.enrich(abs_path, delta, context.repo_root)
                 except Exception as exc:
                     logger.debug("Tree-sitter enrichment failed for %s: %s", abs_path, exc)
 
@@ -200,9 +206,7 @@ class TypeScriptLanguageAdapter:
 
         # Tree-sitter fallback.
         if not HAS_TREE_SITTER:
-            return self._stub_delta(
-                path, relative_path, content_hash, context
-            )
+            return self._stub_delta(path, relative_path, content_hash, context)
 
         extractor = TypeScriptFactExtractor(
             source=content,
@@ -253,7 +257,7 @@ class TypeScriptLanguageAdapter:
         logger.warning(
             "TypeScript extraction is degraded for %s: "
             "tree-sitter-typescript is not installed. "
-            "Install with: pip install -e \".[typescript]\"",
+            'Install with: pip install -e ".[typescript]"',
             relative_path,
         )
         file_node = CodeNode(
@@ -278,7 +282,7 @@ class TypeScriptLanguageAdapter:
                 "message": (
                     "tree-sitter-typescript is not installed; "
                     "TypeScript extraction is limited to a stub CodeFile node. "
-                    "Install with: pip install -e \".[typescript]\""
+                    'Install with: pip install -e ".[typescript]"'
                 ),
                 "file_path": relative_path,
                 "language": self.language,

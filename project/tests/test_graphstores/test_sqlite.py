@@ -115,6 +115,143 @@ async def test_nodes_by_file(store: SQLiteGraphStore, sample_nodes: list[CodeNod
     assert len(rows) == 2
 
 
+async def test_add_nodes_batch_merges_labels_and_properties_on_conflict(
+    store: SQLiteGraphStore,
+) -> None:
+    """A bare import stub sharing an id with a rich CodeFile must not clobber it.
+
+    SCIP translate emits a bare CodeImport stub whose id equals a real CodeFile's
+    node id. Blind INSERT OR REPLACE strips the CodeFile label + file properties.
+    On conflict we must UNION labels and keep the richer node's properties.
+    """
+    rich = CodeNode(
+        id="pkg.mod",
+        graph_id="g1",
+        labels=["CodeFile", "CodeModule", "KnowledgeNode"],
+        properties={
+            "name": "mod",
+            "file_path": "/repo/pkg/mod.py",
+            "qualname": "pkg.mod",
+            "loc": 120,
+        },
+    )
+    stub = CodeNode(
+        id="pkg.mod",
+        graph_id="g1",
+        labels=["CodeImport"],
+        properties={"name": "mod"},
+    )
+
+    await store.add_nodes_batch("g1", [rich])
+    await store.add_nodes_batch("g1", [stub])
+
+    rows = await store.query("g1", "node_by_id", {"node_id": "pkg.mod"})
+    assert len(rows) == 1
+    node = rows[0]["n"]
+
+    # Labels are the UNION; the CodeFile/CodeModule anchor survives.
+    assert set(node["labels"]) == {
+        "CodeFile",
+        "CodeModule",
+        "KnowledgeNode",
+        "CodeImport",
+    }
+    # Rich file-level properties are retained.
+    assert node["properties"]["file_path"] == "/repo/pkg/mod.py"
+    assert node["properties"]["qualname"] == "pkg.mod"
+    assert node["properties"]["loc"] == 120
+
+    # The file anchor is queryable by file (the audit skip regression).
+    by_file = await store.query("g1", "nodes_by_file", {"file_path": "/repo/pkg/mod.py"})
+    assert any(r["n"]["id"] == "pkg.mod" for r in by_file)
+
+
+async def test_add_nodes_batch_merges_same_batch_collision(
+    store: SQLiteGraphStore,
+) -> None:
+    """The fresh-index case: rich node + bare stub arrive in ONE batch call.
+
+    On a fresh index neither node exists in SQLite yet, so merging only against
+    stored rows leaves them both unmerged and INSERT OR REPLACE lets the later
+    stub clobber the rich node. The batch must be folded by id in-memory too.
+    Order-independent: the stub must not win whether it comes before or after.
+    """
+    rich = CodeNode(
+        id="pkg.mod",
+        graph_id="g1",
+        labels=["CodeFile", "CodeModule", "KnowledgeNode"],
+        properties={"name": "mod", "file_path": "/repo/pkg/mod.py", "loc": 120},
+    )
+    stub = CodeNode(
+        id="pkg.mod",
+        graph_id="g1",
+        labels=["CodeImport"],
+        properties={"name": "mod"},
+    )
+
+    # stub AFTER rich (the order SCIP translate emits) in a single batch.
+    await store.add_nodes_batch("g1", [rich, stub])
+    node = (await store.query("g1", "node_by_id", {"node_id": "pkg.mod"}))[0]["n"]
+    assert set(node["labels"]) == {"CodeFile", "CodeModule", "KnowledgeNode", "CodeImport"}
+    assert node["properties"]["file_path"] == "/repo/pkg/mod.py"
+    assert node["properties"]["loc"] == 120
+
+    # And the reverse order (stub BEFORE rich) must yield the same merged result.
+    await store.add_nodes_batch(
+        "g2",
+        [stub.model_copy(update={"graph_id": "g2"}), rich.model_copy(update={"graph_id": "g2"})],
+    )
+    node2 = (await store.query("g2", "node_by_id", {"node_id": "pkg.mod"}))[0]["n"]
+    assert set(node2["labels"]) == {"CodeFile", "CodeModule", "KnowledgeNode", "CodeImport"}
+    assert node2["properties"]["file_path"] == "/repo/pkg/mod.py"
+
+
+async def test_add_nodes_batch_update_removes_obsolete_properties(
+    store: SQLiteGraphStore,
+) -> None:
+    """A legitimate re-index of the SAME logical node must REPLACE, not merge.
+
+    The stub/anchor merge is narrow: it must not turn every conflict into a
+    union. Updating a node from {name:old, obsolete:true} to {name:new} must
+    drop ``obsolete`` and update ``name`` -- normal upsert semantics.
+    """
+    v1 = CodeNode(
+        id="mod.func",
+        graph_id="g1",
+        labels=["CodeFunction", "KnowledgeNode"],
+        properties={"name": "old", "obsolete": True, "file_path": "/repo/mod.py"},
+    )
+    v2 = CodeNode(
+        id="mod.func",
+        graph_id="g1",
+        labels=["CodeFunction", "KnowledgeNode"],
+        properties={"name": "new", "file_path": "/repo/mod.py"},
+    )
+    await store.add_nodes_batch("g1", [v1])
+    await store.add_nodes_batch("g1", [v2])
+
+    node = (await store.query("g1", "node_by_id", {"node_id": "mod.func"}))[0]["n"]
+    assert node["properties"]["name"] == "new", "update did not overwrite name"
+    assert "obsolete" not in node["properties"], "obsolete property survived a replace"
+
+
+async def test_add_nodes_batch_reindex_is_idempotent(
+    store: SQLiteGraphStore, sample_nodes: list[CodeNode]
+) -> None:
+    """Re-indexing an unchanged node must not duplicate labels or grow the row."""
+    await store.add_nodes_batch("g1", sample_nodes)
+    await store.add_nodes_batch("g1", sample_nodes)
+
+    rows = await store.query("g1", "node_by_id", {"node_id": "mod.func"})
+    assert len(rows) == 1
+    labels = rows[0]["n"]["labels"]
+    assert labels == ["CodeFunction", "KnowledgeNode"]
+    assert len(labels) == len(set(labels))
+
+    all_rows = await store.query("g1", "nodes")
+    assert len(all_rows) == 2
+
+
 async def test_file_hashes_and_dirty_files(store: SQLiteGraphStore) -> None:
     await store.update_hash("g1", "/repo/a.py", "hash_a")
     await store.update_hash("g1", "/repo/b.py", "hash_b")
@@ -209,16 +346,31 @@ async def test_delete_file_facts_preserves_cross_file_edge(
     await store.add_nodes_batch(
         "g1",
         [
-            CodeNode(id="a.caller", graph_id="g1", labels=["CodeFunction", "KnowledgeNode"],
-                     properties={"name": "caller", "file_path": "/repo/a.py"}),
-            CodeNode(id="b.save", graph_id="g1", labels=["CodeFunction", "KnowledgeNode"],
-                     properties={"name": "save", "file_path": "/repo/b.py"}),
+            CodeNode(
+                id="a.caller",
+                graph_id="g1",
+                labels=["CodeFunction", "KnowledgeNode"],
+                properties={"name": "caller", "file_path": "/repo/a.py"},
+            ),
+            CodeNode(
+                id="b.save",
+                graph_id="g1",
+                labels=["CodeFunction", "KnowledgeNode"],
+                properties={"name": "save", "file_path": "/repo/b.py"},
+            ),
         ],
     )
     await store.add_edges_batch(
         "g1",
-        [CodeEdge(source="a.caller", target="b.save", graph_id="g1", rel_type="CALLS",
-                  properties={"owner_file_path": "/repo/a.py"})],
+        [
+            CodeEdge(
+                source="a.caller",
+                target="b.save",
+                graph_id="g1",
+                rel_type="CALLS",
+                properties={"owner_file_path": "/repo/a.py"},
+            )
+        ],
     )
 
     # Reindex only the callee file: the caller-owned edge must remain.
@@ -276,11 +428,7 @@ async def test_vector_search_fallback_no_deadlock(
         embedding = [1.0, 0.0, 0.0, 0.0]
         await store.upsert_embeddings(
             "g1",
-            [
-                EmbeddingPayload(
-                    node_id="node.a", graph_id="g1", text="alpha", embedding=embedding
-                )
-            ],
+            [EmbeddingPayload(node_id="node.a", graph_id="g1", text="alpha", embedding=embedding)],
         )
         store._has_sqlite_vec = True
         hits = await store.search_vector("g1", embedding, limit=5)
@@ -321,9 +469,7 @@ async def test_legacy_fts_migration(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE nodes (id TEXT, graph_id TEXT, labels TEXT, properties TEXT)")
-        conn.execute(
-            "CREATE VIRTUAL TABLE node_fts USING fts5(content, node_id, graph_id)"
-        )
+        conn.execute("CREATE VIRTUAL TABLE node_fts USING fts5(content, node_id, graph_id)")
         conn.execute(
             "INSERT INTO node_fts (content, node_id, graph_id) VALUES (?, ?, ?)",
             ("legacy symbol content", "legacy.node", "g1"),

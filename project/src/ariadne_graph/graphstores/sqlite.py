@@ -369,9 +369,7 @@ class SQLiteGraphStore:
         # Copy legacy FTS rows into the new content table.  We batch to keep
         # memory bounded on very large indexes.
         try:
-            cursor = await db.execute(
-                "SELECT content, node_id, graph_id FROM node_fts"
-            )
+            cursor = await db.execute("SELECT content, node_id, graph_id FROM node_fts")
             while True:
                 batch = await cursor.fetchmany(1000)
                 if not batch:
@@ -386,9 +384,7 @@ class SQLiteGraphStore:
                 )
             await db.execute("DROP TABLE node_fts")
         except Exception as exc:
-            logger.warning(
-                "Failed to migrate legacy FTS data (will recreate empty): %s", exc
-            )
+            logger.warning("Failed to migrate legacy FTS data (will recreate empty): %s", exc)
             with contextlib.suppress(Exception):
                 await db.execute("DROP TABLE IF EXISTS node_fts")
 
@@ -417,13 +413,16 @@ class SQLiteGraphStore:
         db = await self._connect()
         try:
             tables = [
-                "nodes", "edges", "file_hashes", "snippets",
-                "embeddings", "communities", "graphs",
+                "nodes",
+                "edges",
+                "file_hashes",
+                "snippets",
+                "embeddings",
+                "communities",
+                "graphs",
             ]
             for table in tables:
-                await db.execute(
-                    f"DELETE FROM {table} WHERE graph_id = ?", (graph_id,)
-                )
+                await db.execute(f"DELETE FROM {table} WHERE graph_id = ?", (graph_id,))
             # Clean up FTS entries for this graph by rowid (O(1) per row).
             await db.execute(
                 """
@@ -434,14 +433,10 @@ class SQLiteGraphStore:
                 """,
                 (graph_id,),
             )
-            await db.execute(
-                "DELETE FROM fts_node_content WHERE graph_id = ?", (graph_id,)
-            )
+            await db.execute("DELETE FROM fts_node_content WHERE graph_id = ?", (graph_id,))
             # Clean up vec_items if sqlite-vec is active
             if self._has_sqlite_vec:
-                await db.execute(
-                    f"DELETE FROM {VEC_TABLE} WHERE graph_id = ?", (graph_id,)
-                )
+                await db.execute(f"DELETE FROM {VEC_TABLE} WHERE graph_id = ?", (graph_id,))
             await db.commit()
         finally:
             await db.close()
@@ -573,6 +568,79 @@ class SQLiteGraphStore:
         finally:
             await db.close()
 
+    # Node labels that anchor a file (a bare import stub must never strip these).
+    _ANCHOR_LABELS = frozenset({"CodeFile", "CodeModule"})
+
+    @classmethod
+    def _is_stub_anchor_collision(
+        cls, incoming_labels: list[str], existing_labels: list[str]
+    ) -> bool:
+        """True only for the SCIP bare-import-stub vs file-anchor id collision.
+
+        SCIP translate emits a bare ``CodeImport`` stub whose id equals a real
+        ``CodeFile``/``CodeModule`` node's id. That is the ONE case where a blind
+        replace loses information and we must union/merge. Every other id
+        conflict is a legitimate re-index of the same logical node and keeps
+        normal upsert (incoming replaces) semantics -- otherwise stale/removed
+        properties would wrongly survive an update.
+        """
+        incoming = set(incoming_labels)
+        existing = set(existing_labels)
+        if incoming == existing:
+            return False
+        # One side is the import stub, the other carries a file anchor.
+        incoming_is_stub = "CodeImport" in incoming and not (incoming & cls._ANCHOR_LABELS)
+        existing_is_stub = "CodeImport" in existing and not (existing & cls._ANCHOR_LABELS)
+        incoming_is_anchor = bool(incoming & cls._ANCHOR_LABELS)
+        existing_is_anchor = bool(existing & cls._ANCHOR_LABELS)
+        return (incoming_is_stub and existing_is_anchor) or (
+            existing_is_stub and incoming_is_anchor
+        )
+
+    @classmethod
+    def _merge_node(
+        cls,
+        node: CodeNode,
+        existing: tuple[list[str], dict[str, Any]] | None,
+    ) -> CodeNode:
+        """Upsert an incoming node against the row already stored under its id.
+
+        Default is normal replace (incoming wins) so updates can remove obsolete
+        properties. The ONE exception is the SCIP bare-import-stub vs
+        file-anchor id collision (:meth:`_is_stub_anchor_collision`): there we
+        UNION labels and keep the richer side's properties so the stub can't
+        strip a real ``CodeFile``/``CodeModule`` anchor.
+        """
+        if existing is None:
+            return node
+
+        existing_labels, existing_props = existing
+
+        if not cls._is_stub_anchor_collision(node.labels, existing_labels):
+            # Legitimate re-index/update: incoming node replaces the stored row.
+            return node
+
+        # Order-preserving union: keep existing labels first, then any new ones.
+        merged_labels = list(existing_labels)
+        for label in node.labels:
+            if label not in merged_labels:
+                merged_labels.append(label)
+
+        # The richer side (more properties) wins on key collisions; the other
+        # side only contributes keys the richer side is missing.
+        if len(node.properties) >= len(existing_props):
+            richer, poorer = node.properties, existing_props
+        else:
+            richer, poorer = existing_props, node.properties
+        merged_props = {**poorer, **richer}
+
+        return CodeNode(
+            id=node.id,
+            graph_id=node.graph_id,
+            labels=merged_labels,
+            properties=merged_props,
+        )
+
     @staticmethod
     def _build_fts_content(node: CodeNode) -> str:
         """Build a searchable text string from node identifiers and metadata."""
@@ -590,9 +658,7 @@ class SQLiteGraphStore:
         return " ".join(parts)
 
     @staticmethod
-    def _chunked(
-        items: Sequence[str], size: int = 999
-    ) -> list[tuple[list[str], str]]:
+    def _chunked(items: Sequence[str], size: int = 999) -> list[tuple[list[str], str]]:
         """Return (chunk, placeholders) tuples for safe SQLite IN clauses."""
         chunks: list[tuple[list[str], str]] = []
         for offset in range(0, len(items), size):
@@ -601,9 +667,7 @@ class SQLiteGraphStore:
             chunks.append((chunk, placeholders))
         return chunks
 
-    async def add_nodes_batch(
-        self, graph_id: str, nodes: Sequence[CodeNode]
-    ) -> None:
+    async def add_nodes_batch(self, graph_id: str, nodes: Sequence[CodeNode]) -> None:
         """Upsert nodes (INSERT OR REPLACE) and keep FTS index in sync."""
         if not nodes:
             return
@@ -611,6 +675,41 @@ class SQLiteGraphStore:
         db = await self._connect()
         try:
             node_ids = [node.id for node in nodes]
+
+            # Read any existing rows for these ids so we can MERGE rather than
+            # clobber on conflict.  SCIP translate emits bare CodeImport stubs
+            # whose id equals a real CodeFile/CodeModule node id; a blind
+            # INSERT OR REPLACE would strip the file anchor's labels and
+            # richer properties (see code_hygiene_mcp-6c7).
+            existing: dict[str, tuple[list[str], dict[str, Any]]] = {}
+            for chunk, placeholders in self._chunked(node_ids):
+                cursor = await db.execute(
+                    f"""
+                    SELECT id, labels, properties FROM nodes
+                    WHERE graph_id = ? AND id IN ({placeholders})
+                    """,
+                    (graph_id, *chunk),
+                )
+                for r in await cursor.fetchall():
+                    existing[r["id"]] = (
+                        json.loads(r["labels"] or "[]"),
+                        json.loads(r["properties"] or "{}"),
+                    )
+
+            # Fold the batch incrementally BY ID so a same-batch collision (a
+            # rich CodeFile node and its bare CodeImport stub in ONE call, the
+            # fresh-index case) merges too -- not just conflicts against rows
+            # already in SQLite. Seed each id from its stored row, then merge
+            # every incoming node with the same id on top, preserving order.
+            merged_by_id: dict[str, CodeNode] = {}
+            for node in nodes:
+                prior = merged_by_id.get(node.id)
+                if prior is not None:
+                    base = (prior.labels, prior.properties)
+                else:
+                    base = existing.get(node.id)
+                merged_by_id[node.id] = self._merge_node(node, base)
+            merged = list(merged_by_id.values())
 
             # Remove stale FTS index rows for the node ids we are about to
             # (re)insert.  With the rowid-keyed external-content schema this is
@@ -625,9 +724,7 @@ class SQLiteGraphStore:
                     (graph_id, *chunk),
                 )
                 rowids = [r["rowid"] for r in await cursor.fetchall()]
-                for rchunk, rplaceholders in self._chunked(
-                    [str(r) for r in rowids]
-                ):
+                for rchunk, rplaceholders in self._chunked([str(r) for r in rowids]):
                     await db.execute(
                         f"DELETE FROM node_fts WHERE rowid IN ({rplaceholders})",
                         rchunk,
@@ -641,7 +738,7 @@ class SQLiteGraphStore:
                     json.dumps(node.properties),
                     node.properties.get("file_path"),
                 )
-                for node in nodes
+                for node in merged
             ]
             await db.executemany(
                 """
@@ -653,10 +750,7 @@ class SQLiteGraphStore:
 
             # Update the external content table, then rebuild the FTS index rows
             # for this batch using the stable rowids.
-            content_rows = [
-                (self._build_fts_content(node), node.id, graph_id)
-                for node in nodes
-            ]
+            content_rows = [(self._build_fts_content(node), node.id, graph_id) for node in merged]
             await db.executemany(
                 """
                 INSERT OR REPLACE INTO fts_node_content
@@ -691,9 +785,7 @@ class SQLiteGraphStore:
         finally:
             await db.close()
 
-    async def add_edges_batch(
-        self, graph_id: str, edges: Sequence[CodeEdge]
-    ) -> None:
+    async def add_edges_batch(self, graph_id: str, edges: Sequence[CodeEdge]) -> None:
         """Insert edges (INSERT OR IGNORE to avoid duplicates)."""
         if not edges:
             return
@@ -1118,8 +1210,7 @@ class SQLiteGraphStore:
                 )
                 rows = await cursor.fetchall()
                 return [
-                    {"file_path": r["file_path"], "content_hash": r["content_hash"]}
-                    for r in rows
+                    {"file_path": r["file_path"], "content_hash": r["content_hash"]} for r in rows
                 ]
 
             if query == "dirty_files":
@@ -1140,9 +1231,7 @@ class SQLiteGraphStore:
         finally:
             await db.close()
 
-    async def get_stored_hash(
-        self, graph_id: str, file_path: str
-    ) -> str | None:
+    async def get_stored_hash(self, graph_id: str, file_path: str) -> str | None:
         """Return the last indexed content hash for a file."""
         db = await self._connect()
         try:
@@ -1155,9 +1244,7 @@ class SQLiteGraphStore:
         finally:
             await db.close()
 
-    async def update_hash(
-        self, graph_id: str, file_path: str, content_hash: str
-    ) -> None:
+    async def update_hash(self, graph_id: str, file_path: str, content_hash: str) -> None:
         """Upsert the content hash for a file."""
         from datetime import datetime
 
@@ -1327,8 +1414,7 @@ class SQLiteGraphStore:
             similarities.sort(key=lambda x: x[1], reverse=True)
 
             return [
-                SearchHit(node_id=node_id, score=score)
-                for node_id, score in similarities[:limit]
+                SearchHit(node_id=node_id, score=score) for node_id, score in similarities[:limit]
             ]
         finally:
             await db.close()
@@ -1346,9 +1432,7 @@ class SQLiteGraphStore:
             logger.warning("FTS search failed, falling back to LIKE: %s", exc)
             return await self._search_keyword_like(graph_id, query, limit)
 
-    async def _search_keyword_fts(
-        self, graph_id: str, query: str, limit: int
-    ) -> list[SearchHit]:
+    async def _search_keyword_fts(self, graph_id: str, query: str, limit: int) -> list[SearchHit]:
         """Keyword search via FTS5."""
         db = await self._connect()
         try:
@@ -1376,9 +1460,7 @@ class SQLiteGraphStore:
         finally:
             await db.close()
 
-    async def _search_keyword_like(
-        self, graph_id: str, query: str, limit: int
-    ) -> list[SearchHit]:
+    async def _search_keyword_like(self, graph_id: str, query: str, limit: int) -> list[SearchHit]:
         """Fallback keyword search using LIKE on node properties."""
         db = await self._connect()
         try:
@@ -1441,9 +1523,7 @@ class SQLiteGraphStore:
     # Communities
     # ------------------------------------------------------------------
 
-    async def set_communities(
-        self, graph_id: str, assignments: dict[str, int]
-    ) -> None:
+    async def set_communities(self, graph_id: str, assignments: dict[str, int]) -> None:
         """Store community assignments for nodes (UPSERT)."""
         if not assignments:
             return
@@ -1547,4 +1627,3 @@ class SQLiteGraphStore:
             ]
         finally:
             await db.close()
-
