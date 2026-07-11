@@ -79,6 +79,23 @@ def _graph_id_from_repo_path(repo_path: str) -> str:
     return hashlib.sha256(resolved.encode()).hexdigest()[:16]
 
 
+def _norm_file_key(file_path: str | None) -> str | None:
+    """Canonicalise a file path for identity comparison.
+
+    Node ``file_path`` is written canonicalised (``str(repo_root.resolve()/rel)``)
+    while edge ``owner_file_path`` comes from the raw filesystem walk. The two
+    strings diverge for the *same* file when the repo root is reached via a
+    non-canonical path (symlink, macOS firmlink, ``..``/``.`` segments), which
+    made ``inspect_file`` match a file's edges without its nodes. Routing both
+    the caller's query and every stored key through this normaliser keys them on
+    one identity. ``resolve()`` collapses symlinks/firmlinks and ``.``/``..``
+    even for paths that no longer exist on disk.
+    """
+    if not file_path:
+        return file_path
+    return str(Path(file_path).resolve())
+
+
 def _read_file_bytes(path: Path) -> bytes:
     """Read file contents as bytes."""
     return path.read_bytes()
@@ -192,12 +209,13 @@ class ToolRegistry:
     async def _get_nodes_for_file(self, graph_id: str, file_path: str) -> list[dict[str, Any]]:
         """Get all nodes that belong to a specific file."""
         try:
+            target = _norm_file_key(file_path)
             nodes = await self.graph_store.query(graph_id, "nodes")
             result = []
             for row in nodes:
                 node_data = row.get("n", row)
                 props = node_data.get("properties", {})
-                if props.get("file_path") == file_path:
+                if _norm_file_key(props.get("file_path")) == target:
                     result.append(node_data)
             return result
         except Exception:
@@ -206,12 +224,13 @@ class ToolRegistry:
     async def _get_edges_for_file(self, graph_id: str, file_path: str) -> list[dict[str, Any]]:
         """Get all edges originating from a specific file."""
         try:
+            target = _norm_file_key(file_path)
             edges = await self.graph_store.query(graph_id, "edges")
             result = []
             for row in edges:
                 edge_data = row.get("r", row)
                 props = edge_data.get("properties", {})
-                if props.get("owner_file_path") == file_path:
+                if _norm_file_key(props.get("owner_file_path")) == target:
                     result.append(edge_data)
             return result
         except Exception:
