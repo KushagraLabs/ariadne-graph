@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fnmatch
 import hashlib
 import logging
 from datetime import UTC, datetime
@@ -13,11 +14,18 @@ from typing import TYPE_CHECKING, Any, cast
 import xxhash
 
 from ariadne_graph.core.architecture import (
+    _DEP_EDGE_SQL,
+    _FILE_SQL,
     PERIPHERAL_ORGANS,
     _rel,
     explain_edge,
     persist_architecture_diagnostics,
     read_dependency_matrix,
+)
+from ariadne_graph.core.architecture_config import (
+    ArchitectureConfig,
+    ModuleSpec,
+    load_architecture_config,
 )
 from ariadne_graph.core.auto_sync import AutoSyncManager
 
@@ -39,6 +47,8 @@ from ariadne_graph.languages.base import LanguageAdapter
 from ariadne_graph.mcp.fallbacks import GraphStoreFallbacks
 from ariadne_graph.mcp.schemas import (
     ArchitectureOutput,
+    AuditPublicSurfacesInput,
+    AuditPublicSurfacesOutput,
     CapabilitiesInput,
     CapabilitiesOutput,
     CommunitiesOutput,
@@ -124,6 +134,166 @@ def _find_adapter_for_file(
         if any(str(file_path).endswith(ext) for ext in adapter.extensions):
             return adapter
     return None
+
+
+# Fan-in at or above this many distinct external consumers marks an internal
+# file as a "promote to public surface" candidate. Deliberately small: any
+# external reach into internals more than once is worth a maintainer's look.
+_HIGH_FAN_IN_THRESHOLD = 2
+
+# Each `from <module> import <symbol>` statement's declared module path, keyed
+# to the FILE that wrote it. This is the only signal that survives past symbol
+# resolution to tell "imported through a re-exporting facade" apart from
+# "imported the internal directly" -- see _audit_public_surfaces.
+_IMPORT_FROM_MODULE_SQL = """
+SELECT json_extract(sn.properties, '$.file_path') AS file_path,
+       json_extract(e.properties, '$.from_module') AS from_module
+FROM edges e
+JOIN nodes sn ON sn.graph_id = e.graph_id AND sn.id = e.source
+WHERE e.graph_id = ?
+  AND e.rel_type = 'IMPORTS_SYMBOL'
+  AND json_extract(sn.properties, '$.file_path') IS NOT NULL
+  AND json_extract(e.properties, '$.from_module') IS NOT NULL
+  AND json_extract(e.properties, '$.from_module') != ''
+"""
+
+
+def _module_name_candidates(rel_path: str) -> set[str]:
+    """Dotted module-name spellings a file's path could appear as in a
+    ``from <module> import ...`` statement.
+
+    Mirrors the extractor's own naming (:func:`_module_name_from_path` in
+    ``languages/python_ast/extractor.py``) PLUS the un-stripped form, since
+    import statements are written by hand and may or may not include a `src`
+    source-root prefix (both ``from src.core import x`` and
+    ``from core import x`` occur in the wild depending on how the package is
+    installed/run).
+    """
+    stem = rel_path[:-len(".py")] if rel_path.endswith(".py") else rel_path
+    if stem.endswith("/__init__"):
+        stem = stem[: -len("/__init__")]
+    dotted = stem.replace("/", ".")
+    candidates = {dotted}
+    if dotted.startswith("src."):
+        candidates.add(dotted[len("src."):])
+    return candidates
+
+
+def _audit_public_surfaces(
+    files: list[str],
+    dep_edges: list[tuple[str, str]],
+    import_edges: list[tuple[str, str]],
+    modules_with_surfaces: dict[str, ModuleSpec],
+    arch_config: ArchitectureConfig,
+) -> list[dict[str, Any]]:
+    """Pure facade/encapsulation report over resolved file->file dep edges.
+
+    For each module with a declared ``public_surfaces`` list: which of its
+    files ARE the surface, which external consumers go through the surface vs.
+    deep-import an internal, which surface files have zero external consumers,
+    which internals have high external fan-in (promotion candidates), and
+    whether the surface is a barrel that hides nothing (the module owns no
+    internal files beyond its declared surface).
+
+    ``dep_edges`` (file->file, SCIP/CALLS-resolved -- ``_DEP_EDGE_SQL``) drives
+    consumer EXISTENCE and fan-in counts, but its edge target is always the
+    symbol's *definition* file, even when the caller imported it through a
+    re-exporting facade -- so it cannot by itself distinguish "went through the
+    surface" from "reached the internal directly". ``import_edges``
+    (importing file, dotted ``from_module`` of its ``from X import Y``
+    statement -- ``IMPORTS_SYMBOL``/``IMPORTS``) supplies that missing signal:
+    it is matched against each file's own possible dotted-module spellings to
+    recover which *declared* module path the consumer actually wrote in source.
+    """
+    all_files = set(files)
+    reports: list[dict[str, Any]] = []
+
+    # module-name -> file path, built once over every file the graph knows about.
+    name_to_file: dict[str, str] = {}
+    for f in all_files:
+        for name in _module_name_candidates(f):
+            name_to_file[name] = f
+
+    # For each importing file, the set of file paths its `from_module`s resolve
+    # to -- i.e. what it literally imported from, regardless of which symbol
+    # inside eventually got called.
+    imported_files_by_consumer: dict[str, set[str]] = {}
+    for src, from_module in import_edges:
+        target = name_to_file.get(from_module)
+        if target is not None:
+            imported_files_by_consumer.setdefault(src, set()).add(target)
+
+    # External-consumer candidates: any file with at least one dep edge or
+    # import edge, so a consumer is never missed just because one of the two
+    # signals didn't fire for it.
+    consumer_candidates = {src for src, _ in dep_edges} | {src for src, _ in import_edges}
+
+    for mod_name, spec in modules_with_surfaces.items():
+        # public_surfaces entries are glob patterns (mirrors ModuleSpec.paths),
+        # so membership is a glob match, not exact-string containment.
+        surface_files = sorted(
+            f for f in all_files
+            if arch_config.module_of(f) == mod_name
+            and any(fnmatch.fnmatch(f, pat) for pat in spec.public_surfaces)
+        )
+        internal_files = sorted(
+            f for f in all_files
+            if arch_config.module_of(f) == mod_name and f not in surface_files
+        )
+        surface_set, internal_set = set(surface_files), set(internal_files)
+
+        # Fan-in still comes from the resolved dep-edge graph (it answers "does
+        # an external file reach this internal's SYMBOLS at all", independent
+        # of which module path it imported through).
+        fan_in: dict[str, set[str]] = {f: set() for f in internal_files}
+        for src, dst in dep_edges:
+            if dst in internal_set and arch_config.module_of(src) != mod_name:
+                fan_in[dst].add(src)
+
+        via_surface: set[tuple[str, str]] = set()
+        deep_import: set[tuple[str, str]] = set()
+        surface_consumers: dict[str, set[str]] = {f: set() for f in surface_files}
+
+        for src in consumer_candidates:
+            if arch_config.module_of(src) == mod_name:
+                continue  # internal-to-internal traffic isn't a consumer
+            imported = imported_files_by_consumer.get(src, set())
+            for surface in imported & surface_set:
+                via_surface.add((src, surface))
+                surface_consumers[surface].add(src)
+            for internal in imported & internal_set:
+                deep_import.add((src, internal))
+
+        unused_public_exports = sorted(f for f in surface_files if not surface_consumers[f])
+        high_fan_in_internals = sorted(
+            (
+                {"internal": f, "external_fan_in": len(consumers)}
+                for f, consumers in fan_in.items()
+                if len(consumers) >= _HIGH_FAN_IN_THRESHOLD
+            ),
+            key=lambda r: (-r["external_fan_in"], r["internal"]),
+        )
+
+        reports.append(
+            {
+                "module": mod_name,
+                "public_exports": surface_files,
+                "via_surface_consumers": [
+                    {"consumer": c, "surface": s} for c, s in sorted(via_surface)
+                ],
+                "deep_import_consumers": [
+                    {"consumer": c, "internal": i} for c, i in sorted(deep_import)
+                ],
+                "unused_public_exports": unused_public_exports,
+                "high_fan_in_internals": high_fan_in_internals,
+                # A barrel with no encapsulation value: the surface hides zero
+                # internal files, i.e. the module owns nothing beyond what it
+                # already exports.
+                "is_all_exporting_barrel": len(internal_files) == 0,
+            }
+        )
+
+    return reports
 
 
 # ---------------------------------------------------------------------------
@@ -1249,6 +1419,88 @@ class ToolRegistry:
                 f"Dependency matrix ({input.group_by}): {len(matrix.nodes)} nodes, "
                 f"{len(matrix.edges)} edges"
             ),
+        )
+
+    async def handle_audit_public_surfaces(
+        self, input: AuditPublicSurfacesInput
+    ) -> AuditPublicSurfacesOutput:
+        """Facade/encapsulation audit over declared `public_surfaces`.
+
+        Read-only report over the same file->file dep-edge SSOT as
+        :func:`~ariadne_graph.core.architecture.persist_architecture_diagnostics`
+        (``_DEP_EDGE_SQL``/``_FILE_SQL``) plus the declared
+        :class:`~ariadne_graph.core.architecture_config.ArchitectureConfig`.
+        Meaningless without a declared ``public_surfaces`` list, so with no
+        `.ariadne/architecture.yml` (or no module declares surfaces) this
+        returns an empty report and says why.
+        """
+        repo_path = str(Path(input.repo_path).resolve())
+        graph_id = self._get_graph_id(repo_path)
+
+        arch_config = load_architecture_config(Path(repo_path))
+        if arch_config is None:
+            return AuditPublicSurfacesOutput(
+                modules=[],
+                message=(
+                    "No .ariadne/architecture.yml found. This audit requires "
+                    "declared public_surfaces per module -- see "
+                    "ArchitectureConfig.public_surfaces."
+                ),
+            )
+        modules_with_surfaces = {
+            name: spec for name, spec in arch_config.modules.items() if spec.public_surfaces
+        }
+        if not modules_with_surfaces:
+            return AuditPublicSurfacesOutput(
+                modules=[],
+                message=(
+                    ".ariadne/architecture.yml declares no public_surfaces on "
+                    "any module. This audit requires at least one module with "
+                    "a declared public_surfaces list."
+                ),
+            )
+
+        exists = await self._graph_exists(graph_id)
+        if not exists:
+            return AuditPublicSurfacesOutput(
+                modules=[], message="Repository has not been indexed yet"
+            )
+        if not isinstance(self.graph_store, SQLiteGraphStore):
+            return AuditPublicSurfacesOutput(
+                modules=[],
+                message="Public-surfaces audit requires the SQLite store (dep-edge join is SQL).",
+            )
+
+        db = await self.graph_store._connect()
+        try:
+            file_cursor = await db.execute(_FILE_SQL, (graph_id,))
+            file_rows = await file_cursor.fetchall()
+            dep_cursor = await db.execute(_DEP_EDGE_SQL, (graph_id,))
+            dep_rows = await dep_cursor.fetchall()
+            import_cursor = await db.execute(_IMPORT_FROM_MODULE_SQL, (graph_id,))
+            import_rows = await import_cursor.fetchall()
+        finally:
+            await db.close()
+
+        files = [_rel(r["file_path"], repo_path) for r in file_rows]
+        dep_edges = [(_rel(r["sf"], repo_path), _rel(r["tf"], repo_path)) for r in dep_rows]
+        # (importing file, dotted from_module) -- the literal `from X import Y`
+        # module path, the ONLY signal that survives past symbol resolution to
+        # tell a via-surface import from a deep one (see _audit_public_surfaces
+        # docstring: the resolved CALLS edge target is the symbol's *definition*
+        # site regardless of which module path the caller imported through).
+        import_edges = [
+            (_rel(r["file_path"], repo_path), r["from_module"])
+            for r in import_rows
+            if r["from_module"]
+        ]
+
+        modules = _audit_public_surfaces(
+            files, dep_edges, import_edges, modules_with_surfaces, arch_config
+        )
+        return AuditPublicSurfacesOutput(
+            modules=modules,
+            message=f"Audited {len(modules)} module(s) with declared public_surfaces",
         )
 
     async def handle_list_communities(self, input: ListCommunitiesInput) -> CommunitiesOutput:

@@ -148,6 +148,12 @@ class GetDependencyMatrixInput(BaseModel):
     )
 
 
+class AuditPublicSurfacesInput(BaseModel):
+    """Input for code_graph_audit_public_surfaces tool."""
+
+    repo_path: str = Field(description="Absolute or relative path to repository root")
+
+
 class ListCommunitiesInput(BaseModel):
     """Input for code_graph_list_communities tool."""
 
@@ -345,6 +351,27 @@ class DependencyMatrixOutput(BaseModel):
     nodes: list[dict[str, Any]] = Field(default_factory=list, description="Matrix nodes: id, module, production")
     edges: list[dict[str, Any]] = Field(
         default_factory=list, description="Matrix edges: source, target, import_count, violation_count"
+    )
+    message: str = Field(default="", description="Human-readable status message")
+
+
+class AuditPublicSurfacesOutput(BaseModel):
+    """Output for code_graph_audit_public_surfaces tool.
+
+    Per-module facade/encapsulation report. Requires a declared
+    ``public_surfaces`` list in `.ariadne/architecture.yml` -- with no config
+    present, ``modules`` is empty and ``message`` explains why.
+    """
+
+    modules: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "One report per declared module: 'module', 'public_exports', "
+            "'via_surface_consumers' (list of {consumer, surface}), "
+            "'deep_import_consumers' (list of {consumer, internal}), "
+            "'unused_public_exports', 'high_fan_in_internals' "
+            "(list of {internal, external_fan_in}), 'is_all_exporting_barrel'"
+        ),
     )
     message: str = Field(default="", description="Human-readable status message")
 

@@ -25,6 +25,7 @@ from ariadne_graph.graphstores.base import GraphStore, SearchableGraphStore
 from ariadne_graph.graphstores.factory import create_graph_store
 from ariadne_graph.languages.base import LanguageAdapter
 from ariadne_graph.mcp.schemas import (
+    AuditPublicSurfacesInput,
     CapabilitiesInput,
     DeleteProjectInput,
     DetectChangesInput,
@@ -408,6 +409,30 @@ async def code_graph_get_dependency_matrix(
     registry = _get_registry()
     input_data = GetDependencyMatrixInput(repo_path=repo_path, group_by=group_by)
     result = await registry.handle_get_dependency_matrix(input_data)
+    return result.model_dump()
+
+
+@mcp.tool()
+async def code_graph_audit_public_surfaces(repo_path: str) -> dict[str, Any]:
+    """Facade/encapsulation audit over declared `public_surfaces`.
+
+    For each module declaring `public_surfaces` in `.ariadne/architecture.yml`:
+    its public exports, which external consumers go through the surface vs.
+    deep-import an internal, unused public exports, internal files with high
+    external fan-in (promotion candidates), and whether the surface is an
+    all-exporting barrel with no real encapsulation value. Requires a declared
+    `public_surfaces` list -- with no `.ariadne/architecture.yml`, the message
+    explains this tool needs one.
+
+    Args:
+        repo_path: Absolute or relative path to the repository root.
+
+    Returns:
+        Dict with a per-module `modules` report list and a status `message`.
+    """
+    registry = _get_registry()
+    input_data = AuditPublicSurfacesInput(repo_path=repo_path)
+    result = await registry.handle_audit_public_surfaces(input_data)
     return result.model_dump()
 
 
