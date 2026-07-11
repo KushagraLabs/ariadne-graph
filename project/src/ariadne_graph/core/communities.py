@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import networkx as nx  # type: ignore[import-untyped]
 
+from ariadne_graph.core.architecture import PERIPHERAL_ORGANS, _dir_of, _organ
 from ariadne_graph.core.models import (
     ArchitectureSummary,
     CommunityInfo,
@@ -173,6 +174,96 @@ class CommunityAnalyzer:
 
         return await self.detect_communities(graph_id)
 
+    @staticmethod
+    def _is_test_node(node_data: dict[str, Any]) -> bool:
+        """Whether a node's file lives under a peripheral organ (tests/scripts)."""
+        file_path = node_data.get("properties", {}).get("file_path", "")
+        if not file_path:
+            return False
+        return _organ(_dir_of(file_path)) in PERIPHERAL_ORGANS
+
+    @staticmethod
+    def _enrich_hotspot(
+        node_id: str,
+        digraph: nx.DiGraph,
+        node_lookup: dict[str, dict[str, Any]],
+        *,
+        metric_type: str,
+        score: float,
+        community_id: int | None,
+    ) -> HotspotInfo:
+        """Build a ``HotspotInfo`` with internal/external coupling detail.
+
+        "Internal" edges are those whose neighbor shares this node's
+        ``file_path`` (e.g. same-file helper calls); "external" edges cross
+        into a different file. Shared by :meth:`find_hotspots` and
+        :meth:`get_architecture_summary` so both surface identical semantics.
+        """
+        node_data = node_lookup.get(node_id, {})
+        props = node_data.get("properties", {})
+        name = props.get("name", node_id.split(".")[-1] if "." in node_id else node_id)
+        file_path = props.get("file_path", "")
+
+        neighbors: list[tuple[str, str]] = []  # (neighbor_id, direction)
+        for _src, tgt in digraph.out_edges(node_id):
+            neighbors.append((tgt, "out"))
+        for src, _tgt in digraph.in_edges(node_id):
+            neighbors.append((src, "in"))
+
+        internal_refs = 0
+        external_refs = 0
+        imported_files: list[str] = []  # files this node's out-edges reach
+        importing_files: list[str] = []  # files whose nodes reach into this one
+        external_modules: set[str] = set()
+        prod_refs = 0
+        test_refs = 0
+
+        for neighbor_id, direction in neighbors:
+            neighbor_data = node_lookup.get(neighbor_id, {})
+            neighbor_fp = neighbor_data.get("properties", {}).get("file_path", "")
+
+            if neighbor_fp and neighbor_fp == file_path:
+                internal_refs += 1
+            else:
+                external_refs += 1
+                if neighbor_fp:
+                    external_modules.add(neighbor_fp)
+                    if direction == "out" and neighbor_fp not in imported_files:
+                        imported_files.append(neighbor_fp)
+                    if direction == "in" and neighbor_fp not in importing_files:
+                        importing_files.append(neighbor_fp)
+
+            if CommunityAnalyzer._is_test_node(neighbor_data):
+                test_refs += 1
+            else:
+                prod_refs += 1
+
+        file_fan_in = digraph.in_degree(node_id) if digraph.has_node(node_id) else 0
+        file_fan_out = digraph.out_degree(node_id) if digraph.has_node(node_id) else 0
+
+        return HotspotInfo(
+            node_id=node_id,
+            node_name=name,
+            file_path=file_path,
+            metric_type=metric_type,
+            score=score,
+            community_id=community_id,
+            internal_refs=internal_refs,
+            external_refs=external_refs,
+            imported_files=imported_files,
+            importing_files=importing_files,
+            external_modules=sorted(external_modules),
+            symbol_ref_count=internal_refs + external_refs,
+            file_fan_in=int(file_fan_in),
+            file_fan_out=int(file_fan_out),
+            prod_refs=prod_refs,
+            test_refs=test_refs,
+            score_formula=(
+                f"{metric_type} metric over graph degree/centrality; "
+                "internal_refs/external_refs split by shared file_path"
+            ),
+        )
+
     async def get_architecture_summary(
         self, graph_id: str
     ) -> ArchitectureSummary:
@@ -271,16 +362,11 @@ class CommunityAnalyzer:
 
         hotspots: list[HotspotInfo] = []
         for node_id, degree in sorted_by_degree:
-            node_data = node_lookup.get(node_id, {})
-            props = node_data.get("properties", {})
-            name = props.get("name", node_id.split(".")[-1] if "." in node_id else node_id)
-            file_path = props.get("file_path", "")
-
             hotspots.append(
-                HotspotInfo(
-                    node_id=node_id,
-                    node_name=name,
-                    file_path=file_path,
+                self._enrich_hotspot(
+                    node_id,
+                    digraph,
+                    node_lookup,
                     metric_type="complexity",
                     score=float(degree),
                     community_id=assignments.get(node_id),
@@ -307,6 +393,7 @@ class CommunityAnalyzer:
         graph_id: str,
         top_n: int = 10,
         metric: str = "complexity",
+        include_tests: bool = False,
     ) -> list[HotspotInfo]:
         """Find code hotspots using graph centrality metrics.
 
@@ -316,6 +403,9 @@ class CommunityAnalyzer:
             metric: Metric to use — "complexity" (degree centrality),
                     "coupling" (approximated betweenness centrality),
                     "fan_in" (in-degree), "fan_out" (out-degree).
+            include_tests: When False (default), hotspots whose file lives
+                    under a peripheral organ (tests/scripts, per
+                    ``architecture.PERIPHERAL_ORGANS``) are excluded.
 
         Returns:
             List of hotspot info ranked by the chosen metric.
@@ -358,21 +448,22 @@ class CommunityAnalyzer:
             undirected = digraph.to_undirected()
             scores = await asyncio.to_thread(nx.degree_centrality, undirected)
 
-        # Sort and build results
+        # Sort, optionally exclude peripheral organs, then take top_n.
         sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        if not include_tests:
+            sorted_scores = [
+                (node_id, score)
+                for node_id, score in sorted_scores
+                if not self._is_test_node(node_lookup.get(node_id, {}))
+            ]
 
         hotspots: list[HotspotInfo] = []
         for node_id, score in sorted_scores[:top_n]:
-            node_data = node_lookup.get(node_id, {})
-            props = node_data.get("properties", {})
-            name = props.get("name", node_id.split(".")[-1] if "." in node_id else node_id)
-            file_path = props.get("file_path", "")
-
             hotspots.append(
-                HotspotInfo(
-                    node_id=node_id,
-                    node_name=name,
-                    file_path=file_path,
+                self._enrich_hotspot(
+                    node_id,
+                    digraph,
+                    node_lookup,
                     metric_type=metric,
                     score=round(score, 6),
                     community_id=assignments.get(node_id),

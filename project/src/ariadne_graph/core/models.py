@@ -120,6 +120,23 @@ class HotspotInfo(BaseModel):
     score: float = 0.0
     community_id: int | None = None
 
+    # Internal-vs-external coupling split (bead 88y). "Internal" = neighbor
+    # lives in the same file as this hotspot (e.g. same-file helper calls);
+    # "external" = neighbor lives in a different file. Splitting the two
+    # keeps a large, self-referential file from being misread as having high
+    # cross-domain coupling when most of its edges never leave the file.
+    internal_refs: int = 0
+    external_refs: int = 0
+    imported_files: list[str] = Field(default_factory=list)
+    importing_files: list[str] = Field(default_factory=list)
+    external_modules: list[str] = Field(default_factory=list)
+    symbol_ref_count: int = 0
+    file_fan_in: int = 0
+    file_fan_out: int = 0
+    prod_refs: int = 0
+    test_refs: int = 0
+    score_formula: str = ""
+
 
 class ImpactAnalysisResult(BaseModel):
     """Result of impact analysis for a change."""
