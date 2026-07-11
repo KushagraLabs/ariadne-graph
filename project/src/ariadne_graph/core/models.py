@@ -98,6 +98,8 @@ class ArchitectureSummary(BaseModel):
     total_entities: int
     communities: list[CommunityInfo] = Field(default_factory=list)
     hotspots: list[HotspotInfo] = Field(default_factory=list)
+    granularity: str = "symbol"
+    modularity: float | None = None
 
 
 class CommunityInfo(BaseModel):
@@ -108,6 +110,7 @@ class CommunityInfo(BaseModel):
     representative_files: list[str] = Field(default_factory=list)
     internal_edge_density: float = 0.0
     external_coupling: dict[int, int] = Field(default_factory=dict)
+    label: str = ""
 
 
 class HotspotInfo(BaseModel):

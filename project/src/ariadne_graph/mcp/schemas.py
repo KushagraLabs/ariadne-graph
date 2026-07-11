@@ -108,6 +108,10 @@ class GetArchitectureInput(BaseModel):
     """Input for code_graph_get_architecture tool."""
 
     repo_path: str = Field(description="Absolute or relative path to repository root")
+    granularity: str = Field(
+        default="symbol",
+        description='Community granularity: "symbol" (default) or "file"',
+    )
 
 
 class ListCommunitiesInput(BaseModel):
@@ -115,6 +119,10 @@ class ListCommunitiesInput(BaseModel):
 
     repo_path: str = Field(description="Absolute or relative path to repository root")
     community_id: int | None = Field(default=None, description="Filter to a specific community")
+    granularity: str = Field(
+        default="symbol",
+        description='Community granularity: "symbol" (default) or "file"',
+    )
 
 
 class InspectFileInput(BaseModel):

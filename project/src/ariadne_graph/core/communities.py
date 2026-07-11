@@ -95,7 +95,60 @@ class CommunityAnalyzer:
         self._cache[graph_id] = (digraph, node_lookup, None)
         return digraph, node_lookup
 
-    async def detect_communities(self, graph_id: str) -> dict[str, int]:
+    @staticmethod
+    def _file_projection(
+        digraph: nx.DiGraph,
+        node_lookup: dict[str, dict[str, Any]],
+        exclude_external: bool = True,
+    ) -> nx.DiGraph:
+        """Project the symbol-level graph onto a file->file graph.
+
+        Every symbol node is mapped to its ``properties.file_path``. Nodes
+        with no file_path (external/library symbols) are dropped when
+        ``exclude_external`` is True — the default, since those are not
+        repo files and would otherwise pollute file-granularity communities.
+        Edges between two symbols in different files collapse into a single
+        file->file edge (parallel edges merged; NetworkX DiGraph semantics).
+        Self-edges (same-file references) are dropped, since they carry no
+        cross-file coupling signal at file granularity.
+
+        Args:
+            digraph: The raw symbol-level graph (SSOT, unmodified).
+            node_lookup: node_id -> node_data (labels/properties) lookup.
+            exclude_external: Drop nodes with an empty file_path.
+
+        Returns:
+            A new DiGraph keyed by file_path.
+        """
+        file_graph: nx.DiGraph = nx.DiGraph()
+
+        def file_of(node_id: str) -> str:
+            return node_lookup.get(node_id, {}).get("properties", {}).get("file_path", "")
+
+        for node_id in digraph.nodes():
+            fp = file_of(node_id)
+            if not fp and exclude_external:
+                continue
+            file_graph.add_node(fp)
+
+        for src, tgt in digraph.edges():
+            src_fp = file_of(src)
+            tgt_fp = file_of(tgt)
+            if exclude_external and (not src_fp or not tgt_fp):
+                continue
+            if not src_fp or not tgt_fp or src_fp == tgt_fp:
+                continue
+            file_graph.add_edge(src_fp, tgt_fp)
+
+        return file_graph
+
+    async def detect_communities(
+        self,
+        graph_id: str,
+        granularity: str = "symbol",
+        exclude_external: bool = True,
+        resolution: float = 1.0,
+    ) -> dict[str, int]:
         """Detect communities using the Louvain algorithm.
 
         1. Load the graph (or use cached copy).
@@ -104,10 +157,23 @@ class CommunityAnalyzer:
 
         Args:
             graph_id: The repository graph identifier.
+            granularity: "symbol" (default, raw SCIP symbol nodes — unchanged
+                    behavior) or "file" (project onto file->file edges first,
+                    per :meth:`_file_projection`).
+            exclude_external: File granularity only — drop nodes with no repo
+                    file_path (library/external symbols).
+            resolution: Louvain resolution parameter (higher = more, smaller
+                    communities).
 
         Returns:
-            Mapping of node_id -> community_id.
+            Mapping of node_id -> community_id (symbol granularity) or
+            file_path -> community_id (file granularity).
         """
+        if granularity == "file":
+            return await self._detect_communities_file(
+                graph_id, exclude_external=exclude_external, resolution=resolution
+            )
+
         digraph, _node_lookup = await self._load_graph(graph_id)
 
         if digraph.number_of_nodes() == 0:
@@ -144,6 +210,78 @@ class CommunityAnalyzer:
             graph_id,
             digraph.number_of_nodes(),
             digraph.number_of_edges(),
+        )
+
+        return assignments
+
+    @staticmethod
+    async def _file_modularity(
+        file_graph: nx.DiGraph, assignments: dict[str, int]
+    ) -> float | None:
+        """Louvain modularity of a file-granularity partition, or None if
+        the graph has no edges (modularity is undefined without edges)."""
+        if file_graph.number_of_edges() == 0:
+            return None
+        try:
+            import community as community_louvain  # type: ignore[import-untyped]
+
+            undirected = file_graph.to_undirected()
+            return cast(
+                float,
+                await asyncio.to_thread(
+                    community_louvain.modularity, assignments, undirected
+                ),
+            )
+        except ImportError:
+            return None
+
+    async def _detect_communities_file(
+        self,
+        graph_id: str,
+        exclude_external: bool = True,
+        resolution: float = 1.0,
+    ) -> dict[str, int]:
+        """File-granularity community detection (see :meth:`detect_communities`).
+
+        Runs Louvain over the file->file projection (:meth:`_file_projection`)
+        of the raw symbol graph. Does not touch ``_load_graph``'s cache or
+        ``graph_store.set_communities`` — those remain the symbol-level SSOT;
+        this is a derived, on-demand view.
+        """
+        digraph, node_lookup = await self._load_graph(graph_id)
+        file_graph = self._file_projection(digraph, node_lookup, exclude_external)
+
+        if file_graph.number_of_nodes() == 0:
+            return {}
+
+        if file_graph.number_of_edges() == 0:
+            return dict.fromkeys(file_graph.nodes(), 0)
+
+        undirected = file_graph.to_undirected()
+        try:
+            import community as community_louvain  # type: ignore[import-untyped]
+
+            assignments = cast(
+                dict[str, int],
+                await asyncio.to_thread(
+                    community_louvain.best_partition,
+                    undirected,
+                    resolution=resolution,
+                ),
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "python-louvain is required for community detection. "
+                "Install with: pip install python-louvain"
+            ) from exc
+
+        logger.info(
+            "Detected %d file-granularity communities in graph %s "
+            "(%d files, %d file-file edges)",
+            len(set(assignments.values())),
+            graph_id,
+            file_graph.number_of_nodes(),
+            file_graph.number_of_edges(),
         )
 
         return assignments
@@ -265,7 +403,7 @@ class CommunityAnalyzer:
         )
 
     async def get_architecture_summary(
-        self, graph_id: str
+        self, graph_id: str, granularity: str = "symbol"
     ) -> ArchitectureSummary:
         """Generate an architecture summary from community detection.
 
@@ -277,12 +415,25 @@ class CommunityAnalyzer:
 
         Args:
             graph_id: The repository graph identifier.
+            granularity: "symbol" (default, unchanged behavior) or "file" —
+                    communities and coupling are computed over the file->file
+                    projection (:meth:`_file_projection`) instead of raw
+                    symbols. Hotspots always remain symbol-level.
 
         Returns:
             ArchitectureSummary with community info and hotspots.
         """
-        assignments = await self.get_community_assignments(graph_id)
-        digraph, node_lookup = await self._load_graph(graph_id)
+        raw_digraph, node_lookup = await self._load_graph(graph_id)
+        modularity: float | None = None
+
+        if granularity == "file":
+            assignments = await self._detect_communities_file(graph_id)
+            digraph = self._file_projection(raw_digraph, node_lookup)
+            if assignments:
+                modularity = await self._file_modularity(digraph, assignments)
+        else:
+            assignments = await self.get_community_assignments(graph_id)
+            digraph = raw_digraph
 
         community_groups: dict[int, list[str]] = {}
         for node_id, cid in assignments.items():
@@ -338,10 +489,22 @@ class CommunityAnalyzer:
             )[:5]
             rep_files = []
             for node_id, _ in top_nodes:
-                props = node_lookup.get(node_id, {}).get("properties", {})
-                fp = props.get("file_path", "")
+                if granularity == "file":
+                    # node_id IS the file path at file granularity.
+                    fp = node_id
+                else:
+                    props = node_lookup.get(node_id, {}).get("properties", {})
+                    fp = props.get("file_path", "")
                 if fp and fp not in rep_files:
                     rep_files.append(fp)
+
+            # Label by dominant directory/organ among representative files.
+            organ_counts: dict[str, int] = {}
+            for fp in rep_files:
+                organ = _organ(_dir_of(fp))
+                if organ:
+                    organ_counts[organ] = organ_counts.get(organ, 0) + 1
+            label = max(organ_counts, key=lambda k: organ_counts[k]) if organ_counts else ""
 
             communities.append(
                 CommunityInfo(
@@ -350,12 +513,26 @@ class CommunityAnalyzer:
                     representative_files=rep_files[:5],
                     internal_edge_density=round(density, 4),
                     external_coupling=external_edges,
+                    label=label,
                 )
             )
 
-        # Identify hotspots: highest total degree nodes
+        # Identify hotspots: highest total degree symbol nodes (always
+        # symbol-level, even when granularity="file" — hotspots rank
+        # individual code entities, not whole files).
+        symbol_in_degrees = dict(raw_digraph.in_degree())
+        symbol_out_degrees = dict(raw_digraph.out_degree())
+        symbol_total_degrees = {
+            node: symbol_in_degrees.get(node, 0) + symbol_out_degrees.get(node, 0)
+            for node in raw_digraph.nodes()
+        }
+        symbol_assignments = (
+            await self.get_community_assignments(graph_id)
+            if granularity == "file"
+            else assignments
+        )
         sorted_by_degree = sorted(
-            total_degrees.items(),
+            symbol_total_degrees.items(),
             key=lambda x: x[1],
             reverse=True,
         )[:20]
@@ -365,11 +542,11 @@ class CommunityAnalyzer:
             hotspots.append(
                 self._enrich_hotspot(
                     node_id,
-                    digraph,
+                    raw_digraph,
                     node_lookup,
                     metric_type="complexity",
                     score=float(degree),
-                    community_id=assignments.get(node_id),
+                    community_id=symbol_assignments.get(node_id),
                 )
             )
 
@@ -380,12 +557,20 @@ class CommunityAnalyzer:
             if fp:
                 all_files.add(fp)
 
+        total_entities = (
+            raw_digraph.number_of_nodes()
+            if granularity == "file"
+            else len(all_community_nodes)
+        )
+
         return ArchitectureSummary(
             total_communities=len(community_groups),
             total_files=len(all_files),
-            total_entities=len(all_community_nodes),
+            total_entities=total_entities,
             communities=communities,
             hotspots=hotspots,
+            granularity=granularity,
+            modularity=modularity,
         )
 
     async def find_hotspots(
