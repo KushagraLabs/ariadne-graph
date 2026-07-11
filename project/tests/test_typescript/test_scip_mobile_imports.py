@@ -1,9 +1,18 @@
-"""Mobile/.tsx files still emit per-file IMPORTS_SYMBOL edges (bead c66).
+"""Translator IMPORT-role handling for a subproject-prefixed file (unit).
 
-The mobile subtree and some server entrypoints (e.g. server/index.ts) were
-getting ZERO IMPORTS_SYMBOL edges. This pins the invariant that an import
-occurrence in a subproject-prefixed ``.tsx`` file produces an IMPORTS_SYMBOL
-edge whose ``owner_file_path`` is the correct (prefix-rebased) absolute path.
+SCOPE / CAVEAT: this drives ``ScipGraphTranslator`` with a SYNTHETIC
+``SymbolRole.IMPORT`` occurrence. Real ``scip-typescript`` (v0.4.0) does NOT set
+the IMPORT role on any occurrence, so this exercises the translator's is_import
+branch IN ISOLATION -- a contract that only fires *if* SCIP ever emits the role.
+It is NOT coverage of how mobile imports actually reach the graph today; the live
+path grafts Tree-sitter imports in the enricher and is covered end-to-end (real
+scip-typescript) by ``test_scip_subproject_imports_e2e.py``. See bead
+code_hygiene_mcp-qb9 for why this distinction matters (a synthetic-input test
+that "passes immediately" once masked c66 being broken on the live graph).
+
+What this pins: given an IMPORT-role occurrence in a subproject-prefixed file,
+the translator emits an IMPORTS_SYMBOL edge whose ``owner_file_path`` is the
+prefix-rebased absolute path and whose relative import resolves to the sibling.
 """
 
 from __future__ import annotations
@@ -22,7 +31,11 @@ BUTTON = "scip-typescript npm mobileapp 1.0.0 src/`Button.tsx`/Button#"
 
 
 def _screen_doc() -> ScipDocument:
-    """A mobile-style .tsx screen importing a sibling component."""
+    """A mobile-style .tsx screen with a SYNTHETIC IMPORT-role occurrence.
+
+    NOTE: real scip-typescript never sets SymbolRole.IMPORT; this is a
+    hand-built input to exercise the translator's is_import branch only.
+    """
     return ScipDocument(
         relative_path=Path("src/Screen.tsx"),
         language="typescript",
@@ -40,7 +53,8 @@ def _screen_doc() -> ScipDocument:
     )
 
 
-def test_mobile_tsx_emits_imports_symbol_edge(tmp_path: Path) -> None:
+def test_translator_import_role_emits_prefix_rebased_edge(tmp_path: Path) -> None:
+    # Synthetic IMPORT-role input; real-path mobile coverage is in the e2e test.
     # Subproject layout: <repo>/mobile/src/*.tsx
     (tmp_path / "mobile" / "src").mkdir(parents=True)
     (tmp_path / "mobile" / "src" / "Button.tsx").write_text("export class Button {}\n")

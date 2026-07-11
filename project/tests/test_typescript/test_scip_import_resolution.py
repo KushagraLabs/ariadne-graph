@@ -1,14 +1,16 @@
-"""Relative-import IMPORTS_SYMBOL edges resolve to a target file (bead p25).
+"""Translator resolves an IMPORT-role symbol to its target file (unit).
 
-SCIP import occurrences never carried a resolved target, so ``resolved_source``
-was non-null on only ~0.4% of ``IMPORTS_SYMBOL`` edges and file-to-file
-dependency queries came up empty for TypeScript.
+SCOPE / CAVEAT: this drives ``ScipGraphTranslator`` with a SYNTHETIC
+``SymbolRole.IMPORT`` occurrence. Real ``scip-typescript`` (v0.4.0) does NOT set
+the IMPORT role, so this exercises the translator's resolution branch IN
+ISOLATION -- it is NOT how ``resolved_source`` gets onto the live graph today
+(that comes from the enricher grafting Tree-sitter imports, covered end-to-end by
+``test_scip_subproject_imports_e2e.py``). See bead code_hygiene_mcp-qb9.
 
-For a relative/local import the imported SCIP *symbol* already embeds the
-target file path (``scip-... src/`util.ts`/helper().``). The translator resolves
-that to the real repo file and records ``resolved_source`` (absolute path) on
-the CodeImport node and the IMPORTS_SYMBOL edge — matching the property name the
-Tree-sitter extractor already emits.
+What this pins: given an IMPORT-role occurrence whose SCIP symbol embeds a target
+file path (``scip-... src/`util.ts`/helper().``), the translator resolves it to
+the real repo file and records ``resolved_source`` (absolute path) on both the
+CodeImport node and the IMPORTS_SYMBOL edge.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ HELPER = "scip-typescript npm app 1.0.0 src/`util.ts`/helper()."
 
 
 def _importing_doc() -> ScipDocument:
+    # SYNTHETIC IMPORT-role occurrence: real scip-typescript never sets this bit.
     return ScipDocument(
         relative_path=Path("src/main.ts"),
         language="typescript",
@@ -43,7 +46,8 @@ def _importing_doc() -> ScipDocument:
     )
 
 
-def test_relative_import_resolves_to_target_file(tmp_path: Path) -> None:
+def test_translator_import_role_resolves_to_target_file(tmp_path: Path) -> None:
+    # Synthetic IMPORT-role input; real-path resolution coverage is in the e2e test.
     (tmp_path / "src").mkdir(parents=True)
     (tmp_path / "src" / "util.ts").write_text("export const helper = 1;\n")
     (tmp_path / "src" / "main.ts").write_text("import { helper } from './util';\n")
