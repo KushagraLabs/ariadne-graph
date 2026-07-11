@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from pathlib import PurePosixPath
 from typing import Any
 
 from ariadne_graph.graphstores.base import GraphStore
@@ -24,6 +25,23 @@ from ariadne_graph.mcp.schemas import (
 logger = logging.getLogger(__name__)
 
 
+def _file_path_matches(node_data: dict[str, Any], query: str) -> bool:
+    """True if the node's file_path basename or relative path matches query.
+
+    Mirrors ``GraphRetriever._file_path_matches`` so the plain-GraphStore
+    fallback path resolves filenames the same way the SearchableGraphStore
+    path does (bead w2b).
+    """
+    file_path = node_data.get("properties", {}).get("file_path", "")
+    if not file_path:
+        return False
+    path = PurePosixPath(file_path.replace("\\", "/"))
+    query_norm = query.replace("\\", "/")
+    if path.name == query_norm:
+        return True
+    return "/" in query_norm and str(path).endswith("/" + query_norm.lstrip("/"))
+
+
 class GraphStoreFallbacks:
     """Minimal graph operations that work with a plain GraphStore backend."""
 
@@ -33,7 +51,14 @@ class GraphStoreFallbacks:
         graph_id: str,
         query: str,
     ) -> RetrieveOutput:
-        """Retrieve a node by id/name plus its neighbors and edges."""
+        """Retrieve a node by id/name plus its neighbors and edges.
+
+        Falls back to a file_path basename/relative-path match when nothing
+        matched the id directly (bead w2b). A single matching file resolves
+        to a ``found: True`` result; several distinct files sharing the
+        basename are surfaced as ``found: False`` with a ``candidates`` list
+        instead of guessing.
+        """
         results: list[dict[str, Any]] = []
 
         try:
@@ -44,6 +69,56 @@ class GraphStoreFallbacks:
                     results.append({"type": "node", "data": node_data})
         except Exception as exc:
             logger.warning("Fallback retrieve: nodes query failed for %s: %s", graph_id, exc)
+
+        if not results:
+            try:
+                nodes = await graph_store.query(graph_id, "nodes")
+                matches_by_file: dict[str, dict[str, Any]] = {}
+                for row in nodes:
+                    node_data = row.get("n", row)
+                    if not _file_path_matches(node_data, query):
+                        continue
+                    file_path = node_data.get("properties", {}).get("file_path", "")
+                    existing = matches_by_file.get(file_path)
+                    labels = set(node_data.get("labels", []) or [])
+                    is_module = bool(labels & {"CodeModule", "CodeFile"})
+                    if existing is None or (
+                        is_module
+                        and not (
+                            set(existing.get("labels", []) or [])
+                            & {"CodeModule", "CodeFile"}
+                        )
+                    ):
+                        matches_by_file[file_path] = node_data
+
+                file_matches = list(matches_by_file.values())
+                if len(file_matches) == 1:
+                    results.append({
+                        "type": "retrieve",
+                        "data": {
+                            "found": True,
+                            "query": query,
+                            "node": file_matches[0],
+                            "edges": {"outgoing": [], "incoming": []},
+                            "snippet": "",
+                        },
+                    })
+                elif len(file_matches) > 1:
+                    results.append({
+                        "type": "retrieve",
+                        "data": {
+                            "found": False,
+                            "query": query,
+                            "node": None,
+                            "edges": {"outgoing": [], "incoming": []},
+                            "snippet": "",
+                            "candidates": file_matches,
+                        },
+                    })
+            except Exception as exc:
+                logger.warning(
+                    "Fallback retrieve: file_path scan failed for %s: %s", query, exc
+                )
 
         try:
             neighbors = await graph_store.query(

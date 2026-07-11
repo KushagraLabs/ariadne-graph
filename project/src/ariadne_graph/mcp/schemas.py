@@ -8,6 +8,9 @@ from pydantic import BaseModel, Field
 
 from ariadne_graph.core.models import ProjectRecord
 
+# Bumped whenever a response shape changes in a way callers should notice.
+SCHEMA_VERSION = "1"
+
 # ============================================================================
 # Input schemas
 # ============================================================================
@@ -102,6 +105,13 @@ class FindHotspotsInput(BaseModel):
         default="complexity",
         description='Metric to rank by: "complexity", "coupling", "fan_in", "fan_out"',
     )
+    offset: int = Field(default=0, ge=0, description="Number of ranked hotspots to skip before returning top_n")
+    summary_only: bool = Field(
+        default=False, description="Return only counts (total/has_more), omitting the hotspot entries"
+    )
+    include_edges: bool = Field(
+        default=True, description="Reserved for parity with other paginated tools; hotspots carry no edges"
+    )
 
 
 class GetArchitectureInput(BaseModel):
@@ -111,6 +121,14 @@ class GetArchitectureInput(BaseModel):
     granularity: str = Field(
         default="symbol",
         description='Community granularity: "symbol" (default) or "file"',
+    )
+    limit: int = Field(default=50, ge=1, le=500, description="Maximum number of communities to return")
+    offset: int = Field(default=0, ge=0, description="Number of communities to skip before returning limit")
+    summary_only: bool = Field(
+        default=False, description="Return only aggregate counts, omitting the communities list"
+    )
+    include_edges: bool = Field(
+        default=True, description="Reserved for parity with other paginated tools; architecture carries no edges"
     )
 
 
@@ -137,6 +155,12 @@ class InspectFileInput(BaseModel):
 
     file_path: str = Field(description="Path of the file to inspect")
     graph_id: str | None = Field(default=None, description="Graph ID; derived from file_path if omitted")
+    limit: int = Field(default=200, ge=1, le=2000, description="Maximum number of nodes (and, independently, edges) to return")
+    offset: int = Field(default=0, ge=0, description="Number of nodes/edges to skip before returning limit")
+    summary_only: bool = Field(
+        default=False, description="Return only node/edge counts, omitting the nodes and edges lists"
+    )
+    include_edges: bool = Field(default=True, description="Whether to include the edges list in the response")
 
 
 class LumenRetrieveInput(BaseModel):
@@ -209,6 +233,7 @@ class RetrieveOutput(BaseModel):
     """Output for code_graph_retrieve tool."""
 
     results: list[dict[str, Any]] = Field(default_factory=list, description="Retrieved nodes and edges")
+    schema_version: str = Field(default=SCHEMA_VERSION, description="Response schema version")
 
 
 class LumenRetrieveOutput(RetrieveOutput):
@@ -273,14 +298,20 @@ class FindHotspotsOutput(BaseModel):
     """Output for code_graph_find_hotspots tool."""
 
     hotspots: list[dict[str, Any]] = Field(default_factory=list, description="Ranked hotspot entries")
+    total: int = Field(default=0, description="Total number of hotspots available before pagination")
+    has_more: bool = Field(default=False, description="Whether more hotspots exist beyond this page")
     message: str = Field(default="", description="Human-readable status message")
+    schema_version: str = Field(default=SCHEMA_VERSION, description="Response schema version")
 
 
 class ArchitectureOutput(BaseModel):
     """Output for code_graph_get_architecture tool."""
 
     summary: dict[str, Any] = Field(default_factory=dict, description="Architecture summary")
+    total: int = Field(default=0, description="Total number of communities available before pagination")
+    has_more: bool = Field(default=False, description="Whether more communities exist beyond this page")
     message: str = Field(default="", description="Human-readable status message")
+    schema_version: str = Field(default=SCHEMA_VERSION, description="Response schema version")
 
 
 class ExplainEdgeOutput(BaseModel):
@@ -311,7 +342,13 @@ class InspectFileOutput(BaseModel):
 
     nodes: list[dict[str, Any]] = Field(default_factory=list, description="Nodes in the file")
     edges: list[dict[str, Any]] = Field(default_factory=list, description="Edges in the file")
+    total_nodes: int = Field(default=0, description="Total number of nodes available before pagination")
+    total_edges: int = Field(default=0, description="Total number of edges available before pagination")
+    has_more: bool = Field(
+        default=False, description="Whether more nodes or edges exist beyond this page"
+    )
     message: str = Field(default="", description="Human-readable status message")
+    schema_version: str = Field(default=SCHEMA_VERSION, description="Response schema version")
 
 
 class ListDiagnosticsInput(BaseModel):

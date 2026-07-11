@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections import deque
+from pathlib import PurePosixPath
 from typing import Any, cast
 
 from ariadne_graph.core.models import ImpactAnalysisResult
@@ -51,6 +52,18 @@ class GraphRetriever:
         node_data = await self._resolve_symbol(graph_id, query)
 
         if node_data is None:
+            # Filename query that matched more than one file: surface
+            # candidates instead of silently guessing (bead w2b).
+            _, file_matches = await self._resolve_by_file_path(graph_id, query)
+            if len(file_matches) > 1:
+                return {
+                    "found": False,
+                    "query": query,
+                    "node": None,
+                    "edges": {"outgoing": [], "incoming": []},
+                    "snippet": "",
+                    "candidates": file_matches,
+                }
             return {
                 "found": False,
                 "query": query,
@@ -103,7 +116,14 @@ class GraphRetriever:
             direction: "outgoing", "incoming", or "both".
 
         Returns:
-            List of edge dictionaries.
+            List of edge dictionaries, each with source == node_id
+            (direction="outgoing") or target == node_id
+            (direction="incoming"). Direction is decided from each edge's
+            actual source/target relative to node_id, never from which
+            named query happened to return the row: some backend query
+            names (e.g. "node_edges" used as a fallback) are bidirectional,
+            so a naive "whichever query returned it" label can put an
+            incoming edge in the outgoing bucket and vice versa.
         """
         if direction == "outgoing":
             query_names = ["node_outgoing_edges", "node_edges"]
@@ -144,8 +164,21 @@ class GraphRetriever:
         edges: list[dict[str, Any]] = []
         for row in rows:
             edge_data = row.get("r", row)
-            if edge_data:
-                edges.append(edge_data)
+            if not edge_data:
+                continue
+            src = edge_data.get("source", "")
+            tgt = edge_data.get("target", "")
+            # Classify by the edge's own source/target relative to node_id,
+            # not by which named query produced the row (queries like
+            # "node_edges" are bidirectional and can return an edge where
+            # node_id is the target even when "outgoing" was requested).
+            if direction == "outgoing" and src != node_id:
+                continue
+            if direction == "incoming" and tgt != node_id:
+                continue
+            if direction == "both" and node_id not in (src, tgt):
+                continue
+            edges.append(edge_data)
 
         return edges
 
@@ -308,6 +341,57 @@ class GraphRetriever:
             return 600 + label_score
         return -1
 
+    @staticmethod
+    def _file_path_matches(node_data: dict[str, Any], query: str) -> bool:
+        """True if the node's file_path basename or relative path matches query."""
+        file_path = node_data.get("properties", {}).get("file_path", "")
+        if not file_path:
+            return False
+        path = PurePosixPath(file_path.replace("\\", "/"))
+        query_norm = query.replace("\\", "/")
+        if path.name == query_norm:
+            return True
+        # Relative-path suffix match, e.g. "src/schema.ts" matches
+        # ".../repo/src/schema.ts".
+        return "/" in query_norm and str(path).endswith("/" + query_norm.lstrip("/"))
+
+    async def _resolve_by_file_path(
+        self, graph_id: str, query: str
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """Match nodes whose file_path basename/relative path equals query.
+
+        Returns ``(node, all_matches)``. ``node`` is set only when exactly one
+        distinct file matches; when several distinct files share the same
+        basename, ``node`` is ``None`` and ``all_matches`` holds one
+        representative node per file so the caller can present candidates.
+        """
+        try:
+            all_nodes = await self.graph_store.query(graph_id, "nodes")
+        except Exception:
+            return None, []
+
+        matches_by_file: dict[str, dict[str, Any]] = {}
+        for row in all_nodes:
+            node_data = cast(dict[str, Any], row.get("n", row))
+            if not self._file_path_matches(node_data, query):
+                continue
+            file_path = node_data.get("properties", {}).get("file_path", "")
+            existing = matches_by_file.get(file_path)
+            # Prefer the module/file node over member symbols as the
+            # representative for a given file.
+            labels = set(node_data.get("labels", []) or [])
+            is_module = bool(labels & {"CodeModule", "CodeFile"})
+            if existing is None or (
+                is_module
+                and not (set(existing.get("labels", []) or []) & {"CodeModule", "CodeFile"})
+            ):
+                matches_by_file[file_path] = node_data
+
+        all_matches = list(matches_by_file.values())
+        if len(all_matches) == 1:
+            return all_matches[0], all_matches
+        return None, all_matches
+
     async def _resolve_symbol(
         self, graph_id: str, symbol: str
     ) -> dict[str, Any] | None:
@@ -363,6 +447,15 @@ class GraphRetriever:
         if candidates:
             candidates.sort(key=lambda x: x[0], reverse=True)
             return candidates[0][1]
+
+        # Filename fallback: no id/name/qualname matched. Try matching
+        # against nodes' file_path basename/relative path (bead w2b). Only
+        # returns a node when the filename maps to exactly one file —
+        # ambiguous matches are left for callers to handle explicitly
+        # (see retrieve_node, which surfaces them as candidates).
+        file_node, _ = await self._resolve_by_file_path(graph_id, symbol)
+        if file_node is not None:
+            return file_node
 
         return None
 
