@@ -238,6 +238,105 @@ export function run(): void {
         assert not any("helper" in m for m in unused_names), "helper() call should mark import used"
         assert not any("widget" in m for m in unused_names), "new widget() should mark import used"
 
+    def test_export_default_call_marks_import_used(self):
+        # Bead code_hygiene_mcp-bhe: `export default <call>(...)` puts the call
+        # under the export_statement's `value` field (not `declaration`), so the
+        # callee was never walked and its import was falsely flagged unused.
+        source = """
+import { defineConfig } from "drizzle-kit";
+import { unusedThing } from "./other";
+
+export default defineConfig({ out: "./x" });
+"""
+        delta = _extract(source, file_name="drizzle.config.ts")
+        unused = [
+            n
+            for n in delta.nodes
+            if "CodeDiagnostic" in n.labels and n.properties.get("rule") == "unused_import"
+        ]
+        unused_names = {n.properties.get("message", "") for n in unused}
+        assert not any("defineConfig" in m for m in unused_names), (
+            "export default defineConfig(...) should mark defineConfig used"
+        )
+        # Guard: a genuinely unused import in the same file is still reported.
+        assert any("unusedThing" in m for m in unused_names), (
+            "genuinely unused import must still be flagged"
+        )
+
+    def test_export_default_identifier_marks_import_used(self):
+        # Bead code_hygiene_mcp-bhe (codex follow-ups): a default export names an
+        # imported binding through arbitrary wrapping syntax -- bare identifier,
+        # parens, `as` cast, object shorthand. Each is a value-position use, but
+        # _visit_expression only marks call/new callees, so each must be handled.
+        # Every import below is referenced somewhere in the `export default`
+        # expression: bare shorthand (alpha), an `as` cast (gamma), a plain
+        # value (delta), and a parenthesized identifier (eps).
+        source = """
+import alpha from "./alpha";
+import gamma from "./gamma";
+import delta from "./delta";
+import eps from "./eps";
+import { unusedThing } from "./other";
+
+export default { alpha, wrapped: (gamma as Config), d: delta, e: (eps) };
+"""
+        delta = _extract(source, file_name="index.ts")
+        unused = [
+            n
+            for n in delta.nodes
+            if "CodeDiagnostic" in n.labels and n.properties.get("rule") == "unused_import"
+        ]
+        unused_names = {n.properties.get("message", "") for n in unused}
+        for used in ("alpha", "gamma", "delta", "eps"):
+            assert not any(f"'{used}'" in m for m in unused_names), (
+                f"{used} is referenced in the export default expression; not unused. "
+                f"unused={unused_names}"
+            )
+        # Guard: a genuinely unused import is still flagged.
+        assert any("unusedThing" in m for m in unused_names), (
+            "genuinely unused import must still be flagged"
+        )
+
+    def test_export_default_does_not_mark_shadowing_binding_used(self):
+        # codex follow-up: an import shadowed by a parameter inside a default
+        # export function is NOT a use of the import -- the walker must stop at
+        # scope boundaries so it doesn't suppress a real unused-import warning.
+        source = """
+import foo from "./foo";
+
+export default (foo) => foo;
+"""
+        delta = _extract(source, file_name="index.ts")
+        unused_names = {
+            n.properties.get("message", "")
+            for n in delta.nodes
+            if "CodeDiagnostic" in n.labels and n.properties.get("rule") == "unused_import"
+        }
+        assert any("'foo'" in m for m in unused_names), (
+            "foo is only a shadowing parameter here; the import IS unused and must be flagged"
+        )
+
+    def test_export_default_computed_member_marks_index_import_used(self):
+        # codex follow-up: `local[key]` is a subscript_expression; the index
+        # identifier `key` is a value-position use of its import.
+        source = """
+import key from "./key";
+import { unusedThing } from "./other";
+
+const local = {};
+export default local[key];
+"""
+        delta = _extract(source, file_name="index.ts")
+        unused_names = {
+            n.properties.get("message", "")
+            for n in delta.nodes
+            if "CodeDiagnostic" in n.labels and n.properties.get("rule") == "unused_import"
+        }
+        assert not any("'key'" in m for m in unused_names), (
+            f"key is used as a computed index; not unused. unused={unused_names}"
+        )
+        assert any("unusedThing" in m for m in unused_names), "guard: real unused still flagged"
+
     def test_exports_detected(self):
         delta = _extract(SAMPLE_TS)
         edges = _edge_labels(delta)

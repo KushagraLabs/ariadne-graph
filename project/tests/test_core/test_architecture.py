@@ -83,6 +83,26 @@ def test_same_organ_import_is_never_a_deep_import():
     assert _rules(diags, "deep_import") == []
 
 
+def test_deep_import_dedupes_per_source_target_pair():
+    # code_hygiene_mcp-1je hard case: file A imports 3 symbols from one deep
+    # target module. The extractor produces one REFERENCES edge per symbol, so
+    # the same (src, dst) pair appears 3 times. The finding must collapse to
+    # exactly ONE deep_import, not one per occurrence.
+    files = ["src/x.py", "lib/deep/y.py"]
+    edges = [
+        ("src/x.py", "lib/deep/y.py"),
+        ("src/x.py", "lib/deep/y.py"),
+        ("src/x.py", "lib/deep/y.py"),
+    ]
+
+    diags = analyze(files, edges)
+
+    deep = _rules(diags, "deep_import")
+    assert len(deep) == 1
+    assert deep[0].node_id == "src/x.py"
+    assert deep[0].properties["count"] == 3
+
+
 # --------------------------------------------------------------------------
 # orphan_module — hard case: an unreferenced entry point (cli.py) is NOT an
 # orphan, but an unreferenced helper IS.
@@ -107,6 +127,20 @@ def test_unreferenced_helper_is_an_orphan():
     orphans = _rules(diags, "orphan_module")
     assert [d.node_id for d in orphans] == ["src/util.py"]
     assert orphans[0].level == "info"
+
+
+def test_js_entry_points_are_not_orphans():
+    # code_hygiene_mcp-ytl hard case: expo App.tsx and drizzle.config.ts have
+    # legitimately zero inbound imports and are is_peripheral_path=False
+    # (production), so only an explicit entry-point predicate exempts them.
+    # A production leaf (server/foo.ts) with no fan-in stays an orphan.
+    files = ["mobile/App.tsx", "drizzle.config.ts", "server/foo.ts", "server/bar.ts"]
+    edges = [("server/bar.ts", "server/foo.ts")]  # bar references foo; nothing refs the rest
+
+    diags = analyze(files, edges)
+
+    orphans = {d.node_id for d in _rules(diags, "orphan_module")}
+    assert orphans == {"server/bar.ts"}
 
 
 def test_file_in_peripheral_organ_is_not_an_orphan():
@@ -182,6 +216,24 @@ def test_cross_organ_edge_is_not_an_upward_import():
     assert _rules(diags, "upward_import") == []
 
 
+def test_upward_import_dedupes_per_source_target_pair():
+    # code_hygiene_mcp-1je: same collapse rule applies to upward_import. Three
+    # REFERENCES occurrences of the same child->parent edge => ONE finding.
+    files = ["pkg/core.py", "pkg/sub/leaf.py"]
+    edges = [
+        ("pkg/sub/leaf.py", "pkg/core.py"),
+        ("pkg/sub/leaf.py", "pkg/core.py"),
+        ("pkg/sub/leaf.py", "pkg/core.py"),
+    ]
+
+    diags = analyze(files, edges)
+
+    up = _rules(diags, "upward_import")
+    assert len(up) == 1
+    assert up[0].node_id == "pkg/sub/leaf.py"
+    assert up[0].properties["count"] == 3
+
+
 # --------------------------------------------------------------------------
 # test-vs-production classification (code_hygiene_mcp-kj3) — hard case:
 # CO-LOCATED tests (server/routes/foo.test.ts) live under a production organ
@@ -223,6 +275,27 @@ def test_is_peripheral_path_handles_directory_group_keys():
     assert is_peripheral_path("mobile/src/__mocks__") is True
     # guard: a production directory key stays non-peripheral
     assert is_peripheral_path("server/routes") is False
+
+
+def test_is_peripheral_path_recognizes_bare_peripheral_organ_key():
+    # code_hygiene_mcp-ma4: a bare top-level organ key (module group node) must be
+    # recognized as peripheral when the organ is a PERIPHERAL_ORGAN.
+    assert is_peripheral_path("scripts") is True
+    assert is_peripheral_path("script") is True
+    assert is_peripheral_path("tests") is True
+    # guard: a production organ key stays non-peripheral
+    assert is_peripheral_path("server") is False
+
+
+def test_matrix_marks_scripts_module_node_non_production():
+    # code_hygiene_mcp-ma4 hard case: the 'scripts' organ is peripheral, but the
+    # module-group node keyed 'scripts' was reported production because the bare
+    # organ key never routed through is_peripheral_path. 'server' stays production.
+    files = ["scripts/deploy.ts", "server/app.ts"]
+    matrix = dependency_matrix(files, [], group_by="module")
+    prod = {n.id: n.production for n in matrix.nodes}
+    assert prod["scripts"] is False
+    assert prod["server"] is True
 
 
 def test_matrix_marks_colocated_test_node_non_production():

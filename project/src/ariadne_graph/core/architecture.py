@@ -18,6 +18,7 @@ browser paint all consume these for free.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -62,6 +63,28 @@ def _stem(rel_path: str) -> str:
     return name.rsplit(".", 1)[0] if "." in name else name
 
 
+# JS/TS entry points that legitimately have zero inbound imports: framework
+# entry files (App.tsx for expo, index.ts as a package root, main.ts) and tool
+# config modules loaded by a runner rather than imported (*.config.ts, drizzle
+# .config.ts, vite.config.mts, …). These are is_peripheral_path=False
+# (production) so they are NOT covered by _ENTRY_POINT_STEMS' Python stems nor by
+# the peripheral exemption; this regex is the JS/TS complement.
+_JS_ENTRY_FILENAME_RE = re.compile(r"^(App|index|main)\.[jt]sx?$|\.config\.[mc]?[jt]s$")
+
+
+def _is_entry_point(rel_path: str) -> bool:
+    """Whether an unreferenced file is a legitimate entry point (not dead code).
+
+    Covers both the Python stems in :data:`_ENTRY_POINT_STEMS` (cli, __main__,
+    …) and JS/TS framework/config entries (``App.tsx``, ``index.ts``,
+    ``*.config.ts``) that a runner loads without any import edge.
+    """
+    if _stem(rel_path) in _ENTRY_POINT_STEMS:
+        return True
+    filename = rel_path.rsplit("/", 1)[-1]
+    return _JS_ENTRY_FILENAME_RE.search(filename) is not None
+
+
 def _rel(file_path: str, repo_root: str) -> str:
     """Repo-relative path (strip repo_root prefix; leave already-relative as-is).
 
@@ -102,7 +125,9 @@ def is_peripheral_path(rel_path: str) -> bool:
     """SSOT for "is this repo-relative path peripheral (test/script) code?".
 
     Peripheral if ANY of:
-      * its top-level organ is a :data:`PERIPHERAL_ORGANS` (tests/scripts at root),
+      * its top-level organ (first path segment) is a :data:`PERIPHERAL_ORGANS`
+        (tests/scripts at root) — works for file paths AND bare/directory group
+        keys like ``scripts`` or ``server/routes``,
       * its filename matches ``(.|_)(test|spec).[jt]sx?`` (co-located JS/TS tests),
       * any path segment is a peripheral segment (``__tests__``, ``__mocks__``, …).
 
@@ -112,7 +137,10 @@ def is_peripheral_path(rel_path: str) -> bool:
     exemptions here, and ``list_diagnostics`` in the MCP layer — routes through
     this so they all agree.
     """
-    if _organ(_dir_of(rel_path)) in PERIPHERAL_ORGANS:
+    # First path segment is the top-level organ. For a file path this is the
+    # organ of its directory; for a bare/directory group key ('scripts',
+    # 'server/routes') it is the key's own first segment — both must be caught.
+    if rel_path.split("/", 1)[0] in PERIPHERAL_ORGANS:
         return True
     filename = rel_path.rsplit("/", 1)[-1]
     if _TEST_FILENAME_RE.search(filename):
@@ -352,6 +380,19 @@ def analyze(
     return diagnostics
 
 
+def _edge_counts(dep_edges: list[tuple[str, str]]) -> Counter[tuple[str, str]]:
+    """Collapse dep edges to one entry per distinct (source, target) pair with an
+    occurrence count.
+
+    The resolved graph emits one REFERENCES/CALLS edge per symbol occurrence, so
+    a single import statement pulling N symbols from a module yields N identical
+    (src, dst) pairs. Layering-violation findings (deep_import, upward_import)
+    are a property of the *relationship*, not each occurrence, so they iterate
+    distinct pairs and carry the occurrence count on the single finding.
+    """
+    return Counter(dep_edges)
+
+
 def _upward_imports(dep_edges: list[tuple[str, str]]) -> list[CodeDiagnostic]:
     """Flag intra-organ direction inversions: a file reaching *up* to an ancestor
     module in its own subtree. A parent importing a child (down) is normal; a
@@ -362,7 +403,7 @@ def _upward_imports(dep_edges: list[tuple[str, str]]) -> list[CodeDiagnostic]:
     directory is a strict ancestor of the source's directory.
     """
     findings: list[CodeDiagnostic] = []
-    for src, dst in dep_edges:
+    for (src, dst), count in _edge_counts(dep_edges).items():
         src_dir, dst_dir = _dir_of(src), _dir_of(dst)
         if not src_dir or not dst_dir or src_dir == dst_dir:
             continue
@@ -376,7 +417,7 @@ def _upward_imports(dep_edges: list[tuple[str, str]]) -> list[CodeDiagnostic]:
                     level="warning",
                     message=f"Upward import to ancestor module: {src} -> {dst}",
                     rule="upward_import",
-                    properties={"file_path": src, "from": src, "to": dst},
+                    properties={"file_path": src, "from": src, "to": dst, "count": count},
                 )
             )
     return findings
@@ -402,7 +443,7 @@ def _orphan_modules(
             continue
         if is_peripheral_path(rel):
             continue
-        if _stem(rel) in _ENTRY_POINT_STEMS:
+        if _is_entry_point(rel):
             continue
         findings.append(
             CodeDiagnostic(
@@ -438,7 +479,7 @@ def _deep_imports(
         return _layer_violations(dep_edges, arch_config)
 
     findings: list[CodeDiagnostic] = []
-    for src, dst in dep_edges:
+    for (src, dst), count in _edge_counts(dep_edges).items():
         src_dir, dst_dir = _dir_of(src), _dir_of(dst)
         if is_peripheral_path(src):
             continue  # edges from tests/scripts are exempt
@@ -455,6 +496,7 @@ def _deep_imports(
                     "from": src,
                     "to": dst,
                     "organ": _organ(dst_dir),
+                    "count": count,
                 },
             )
         )
@@ -472,7 +514,7 @@ def _layer_violations(
     unchecked just because a config file exists).
     """
     findings: list[CodeDiagnostic] = []
-    for src, dst in dep_edges:
+    for (src, dst), count in _edge_counts(dep_edges).items():
         src_dir, dst_dir = _dir_of(src), _dir_of(dst)
         if is_peripheral_path(src):
             continue  # edges from tests/scripts are exempt
@@ -491,6 +533,7 @@ def _layer_violations(
                             "from": src,
                             "to": dst,
                             "organ": _organ(dst_dir),
+                            "count": count,
                         },
                     )
                 )
@@ -509,6 +552,7 @@ def _layer_violations(
                     "to": dst,
                     "from_module": src_mod,
                     "to_module": dst_mod,
+                    "count": count,
                 },
             )
         )

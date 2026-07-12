@@ -466,6 +466,26 @@ class TypeScriptFactExtractor(UniqueIdMixin):
             return
 
         if declaration is None:
+            # `export default <expr>` (e.g. `export default defineConfig({...})`)
+            # carries its expression in the `value` field, not `declaration`; the
+            # TS `export = <expr>` assignment carries it as an unnamed child. Walk
+            # it so value-position callees mark imports used (bead
+            # code_hygiene_mcp-bhe). No export node is emitted here: anonymous
+            # default expressions have no exportable symbol name.
+            value = node.child_by_field_name("value") or _child_by_types(
+                node, ["call_expression", "new_expression", "identifier", "member_expression"]
+            )
+            if value is not None:
+                # `export default <expr>` is a value-position use of whatever it
+                # names, but _visit_expression only marks imports on call/new
+                # callees. A default export can wrap the imported binding in
+                # arbitrary syntax -- `config`, `foo.bar`, `(config)`,
+                # `config as C`, `{ config }` -- so mark every value-position
+                # identifier in the export expression as a potential import use
+                # (bead code_hygiene_mcp-bhe). Scoped to this subtree, not the
+                # whole traversal, to avoid over-marking ordinary references.
+                self._mark_export_value_identifiers(value)
+                self._visit_expression(value)
             return
 
         # Let the declaration emit its own node, then add export edge.
@@ -1094,6 +1114,72 @@ class TypeScriptFactExtractor(UniqueIdMixin):
             if imp["name"] == name or name.startswith(imp["name"] + "."):
                 imp["used"] = True
                 break
+
+    # Nodes that open a new binding scope: an import name referenced *inside* one
+    # may actually be a shadowing parameter/local, so the export walker must not
+    # mark identifiers within them (that would suppress a real unused-import
+    # warning). Real-world `export default` is simple (a call, a bare identifier,
+    # a router/config object) — this walker deliberately covers those and stops
+    # at scope boundaries rather than reimplementing full scope resolution.
+    _SCOPE_BOUNDARY_NODES = frozenset(
+        {
+            "function_declaration",
+            "generator_function_declaration",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+            "class_declaration",
+            "class_body",
+        }
+    )
+
+    def _mark_export_value_identifiers(self, node: Any) -> None:
+        """Mark value-position identifiers in an export-default expression.
+
+        A default export names its value through simple wrapping syntax
+        (``config``, ``(config)``, ``config as C``, ``{ config }``, ``foo.bar``),
+        and _visit_expression only marks call/new callees -- so bare identifier
+        references would leave the import looking unused (bead
+        code_hygiene_mcp-bhe). Walk the expression marking identifier / member
+        roots and object-literal shorthands. Two deliberate exclusions keep this
+        a value-position check without a full resolver: object-literal *keys*
+        (property_identifier) are not references, and subtrees that open a new
+        binding scope (functions/classes) are skipped since an identifier there
+        may be a shadowing parameter/local, not the import.
+
+        KNOWN LIMITATION (bead code_hygiene_mcp-ukr): skipping function bodies
+        means a genuine closure use (``export default () => foo``) is not marked,
+        so ``foo`` could be reported unused. This matches the extractor's
+        existing scope-flat behaviour everywhere else and does not occur in
+        practice (real ``export default`` is a call, an identifier, or a config
+        object -- never a closure). It is the preferred error: descending would
+        mark a *shadowing* parameter as an import use and suppress a real
+        unused-import warning, which is worse.
+        """
+        if node is None or node.type in self._SCOPE_BOUNDARY_NODES:
+            return
+        # A `{ config }` object-literal shorthand references the binding `config`.
+        if node.type == "shorthand_property_identifier":
+            self._mark_import_used(_text_str(node))
+            return
+        # `foo.bar` is a member_expression -> resolve to its root name. Computed
+        # access `obj[key]` is a distinct `subscript_expression` node (not a
+        # member_expression), so it falls through to the generic child walk and
+        # `key` gets visited as an identifier -- no special-casing needed.
+        if node.type == "member_expression":
+            name = _expression_name(node)
+            if name:
+                self._mark_import_used(name)
+            return
+        if node.type == "identifier":
+            self._mark_import_used(_text_str(node))
+            return
+        for child in node.children:
+            # In a `pair` (k: v) skip the key; only the value can reference an
+            # import. Everything else recurses normally.
+            if node.type == "pair" and child.type == "property_identifier":
+                continue
+            self._mark_export_value_identifiers(child)
 
     def _mark_type_used(self, type_text: str) -> None:
         """Mark imports used from a type-position reference (bead df7).
