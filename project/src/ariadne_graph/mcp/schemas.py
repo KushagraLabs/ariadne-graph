@@ -193,6 +193,26 @@ class LumenRetrieveInput(BaseModel):
 # Output schemas
 # ============================================================================
 
+
+class FreshnessMixin(BaseModel):
+    """Shared in-band index-freshness envelope for analysis/query responses.
+
+    Optional and additive: a consumer that ignores it sees no change. When
+    present, ``freshness`` carries ``{last_indexed, dirty_file_count, stale,
+    sync_enabled}`` so a caller can tell a moved-since-index graph apart from a
+    fresh one without a separate ``code_graph_index_status`` round-trip. Left
+    ``None`` when the graph is unknown/unindexed (nothing meaningful to report).
+    """
+
+    freshness: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "In-band index-freshness envelope: {last_indexed (ISO str|None), "
+            "dirty_file_count (int), stale (bool), sync_enabled (bool)}. "
+            "None when the graph is not indexed."
+        ),
+    )
+
 class IndexOutput(BaseModel):
     """Output for code_graph_index tool."""
 
@@ -244,7 +264,7 @@ class DeleteProjectOutput(BaseModel):
     message: str = Field(default="", description="Human-readable status message")
 
 
-class RetrieveOutput(BaseModel):
+class RetrieveOutput(FreshnessMixin):
     """Output for code_graph_retrieve tool."""
 
     results: list[dict[str, Any]] = Field(default_factory=list, description="Retrieved nodes and edges")
@@ -263,27 +283,27 @@ class LumenRetrieveOutput(RetrieveOutput):
     )
 
 
-class SearchSemanticOutput(BaseModel):
+class SearchSemanticOutput(FreshnessMixin):
     """Output for code_graph_search_semantic tool."""
 
     hits: list[dict[str, Any]] = Field(default_factory=list, description="Ranked search hits")
     message: str = Field(default="", description="Human-readable status message")
 
 
-class SearchCodeOutput(BaseModel):
+class SearchCodeOutput(FreshnessMixin):
     """Output for code_graph_search_code tool."""
 
     matches: list[dict[str, Any]] = Field(default_factory=list, description="Matching code snippets")
     message: str = Field(default="", description="Human-readable status message")
 
 
-class TraceDependenciesOutput(BaseModel):
+class TraceDependenciesOutput(FreshnessMixin):
     """Output for code_graph_trace_dependencies tool."""
 
     paths: list[list[str]] = Field(default_factory=list, description="Dependency paths as node ID chains")
 
 
-class ImpactAnalysisOutput(BaseModel):
+class ImpactAnalysisOutput(FreshnessMixin):
     """Output for code_graph_impact_analysis tool."""
 
     target_symbol: str = Field(description="The analyzed symbol")
@@ -309,7 +329,7 @@ class DetectChangesOutput(BaseModel):
     )
 
 
-class FindHotspotsOutput(BaseModel):
+class FindHotspotsOutput(FreshnessMixin):
     """Output for code_graph_find_hotspots tool."""
 
     hotspots: list[dict[str, Any]] = Field(default_factory=list, description="Ranked hotspot entries")
@@ -319,7 +339,7 @@ class FindHotspotsOutput(BaseModel):
     schema_version: str = Field(default=SCHEMA_VERSION, description="Response schema version")
 
 
-class ArchitectureOutput(BaseModel):
+class ArchitectureOutput(FreshnessMixin):
     """Output for code_graph_get_architecture tool."""
 
     summary: dict[str, Any] = Field(default_factory=dict, description="Architecture summary")
@@ -329,7 +349,7 @@ class ArchitectureOutput(BaseModel):
     schema_version: str = Field(default=SCHEMA_VERSION, description="Response schema version")
 
 
-class ExplainEdgeOutput(BaseModel):
+class ExplainEdgeOutput(FreshnessMixin):
     """Output for code_graph_explain_edge tool."""
 
     src: str = Field(default="", description="Repo-relative path of the importing file")
@@ -345,7 +365,7 @@ class ExplainEdgeOutput(BaseModel):
     message: str = Field(default="", description="Human-readable status message")
 
 
-class DependencyMatrixOutput(BaseModel):
+class DependencyMatrixOutput(FreshnessMixin):
     """Output for code_graph_get_dependency_matrix tool."""
 
     nodes: list[dict[str, Any]] = Field(default_factory=list, description="Matrix nodes: id, module, production")
@@ -355,7 +375,7 @@ class DependencyMatrixOutput(BaseModel):
     message: str = Field(default="", description="Human-readable status message")
 
 
-class AuditPublicSurfacesOutput(BaseModel):
+class AuditPublicSurfacesOutput(FreshnessMixin):
     """Output for code_graph_audit_public_surfaces tool.
 
     Per-module facade/encapsulation report. Requires a declared
@@ -376,14 +396,14 @@ class AuditPublicSurfacesOutput(BaseModel):
     message: str = Field(default="", description="Human-readable status message")
 
 
-class CommunitiesOutput(BaseModel):
+class CommunitiesOutput(FreshnessMixin):
     """Output for code_graph_list_communities tool."""
 
     communities: list[dict[str, Any]] = Field(default_factory=list, description="Community entries")
     message: str = Field(default="", description="Human-readable status message")
 
 
-class InspectFileOutput(BaseModel):
+class InspectFileOutput(FreshnessMixin):
     """Output for code_graph_inspect_file tool."""
 
     nodes: list[dict[str, Any]] = Field(default_factory=list, description="Nodes in the file")
@@ -418,7 +438,7 @@ class ListDiagnosticsInput(BaseModel):
     limit: int = Field(default=100, ge=1, le=1000, description="Maximum diagnostics to return")
 
 
-class ListDiagnosticsOutput(BaseModel):
+class ListDiagnosticsOutput(FreshnessMixin):
     """Output for code_graph_list_diagnostics tool."""
 
     diagnostics: list[dict[str, Any]] = Field(

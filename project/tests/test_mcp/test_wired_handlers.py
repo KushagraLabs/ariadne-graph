@@ -543,3 +543,154 @@ async def test_search_code_language_filter_sqlite_keyword_hits(tmp_path: Path) -
             assert file_path.endswith(".py")
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_freshness_envelope_marks_content_change_stale(tmp_path: Path) -> None:
+    """A content change to one file must surface as stale + dirty_file_count>=1
+    on an analysis response, and reindexing must clear it.
+
+    This is the hard case: only a CONTENT change (not a mere touch) counts, and
+    the envelope must ride along on impact_analysis without a separate
+    index_status call. SQLite store so file_hashes/last_indexed are persisted.
+    """
+    repo = tmp_path / "repo"
+    _write_sample_repo(repo)
+    db_path = tmp_path / "graph.db"
+    store = SQLiteGraphStore(str(db_path))
+    registry = _make_registry(store, repo)
+
+    try:
+        index_result = await registry.handle_index(IndexInput(repo_path=str(repo)))
+        graph_id = index_result.graph_id
+
+        # Fresh right after indexing: no dirty files, not stale.
+        fresh = await registry.handle_impact_analysis(
+            ImpactAnalysisInput(symbol="package.utils.helper", graph_id=graph_id)
+        )
+        assert fresh.freshness is not None
+        assert fresh.freshness["stale"] is False
+        assert fresh.freshness["dirty_file_count"] == 0
+        assert fresh.freshness["last_indexed"] is not None
+
+        # Content change to one file — bump mtime past last_indexed AND change bytes.
+        import os
+        import time
+
+        target = repo / "package" / "utils.py"
+        target.write_text(
+            '''"""Utility module."""
+
+
+def helper(value: str) -> str:
+    return value.lower()  # changed
+'''
+        )
+        future = time.time() + 10
+        os.utime(target, (future, future))
+
+        stale = await registry.handle_impact_analysis(
+            ImpactAnalysisInput(symbol="package.utils.helper", graph_id=graph_id)
+        )
+        assert stale.freshness is not None
+        assert stale.freshness["stale"] is True
+        assert stale.freshness["dirty_file_count"] >= 1
+
+        # Reindex clears staleness.
+        await registry.handle_index(IndexInput(repo_path=str(repo)))
+        refreshed = await registry.handle_impact_analysis(
+            ImpactAnalysisInput(symbol="package.utils.helper", graph_id=graph_id)
+        )
+        assert refreshed.freshness is not None
+        assert refreshed.freshness["stale"] is False
+        assert refreshed.freshness["dirty_file_count"] == 0
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_freshness_prefilter_detects_content_change_at_equal_mtime(tmp_path: Path) -> None:
+    """A content change whose mtime lands exactly on the index cutoff must still
+    be caught — an equal mtime is not proof of unchanged bytes.
+
+    Guards the mtime-prefilter boundary directly (``st_mtime < cutoff`` skips,
+    ``==`` does not): coarse fs resolution / mtime-preserving tools can leave a
+    modified file at exactly last_indexed.
+    """
+    import os
+    from datetime import datetime
+
+    from ariadne_graph.core.freshness import FreshnessTracker
+
+    repo = tmp_path / "repo"
+    _write_sample_repo(repo)
+    db_path = tmp_path / "graph.db"
+    store = SQLiteGraphStore(str(db_path))
+    registry = _make_registry(store, repo)
+
+    try:
+        index_result = await registry.handle_index(IndexInput(repo_path=str(repo)))
+        graph_id = index_result.graph_id
+
+        tracker = FreshnessTracker(store)
+        # Read last_indexed straight from metadata to pin the exact cutoff.
+        meta_rows = await store.query(graph_id, "index_metadata", params={"graph_id": graph_id})
+        last_indexed = meta_rows[0]["last_indexed"]
+        cutoff = datetime.fromisoformat(last_indexed).timestamp()
+
+        target = repo / "package" / "utils.py"
+        target.write_text('def helper(value: str) -> str:\n    return value  # changed\n')
+        os.utime(target, (cutoff, cutoff))  # mtime EXACTLY at the cutoff
+
+        env = await tracker.compute_freshness(graph_id)
+        assert env is not None
+        assert env["dirty_file_count"] >= 1
+        assert env["stale"] is True
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_freshness_multi_graph_aggregation_is_honest(tmp_path: Path) -> None:
+    """Cross-repo aggregation must not let one clean graph mask staleness or
+    missing coverage in another.
+
+    A stale graph alongside a fresh one must aggregate to stale=True; an
+    unknown/missing contributor must knock stale to None and dirty count to None
+    rather than a confident False/0.
+    """
+    repo = tmp_path / "repo"
+    _write_sample_repo(repo)
+    db_path = tmp_path / "graph.db"
+    store = SQLiteGraphStore(str(db_path))
+    registry = _make_registry(store, repo)
+
+    try:
+        index_result = await registry.handle_index(IndexInput(repo_path=str(repo)))
+        real_gid = index_result.graph_id
+
+        # One fresh real graph.
+        clean = await registry._freshness_envelope_multi([real_gid])
+        assert clean is not None
+        assert clean["stale"] is False
+
+        # Fresh real graph + a graph id that has no envelope (unindexed) ->
+        # coverage gap: stale and dirty count both go unknown (None).
+        with_gap = await registry._freshness_envelope_multi([real_gid, "unindexed-xyz"])
+        assert with_gap is not None
+        assert with_gap["stale"] is None
+        assert with_gap["dirty_file_count"] is None
+
+        # Make the real graph stale; any stale contributor forces stale=True even
+        # when another contributor is missing.
+        import os
+        import time
+
+        target = repo / "package" / "utils.py"
+        target.write_text("def helper(v: str) -> str:\n    return v  # changed\n")
+        os.utime(target, (time.time() + 10, time.time() + 10))
+        stale_agg = await registry._freshness_envelope_multi([real_gid, "unindexed-xyz"])
+        assert stale_agg is not None
+        assert stale_agg["stale"] is True
+    finally:
+        await store.close()

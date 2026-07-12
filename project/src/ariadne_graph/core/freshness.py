@@ -118,6 +118,133 @@ class FreshnessTracker:
                 dirty.append(file_path)
         return dirty
 
+    async def compute_freshness(
+        self,
+        graph_id: str,
+        dirty_hint: int | None = None,
+    ) -> dict[str, object] | None:
+        """Cheap in-band freshness envelope for an analysis/query response.
+
+        Returns ``{last_indexed, dirty_file_count, stale, sync_enabled}`` or
+        ``None`` when the graph has never been indexed (no metadata row).
+
+        Staleness source is an **mtime prefilter** (bead decision (a)): every
+        stored file is ``stat``-ed and only those whose ``st_mtime`` is newer
+        than the repo's ``last_indexed`` timestamp are re-hashed to confirm a
+        real content change. Stat-only over the file set is O(repo) syscalls but
+        avoids the O(repo) *reads+hashes* that :meth:`_compute_dirty_files` does
+        unconditionally, so it stays cheap on large repos. When the repo path is
+        unavailable (metadata has no path — bead fallback (c)) it degrades to a
+        timestamp-only envelope: ``dirty_file_count`` is unknown so ``stale``
+        cannot be asserted — both are reported ``None`` (unknown).
+
+        ``dirty_hint`` lets a caller that already knows the dirty count (e.g. a
+        watcher-tracked dirty set) skip the scan entirely; when given it is used
+        verbatim and no filesystem work happens.
+        """
+        rows = await self.graph_store.query(
+            graph_id,
+            "index_metadata",
+            params={"graph_id": graph_id},
+        )
+        if not rows:
+            return None
+
+        meta = rows[0]
+        last_indexed = meta.get("last_indexed")
+        sync_enabled = bool(meta.get("sync_enabled", False))
+        repo_path = meta.get("repo_path", "")
+
+        if dirty_hint is not None:
+            return {
+                "last_indexed": last_indexed,
+                "dirty_file_count": dirty_hint,
+                "stale": dirty_hint > 0,
+                "sync_enabled": sync_enabled,
+            }
+
+        if not repo_path or last_indexed is None:
+            # Fallback (c): timestamp-only. No path or no index time to compare
+            # mtimes against, so dirty count is genuinely unknown. Report both
+            # count and staleness as None (unknown) rather than a misleading
+            # zero/False that would read as "confirmed fresh".
+            return {
+                "last_indexed": last_indexed,
+                "dirty_file_count": None,
+                "stale": None,
+                "sync_enabled": sync_enabled,
+            }
+
+        dirty_count = await self._count_dirty_mtime_prefilter(graph_id, repo_path, last_indexed)
+        return {
+            "last_indexed": last_indexed,
+            "dirty_file_count": dirty_count,
+            "stale": dirty_count > 0,
+            "sync_enabled": sync_enabled,
+        }
+
+    async def _count_dirty_mtime_prefilter(
+        self,
+        graph_id: str,
+        repo_path: str,
+        last_indexed: str,
+    ) -> int:
+        """Count stored files whose content changed since ``last_indexed``.
+
+        Prefilters on ``st_mtime``: a file is only read+hashed when its mtime is
+        NOT strictly older than the index timestamp, so an unchanged repo pays
+        one ``stat`` per file and zero reads. An equal mtime is deliberately NOT
+        skipped — coarse timestamp resolution, mtime-preserving tooling, or
+        restored timestamps can leave a modified file at exactly the cutoff, so
+        it is hash-verified rather than trusted. A missing file counts as dirty
+        (it was indexed and is now gone).
+
+        NOTE (known limitation, surfaced not silent): this counts only files
+        that were indexed (have a ``file_hashes`` row). A brand-new untracked
+        file on disk is NOT reflected here, because discovering the full current
+        file set per analysis call would reintroduce the O(repo) walk this cheap
+        path exists to avoid. New-file staleness is caught by
+        ``code_graph_detect_changes`` / a reindex, not this envelope.
+        """
+        rows = await self.graph_store.query(
+            graph_id,
+            "file_hashes",
+            params={"graph_id": graph_id},
+        )
+        if not rows:
+            return 0
+
+        try:
+            cutoff = datetime.fromisoformat(last_indexed).timestamp()
+        except (ValueError, TypeError):
+            cutoff = None
+
+        root = Path(repo_path)
+        dirty = 0
+        for row in rows:
+            file_path = row.get("file_path", "")
+            stored_hash = row.get("content_hash", "")
+            if not file_path:
+                continue
+            path = Path(file_path)
+            if not path.is_absolute():
+                path = root / path
+            try:
+                st = path.stat()
+            except OSError:
+                dirty += 1  # indexed file now missing/unreadable
+                continue
+            if cutoff is not None and st.st_mtime < cutoff:
+                continue  # strictly older than index — trust the stored hash
+            try:
+                current_hash = xxhash.xxh3_64_hexdigest(path.read_bytes())
+            except OSError:
+                dirty += 1
+                continue
+            if current_hash != stored_hash:
+                dirty += 1
+        return dirty
+
     async def mark_indexed(
         self,
         graph_id: str,

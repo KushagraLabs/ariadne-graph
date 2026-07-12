@@ -413,6 +413,81 @@ class ToolRegistry:
         """Derive graph_id from repo_path."""
         return _graph_id_from_repo_path(repo_path)
 
+    async def _freshness_envelope(self, graph_id: str | None) -> dict[str, Any] | None:
+        """Compute the shared in-band freshness envelope for an analysis response.
+
+        Delegates to :meth:`FreshnessTracker.compute_freshness` (cheap mtime
+        prefilter — see its docstring). Returns ``None`` for an unknown/unindexed
+        graph so the response's optional ``freshness`` field simply stays absent.
+        A watcher-enabled project needs no special dirty-set plumbing: the watcher
+        reindexes on every change, so ``last_indexed`` advances and the mtime
+        prefilter finds nothing dirty. Never raises — a freshness failure must not
+        break the analysis result it rides along with.
+        """
+        if graph_id is None:
+            return None
+        try:
+            return await self.freshness_tracker.compute_freshness(graph_id)
+        except Exception as exc:
+            logger.warning("Freshness envelope computation failed for %s: %s", graph_id, exc)
+            return None
+
+    async def _freshness_envelope_multi(self, graph_ids: list[str]) -> dict[str, Any] | None:
+        """Aggregate freshness across every graph a result was drawn from.
+
+        The cross-repo search/trace handlers combine hits from all known graphs,
+        so reporting one graph's freshness would let a fresh graph mask a stale
+        one. This rolls the per-graph envelopes up honestly, never letting a
+        known-clean graph paper over a gap in another:
+
+        - A graph whose lookup returns ``None`` (unindexed / lookup failed) is a
+          coverage gap, tracked as ``missing`` so the aggregate cannot claim a
+          confident ``False``.
+        - ``stale`` is ``True`` if ANY graph is confirmed stale; else ``None``
+          (unknown) if any contributor is stale-unknown OR missing; else
+          ``False``.
+        - ``dirty_file_count`` sums the per-graph counts, but is ``None`` if ANY
+          contributor's count is unknown or missing (a partial sum would
+          understate).
+        - ``last_indexed`` is the OLDEST (the freshness floor); ``sync_enabled``
+          is ``True`` only if every contributor has sync on.
+
+        Returns ``None`` only when NO graph id was supplied at all.
+        """
+        if not graph_ids:
+            return None
+        envelopes = [await self._freshness_envelope(gid) for gid in graph_ids]
+        present = [e for e in envelopes if e is not None]
+        if not present:
+            return None
+        if len(envelopes) == 1 and present:
+            return present[0]
+
+        missing = len(envelopes) - len(present)  # graphs with no envelope at all
+
+        stales = [e["stale"] for e in present]
+        if any(s is True for s in stales):
+            stale: bool | None = True
+        elif missing or any(s is None for s in stales):
+            stale = None
+        else:
+            stale = False
+
+        counts = [e["dirty_file_count"] for e in present]
+        # A partial sum understates, so any unknown/missing count makes the
+        # aggregate count unknown rather than a misleadingly precise number.
+        dirty_total = sum(counts) if (not missing and all(c is not None for c in counts)) else None
+
+        indexed = [e["last_indexed"] for e in present if e["last_indexed"] is not None]
+        oldest = min(indexed) if indexed else None  # ISO-8601 sorts lexicographically
+
+        return {
+            "last_indexed": oldest,
+            "dirty_file_count": dirty_total,
+            "stale": stale,
+            "sync_enabled": all(e["sync_enabled"] for e in present),
+        }
+
     async def _graph_exists(self, graph_id: str) -> bool:
         """Check whether any data exists for the given graph."""
         try:
@@ -921,17 +996,20 @@ class ToolRegistry:
             return RetrieveOutput(results=[])
 
         query = input.query
+        freshness = await self._freshness_envelope(graph_id)
 
         # Use GraphRetriever when available
         if self.retriever is not None:
             try:
                 result = await self.retriever.retrieve_node(graph_id, query)
                 results: list[dict[str, Any]] = [{"type": "retrieve", "data": result}]
-                return RetrieveOutput(results=results)
+                return RetrieveOutput(results=results, freshness=freshness)
             except Exception as exc:
                 logger.warning("GraphRetriever failed, falling back to scan: %s", exc)
 
-        return await GraphStoreFallbacks.retrieve(self.graph_store, graph_id, query)
+        out = await GraphStoreFallbacks.retrieve(self.graph_store, graph_id, query)
+        out.freshness = freshness
+        return out
 
     async def handle_lumen_code_graph_retrieve(
         self, input: LumenRetrieveInput
@@ -964,6 +1042,7 @@ class ToolRegistry:
         return LumenRetrieveOutput(
             results=canonical.results,
             lumen_context=lumen_context,
+            freshness=canonical.freshness,
         )
 
     async def handle_search_semantic(self, input: SearchSemanticInput) -> SearchSemanticOutput:
@@ -1031,6 +1110,7 @@ class ToolRegistry:
         return SearchSemanticOutput(
             hits=all_hits,
             message=f"Found {len(all_hits)} semantic matches",
+            freshness=await self._freshness_envelope_multi(graph_ids),
         )
 
     async def handle_search_code(self, input: SearchCodeInput) -> SearchCodeOutput:
@@ -1042,6 +1122,7 @@ class ToolRegistry:
         if not graph_ids:
             return SearchCodeOutput(matches=[], message="No indexed graphs found")
 
+        freshness = await self._freshness_envelope_multi(graph_ids)
         matches: list[dict[str, Any]] = []
 
         def _language_from_props(props: dict[str, Any]) -> str:
@@ -1141,6 +1222,7 @@ class ToolRegistry:
                             return SearchCodeOutput(
                                 matches=matches,
                                 message=f"Found {len(matches)} matches",
+                                freshness=freshness,
                             )
             except Exception:
                 continue
@@ -1151,6 +1233,7 @@ class ToolRegistry:
         return SearchCodeOutput(
             matches=matches,
             message=f"Found {len(matches)} matches" if matches else "No matches found",
+            freshness=freshness,
         )
 
     async def handle_trace_dependencies(
@@ -1196,7 +1279,8 @@ class ToolRegistry:
                 if len(path) > 1:
                     all_paths.append(path)
 
-        return TraceDependenciesOutput(paths=all_paths)
+        freshness = await self._freshness_envelope_multi(graph_ids)
+        return TraceDependenciesOutput(paths=all_paths, freshness=freshness)
 
     # ==================================================================
     # ANALYSIS TOOLS (5)
@@ -1218,6 +1302,7 @@ class ToolRegistry:
             )
 
         for graph_id in graph_ids:
+            freshness = await self._freshness_envelope(graph_id)
             if self.retriever is not None:
                 try:
                     result = await self.retriever.impact_analysis(graph_id, symbol)
@@ -1227,11 +1312,14 @@ class ToolRegistry:
                         direct_dependencies=result.direct_dependencies,
                         transitive_affected=result.transitive_affected,
                         coupling_scores=result.coupling_scores,
+                        freshness=freshness,
                     )
                 except Exception as exc:
                     logger.warning("GraphRetriever impact analysis failed: %s", exc)
 
-            return await GraphStoreFallbacks.impact_analysis(self.graph_store, graph_id, symbol)
+            out = await GraphStoreFallbacks.impact_analysis(self.graph_store, graph_id, symbol)
+            out.freshness = freshness
+            return out
 
         return ImpactAnalysisOutput(
             target_symbol=symbol,
@@ -1321,6 +1409,7 @@ class ToolRegistry:
         # requested page to page/has_more here without changing either
         # ranking implementation: an oversized result means more remain.
         fetch_n = input.offset + input.top_n + 1
+        freshness = await self._freshness_envelope(graph_id)
 
         if self.community_analyzer is not None:
             try:
@@ -1336,6 +1425,7 @@ class ToolRegistry:
                     total=total,
                     has_more=has_more,
                     message=f"Top {len(page)} hotspots by {input.metric}",
+                    freshness=freshness,
                 )
             except Exception as exc:
                 logger.warning("CommunityAnalyzer.find_hotspots failed: %s", exc)
@@ -1351,6 +1441,7 @@ class ToolRegistry:
             total=total,
             has_more=has_more,
             message=fallback.message,
+            freshness=freshness,
         )
 
     def _paginate_architecture(
@@ -1389,6 +1480,7 @@ class ToolRegistry:
                 message="Repository has not been indexed yet",
             )
 
+        freshness = await self._freshness_envelope(graph_id)
         if self.community_analyzer is not None:
             try:
                 summary_obj = await self.community_analyzer.get_architecture_summary(
@@ -1402,16 +1494,23 @@ class ToolRegistry:
                         f"{summary_obj.total_entities} entities"
                     ),
                 )
-                return self._paginate_architecture(output, input)
+                paginated = self._paginate_architecture(output, input)
+                paginated.freshness = freshness
+                return paginated
             except Exception as exc:
                 logger.warning("CommunityAnalyzer architecture summary failed: %s", exc)
 
         fallback = await GraphStoreFallbacks.get_architecture(self.graph_store, graph_id)
-        return self._paginate_architecture(fallback, input)
+        paginated = self._paginate_architecture(fallback, input)
+        paginated.freshness = freshness
+        return paginated
 
     async def handle_explain_edge(self, input: ExplainEdgeInput) -> ExplainEdgeOutput:
         """Explain why a single file->file edge is or isn't a layering violation."""
         explanation = explain_edge(input.src_path, input.dst_path)
+        # explain_edge is a pure static classification of two paths against the
+        # layering charter — it touches no indexed graph, so there is no
+        # freshness to report and the (optional) envelope stays None.
         return ExplainEdgeOutput(
             src=explanation.src,
             dst=explanation.dst,
@@ -1467,6 +1566,7 @@ class ToolRegistry:
                 f"Dependency matrix ({input.group_by}): {len(matrix.nodes)} nodes, "
                 f"{len(matrix.edges)} edges"
             ),
+            freshness=await self._freshness_envelope(graph_id),
         )
 
     async def handle_audit_public_surfaces(
@@ -1558,6 +1658,7 @@ class ToolRegistry:
         return AuditPublicSurfacesOutput(
             modules=modules,
             message=f"Audited {len(modules)} module(s) with declared public_surfaces",
+            freshness=await self._freshness_envelope(graph_id),
         )
 
     async def handle_list_communities(self, input: ListCommunitiesInput) -> CommunitiesOutput:
@@ -1616,6 +1717,7 @@ class ToolRegistry:
         return CommunitiesOutput(
             communities=communities,
             message=f"Found {len(communities)} communities",
+            freshness=await self._freshness_envelope(graph_id),
         )
 
     # ==================================================================
@@ -1668,6 +1770,7 @@ class ToolRegistry:
             total_edges=total_edges,
             has_more=has_more,
             message=f"Found {total_nodes} nodes and {total_edges} edges in {file_path}",
+            freshness=await self._freshness_envelope(graph_id),
         )
 
     async def handle_list_diagnostics(self, input: ListDiagnosticsInput) -> ListDiagnosticsOutput:
@@ -1761,4 +1864,5 @@ class ToolRegistry:
             diagnostics=results,
             counts={"by_rule": by_rule, "by_production": by_production},
             message=f"Found {len(matched)} diagnostics ({len(results)} returned)",
+            freshness=await self._freshness_envelope(graph_id),
         )
