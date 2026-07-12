@@ -89,6 +89,11 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         # State tracking
         self._class_stack: list[str] = []
         self._function_stack: list[str] = []
+        # Stack of value-namespace binding scopes (bead code_hygiene_mcp-ukr).
+        # Each frame holds the locally-bound names in scope; a name that resolves
+        # to one of these shadows an import of the same name, so
+        # _mark_import_used must NOT mark the import used. See _push_scope.
+        self._scope_stack: list[set[str]] = []
         self._imports: list[dict[str, Any]] = []
         self._import_nodes: list[CodeNode] = []
 
@@ -820,11 +825,20 @@ class TypeScriptFactExtractor(UniqueIdMixin):
                 {"symbol": func_name, "default": is_default},
             )
 
-        # Visit body for call tracking
-        body = _child_by_types(node, ["statement_block", "expression"])
+        # Visit body for call tracking. Push this function's parameter scope so a
+        # reference to a shadowing param is not mis-marked as an import use (bead
+        # code_hygiene_mcp-ukr). The body block pushes its own frame for locals
+        # (see _visit_expression). The `body` field covers both a
+        # `statement_block` and an expression-bodied arrow (`() => foo`, whose
+        # body is a bare identifier the old type-list lookup missed).
+        body = node.child_by_field_name("body") or _child_by_types(
+            node, ["statement_block", "expression"]
+        )
         if body is not None:
             self._function_stack.append(node_id)
-            self._visit_body(body)
+            self._push_scope(self._function_scope_bindings(node))
+            self._visit_expression(body)
+            self._pop_scope()
             self._function_stack.pop()
 
         return node_id
@@ -1063,11 +1077,56 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         ):
             self._process_function(node)
             return
+        # An anonymous `function (...) {}` expression (a callback) opens its own
+        # parameter/var scope, but -- unlike a declaration or a named/assigned
+        # arrow -- it produces no CodeFunction node. Walk it for import usage
+        # under its own scope frame WITHOUT emitting a node, so a shadowing param
+        # is not mis-marked as an import use (bead code_hygiene_mcp-ukr, codex
+        # review) and the node set is unchanged.
+        if node_type in ("function_expression", "generator_function_expression"):
+            self._visit_anonymous_function(node)
+            return
         if node_type == "class_declaration":
             self._process_class(node)
             return
+        # An anonymous `class {}` expression emits no node here; its methods
+        # still open parameter scopes, so walk it scope-aware without a node
+        # (bead code_hygiene_mcp-ukr, codex review). A method_definition is a
+        # function for scoping purposes.
+        if node_type == "class":
+            self._visit_anonymous_class(node)
+            return
+        if node_type == "method_definition":
+            self._visit_anonymous_function(node)
+            return
         if node_type in ("variable_declaration", "lexical_declaration"):
             self._process_variable_declaration(node)
+            return
+
+        # Nodes that open a lexical value scope get their own frame so a local
+        # binding shadows an import only within its actual scope (bead
+        # code_hygiene_mcp-ukr). A block's locals are pushed here rather than
+        # pooled into the enclosing function, so a reference in an outer block
+        # still resolves to the import (codex review finding).
+        if node_type == "statement_block":
+            self._push_scope(self._block_bindings(node))
+            for child in node.children:
+                self._visit_expression(child)
+            self._pop_scope()
+            return
+        if node_type in ("for_statement", "for_in_statement"):
+            self._visit_loop(node)
+            return
+        if node_type == "catch_clause":
+            self._visit_catch_clause(node)
+            return
+        if node_type == "switch_body":
+            # `case` declarations share one block scope (the switch body); a
+            # `const` in a case can be referenced by a later case.
+            self._push_scope(self._switch_body_bindings(node))
+            for child in node.children:
+                self._visit_expression(child)
+            self._pop_scope()
             return
 
         # Call/new expressions mark their callee's import used; recursion into
@@ -1082,6 +1141,25 @@ class TypeScriptFactExtractor(UniqueIdMixin):
             for child in node.children:
                 if child.type in ("type_identifier", "generic_type", "nested_type_identifier"):
                     self._mark_type_used(_text_str(child))
+        elif node_type == "member_expression":
+            # `ns.thing` / `foo.bar`: resolve to the root-qualified name so the
+            # namespace-prefix match in _mark_import_used still fires (bead
+            # code_hygiene_mcp-ukr). The `.property` is a property_identifier,
+            # not a bare identifier, so the child walk below won't re-mark it.
+            name = _expression_name(node)
+            if name:
+                self._mark_import_used(name)
+        elif node_type == "identifier":
+            # A bare value-position identifier is a use of its binding. Scope
+            # resolution in _mark_import_used decides whether that binding is the
+            # import or a closer param/local (bead code_hygiene_mcp-ukr). This is
+            # what marks a genuine closure use -- `() => foo` -- of an import.
+            self._mark_import_used(_text_str(node))
+            return
+        elif node_type == "shorthand_property_identifier":
+            # `{ foo }` object-literal shorthand references the binding `foo`.
+            self._mark_import_used(_text_str(node))
+            return
 
         for child in node.children:
             self._visit_expression(child)
@@ -1116,12 +1194,222 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         if callee:
             self._mark_import_used(callee)
 
-    def _mark_import_used(self, name: str) -> None:
-        """Mark an import as used based on a value-position name reference."""
+    def _mark_import_used(self, name: str, *, check_scope: bool = True) -> None:
+        """Mark an import as used based on a value-position name reference.
+
+        Scope-aware (bead code_hygiene_mcp-ukr): a value-position reference marks
+        the import used only when its root name resolves to that import rather
+        than to a closer binding (a param/local of the same name). If any active
+        value scope binds the root name, the reference is a use of the
+        *shadowing* binding, not the import, so nothing is marked -- keeping a
+        genuine closure use (``() => foo``) marking ``foo`` used while a shadowing
+        param (``(foo) => foo``) leaves the import unused.
+
+        ``check_scope=False`` is used for type-position references
+        (``_mark_type_used``): TS has separate type and value namespaces, so a
+        value binding named ``Foo`` must not shadow a type use of imported
+        ``Foo``. Type-namespace bindings (type params, local type/interface
+        decls) are not tracked, so type references never consult the scope stack.
+        """
+        # The root of a member-expression name ("ns.thing" -> "ns") is what a
+        # binding could shadow; the prefix match against imports is preserved.
+        root = name.split(".", 1)[0]
+        if check_scope and self._is_locally_bound(root):
+            return
         for imp in self._imports:
             if imp["name"] == name or name.startswith(imp["name"] + "."):
                 imp["used"] = True
                 break
+
+    # ------------------------------------------------------------------
+    # Lexical scope tracking (value namespace) -- bead code_hygiene_mcp-ukr
+    # ------------------------------------------------------------------
+    #
+    # The scope stack holds one frame per active lexical scope, each with only
+    # that scope's own value bindings. Frames are pushed/popped as the walker
+    # enters/leaves a scope (function bodies, blocks, catch/for/switch bodies),
+    # so a binding shadows an import only for the lifetime of its actual scope --
+    # a reference in an enclosing block still resolves to the import.
+
+    def _is_locally_bound(self, name: str) -> bool:
+        """Return True if *name* is bound by any active (non-import) scope."""
+        return any(name in frame for frame in self._scope_stack)
+
+    def _push_scope(self, names: set[str]) -> None:
+        self._scope_stack.append(names)
+
+    def _pop_scope(self) -> None:
+        self._scope_stack.pop()
+
+    def _function_scope_bindings(self, node: Any) -> set[str]:
+        """Collect a function/arrow's parameter names plus hoisted ``var`` names.
+
+        Parameters (including destructuring) are function-scoped, and ``var``
+        declarations hoist to the nearest enclosing function scope -- so both
+        belong in the function frame, shadowing an import across the whole body
+        (codex review finding). ``let``/``const``/``class`` and block-scoped
+        function declarations are collected per-block instead (_block_bindings).
+        """
+        names: set[str] = set()
+        formal_params = _child_by_type(node, "formal_parameters")
+        if formal_params is not None:
+            for param in formal_params.children:
+                if param.type in ("required_parameter", "optional_parameter", "rest_parameter"):
+                    pattern = _child_by_types(
+                        param,
+                        ["identifier", "object_pattern", "array_pattern", "rest_pattern"],
+                    )
+                    _collect_pattern_names(pattern, names)
+        # A single-identifier arrow param (`foo => ...`) is not wrapped in
+        # formal_parameters; it sits under the `parameter` field (distinct from
+        # the `body` field, so a bare-identifier body like `() => foo` is not
+        # mistaken for a param).
+        if node.type == "arrow_function":
+            direct = node.child_by_field_name("parameter")
+            if direct is not None:
+                _collect_pattern_names(direct, names)
+        body = node.child_by_field_name("body")
+        if body is not None and body.type == "statement_block":
+            self._collect_hoisted_vars(body, names)
+        return names
+
+    def _collect_hoisted_vars(self, node: Any, out: set[str]) -> None:
+        """Collect ``var`` declarator names anywhere in a body, descending
+        through nested blocks/statements but NOT into nested function/class
+        scopes (which start their own function frame)."""
+        for child in node.children:
+            ctype = child.type
+            if ctype == "variable_declaration":  # `var` (let/const are lexical_declaration)
+                for declarator in _children_by_type(child, "variable_declarator"):
+                    pattern = _child_by_types(
+                        declarator, ["identifier", "object_pattern", "array_pattern"]
+                    )
+                    _collect_pattern_names(pattern, out)
+            elif ctype in (
+                "function_declaration",
+                "generator_function_declaration",
+                "arrow_function",
+                "function_expression",
+                "class_declaration",
+                "class",
+                "method_definition",
+            ):
+                continue  # nested function/class owns its own var scope
+            else:
+                self._collect_hoisted_vars(child, out)
+
+    def _block_bindings(self, node: Any) -> set[str]:
+        """Collect the block-scoped value bindings declared *directly* in a block.
+
+        Covers the block's own ``let``/``const`` declarators, ``class`` and
+        (block-scoped) function declaration names. Excludes ``var``, which hoists
+        to the function frame (_function_scope_bindings), and nested blocks, which
+        get their own frame -- so a binding shadows an import only for its actual
+        lexical extent.
+        """
+        names: set[str] = set()
+        for child in node.children:
+            ctype = child.type
+            if ctype == "lexical_declaration":  # let / const
+                for declarator in _children_by_type(child, "variable_declarator"):
+                    pattern = _child_by_types(
+                        declarator, ["identifier", "object_pattern", "array_pattern"]
+                    )
+                    _collect_pattern_names(pattern, names)
+            elif ctype in (
+                "function_declaration",
+                "generator_function_declaration",
+                "class_declaration",
+            ):
+                name_node = _child_by_type(child, "identifier") or _child_by_type(
+                    child, "type_identifier"
+                )
+                if name_node is not None:
+                    names.add(_text_str(name_node))
+        return names
+
+    def _switch_body_bindings(self, node: Any) -> set[str]:
+        """Collect value bindings declared directly in any of a switch's cases."""
+        names: set[str] = set()
+        for case in node.children:
+            if case.type in ("switch_case", "switch_default"):
+                names |= self._block_bindings(case)
+        return names
+
+    def _visit_loop(self, node: Any) -> None:
+        """Walk a for / for-in / for-of, scoping its loop binding to the loop."""
+        names: set[str] = set()
+        if node.type == "for_in_statement":
+            _collect_pattern_names(node.child_by_field_name("left"), names)
+        else:  # for_statement
+            initializer = node.child_by_field_name("initializer")
+            if initializer is not None and initializer.type in (
+                "lexical_declaration",
+                "variable_declaration",
+            ):
+                for declarator in _children_by_type(initializer, "variable_declarator"):
+                    pattern = _child_by_types(
+                        declarator, ["identifier", "object_pattern", "array_pattern"]
+                    )
+                    _collect_pattern_names(pattern, names)
+        self._push_scope(names)
+        for child in node.children:
+            self._visit_expression(child)
+        self._pop_scope()
+
+    def _visit_catch_clause(self, node: Any) -> None:
+        """Walk a catch clause, scoping its parameter to the clause."""
+        names: set[str] = set()
+        param = node.child_by_field_name("parameter")
+        _collect_pattern_names(param, names)
+        self._push_scope(names)
+        for child in node.children:
+            self._visit_expression(child)
+        self._pop_scope()
+
+    def _visit_anonymous_class(self, node: Any) -> None:
+        """Walk an anonymous `class {}` expression for import usage, node-free.
+
+        Emits no node (unlike _process_class). Child methods are dispatched as
+        method_definition -> _visit_anonymous_function (opening their parameter
+        scope); field initializers and heritage clauses recurse generically so
+        their value/type references still mark imports used.
+
+        A NAMED class expression (`class foo {}`) binds its own name within the
+        class body (self-reference); that name shadows an import of the same name
+        (codex review), so it is pushed as a scope frame around the body walk.
+        """
+        names: set[str] = set()
+        name_node = _child_by_type(node, "type_identifier") or _child_by_type(node, "identifier")
+        if name_node is not None:
+            names.add(_text_str(name_node))
+        self._push_scope(names)
+        for child in node.children:
+            self._visit_expression(child)
+        self._pop_scope()
+
+    def _visit_anonymous_function(self, node: Any) -> None:
+        """Walk an anonymous function expression under its own scope frame.
+
+        Emits no CodeFunction node (unlike _process_function) -- anonymous
+        function expressions were never node-bearing, and this walk exists only
+        to scope import-usage. The body's statement_block pushes its own
+        _block_bindings frame via _visit_expression.
+        """
+        names = self._function_scope_bindings(node)
+        # A NAMED function expression (`function foo() {}`) binds its own name
+        # within its body (self-reference); that name shadows an import of the
+        # same name (codex review).
+        name_node = _child_by_type(node, "identifier")
+        if name_node is not None:
+            names.add(_text_str(name_node))
+        self._push_scope(names)
+        body = node.child_by_field_name("body") or _child_by_types(
+            node, ["statement_block", "expression"]
+        )
+        if body is not None:
+            self._visit_expression(body)
+        self._pop_scope()
 
     # Nodes that open a new binding scope: an import name referenced *inside* one
     # may actually be a shadowing parameter/local, so the export walker must not
@@ -1195,9 +1483,13 @@ class TypeScriptFactExtractor(UniqueIdMixin):
         A rendered type such as ``Array<Widget>`` or ``Config["x"]`` may embed
         several imported names, so every identifier token is checked -- unlike
         value positions, which reference a single callee/constructor name.
+
+        Type references bypass value-scope resolution (``check_scope=False``): TS
+        keeps type and value namespaces separate, so a value binding must not
+        shadow a type-position use of an imported type (bead code_hygiene_mcp-ukr).
         """
         for token in _TYPE_IDENT_RE.findall(type_text):
-            self._mark_import_used(token)
+            self._mark_import_used(token, check_scope=False)
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -1299,6 +1591,47 @@ def _child_by_types(node: Any, node_types: list[str]) -> Any | None:
 
 def _children_by_type(node: Any, node_type: str) -> list[Any]:
     return [child for child in node.children if child.type == node_type]
+
+
+def _collect_pattern_names(node: Any, out: set[str]) -> None:
+    """Collect value-namespace binding names from a binding pattern.
+
+    Handles plain identifiers and destructuring patterns (object/array),
+    including rest elements, defaults, and shorthand -- e.g. ``{ foo }``,
+    ``{ a: b }`` (binds ``b``, not ``a``), ``[x, ...rest]``, ``foo = 1``. Used to
+    populate scope frames for import-shadowing detection (bead
+    code_hygiene_mcp-ukr). Property *keys* in an object pattern are not
+    bindings; only the value side (the bound name) is collected.
+    """
+    if node is None:
+        return
+    node_type = node.type
+    if node_type in ("identifier", "shorthand_property_identifier_pattern"):
+        out.add(_text_str(node))
+        return
+    if node_type == "pair_pattern":
+        # `{ key: value }` binds `value`; the key is a property name, not a
+        # binding. Recurse only into the value side.
+        value = node.child_by_field_name("value")
+        _collect_pattern_names(value if value is not None else node, out)
+        return
+    if node_type in ("object_pattern", "array_pattern", "rest_pattern", "assignment_pattern"):
+        for child in node.children:
+            _collect_pattern_names(child, out)
+        return
+    # Generic descent for wrappers we don't special-case (keeps rare tree shapes
+    # from silently dropping a binding).
+    for child in node.children:
+        if child.type in (
+            "identifier",
+            "shorthand_property_identifier_pattern",
+            "object_pattern",
+            "array_pattern",
+            "rest_pattern",
+            "assignment_pattern",
+            "pair_pattern",
+        ):
+            _collect_pattern_names(child, out)
 
 
 def _string_value(node: Any) -> str:

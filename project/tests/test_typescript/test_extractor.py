@@ -816,3 +816,325 @@ class TestTypeScriptLanguageAdapter:
         assert import_nodes
         assert import_nodes[0].properties.get("resolved_source") == str(helper_file)
         assert import_nodes[0].properties.get("resolved_module") == "utils.helper"
+
+
+class TestScopeAwareImportUsage:
+    """Scope walker: mark an import used only when a name resolves to it rather
+    than to a closer binding (bead code_hygiene_mcp-ukr).
+    """
+
+    def test_export_default_closure_marks_import_used(self):
+        # RED case 1: a genuine closure use inside an arrow body is a real use of
+        # the import. The scope-flat walker stopped at the arrow boundary and left
+        # `foo` looking unused (a false positive).
+        source = """
+import foo from "./foo";
+
+export default () => foo;
+"""
+        delta = _extract(source, file_name="index.ts")
+        assert "foo" not in _unused_import_names(delta), (
+            "foo is closed over by the arrow body; it IS used and must not be flagged"
+        )
+
+    def test_export_default_shadowing_param_leaves_import_unused(self):
+        # RED case 2: the arrow parameter `foo` shadows the import `foo`; the body
+        # reference resolves to the param, NOT the import. The import is unused and
+        # must still be flagged (guard against a scope-blind false negative).
+        source = """
+import foo from "./foo";
+
+export default (foo) => foo;
+"""
+        delta = _extract(source, file_name="index.ts")
+        assert "foo" in _unused_import_names(delta), (
+            "foo the import is shadowed by the param; the import IS unused and must be flagged"
+        )
+
+    def test_function_body_closure_marks_import_used(self):
+        # A closure use inside a named function body is a real use.
+        source = """
+import foo from "./foo";
+
+export function wrap() {
+  return foo;
+}
+"""
+        delta = _extract(source, file_name="wrap.ts")
+        assert "foo" not in _unused_import_names(delta)
+
+    def test_function_param_shadow_leaves_import_unused(self):
+        # A parameter shadowing the import makes the import unused.
+        source = """
+import foo from "./foo";
+
+export function wrap(foo) {
+  return foo();
+}
+"""
+        delta = _extract(source, file_name="wrap.ts")
+        assert "foo" in _unused_import_names(delta), (
+            "foo the import is shadowed by the param; the import IS unused"
+        )
+
+    def test_local_const_shadow_leaves_import_unused(self):
+        # A const declarator shadowing the import inside a body makes it unused.
+        source = """
+import foo from "./foo";
+
+export function wrap() {
+  const foo = 1;
+  return foo;
+}
+"""
+        delta = _extract(source, file_name="wrap.ts")
+        assert "foo" in _unused_import_names(delta), (
+            "foo is shadowed by a local const; the import IS unused"
+        )
+
+    def test_destructured_param_shadow_leaves_import_unused(self):
+        # Destructuring patterns bind names too: { foo } shadows the import.
+        source = """
+import foo from "./foo";
+
+export function wrap({ foo }) {
+  return foo;
+}
+"""
+        delta = _extract(source, file_name="wrap.ts")
+        assert "foo" in _unused_import_names(delta), (
+            "foo is shadowed by a destructured param; the import IS unused"
+        )
+
+    def test_member_prefix_match_survives(self):
+        # Member-expression prefix matching must still work post-rewrite: a
+        # namespace import used as `ns.thing()` marks `ns` used.
+        source = """
+import * as ns from "./ns";
+
+export function go() {
+  return ns.thing();
+}
+"""
+        delta = _extract(source, file_name="go.ts")
+        assert "ns" not in _unused_import_names(delta), (
+            "ns.thing() is a member-prefix use of the namespace import"
+        )
+
+    def test_value_binding_does_not_shadow_type_position_use(self):
+        # Design decision (bead code_hygiene_mcp-ukr #2): TS has separate type and
+        # value namespaces. A value binding `Foo` (the const) does NOT shadow a
+        # type-position use of imported `Foo`; the import is used in the type
+        # position and must not be flagged. _mark_type_used is intentionally
+        # scope-blind for this reason.
+        source = """
+import { Foo } from "./foo";
+
+export function make(): Foo {
+  const Foo = 1;
+  return Foo as any;
+}
+"""
+        delta = _extract(source, file_name="make.ts")
+        assert "Foo" not in _unused_import_names(delta), (
+            "imported Foo is used in the return-type position; the value-namespace "
+            "local const Foo does not shadow it"
+        )
+
+    def test_import_use_before_shadowing_block_still_used(self):
+        # Codex finding 1: a block-scoped `const foo` shadows only inside its
+        # block; a reference in the enclosing block still resolves to the import.
+        source = """
+import foo from "./foo";
+
+export function f() {
+  foo();
+  {
+    const foo = 1;
+    return foo;
+  }
+}
+"""
+        delta = _extract(source, file_name="f.ts")
+        assert "foo" not in _unused_import_names(delta), (
+            "foo() before the shadowing block is a genuine import use"
+        )
+
+    def test_switch_case_local_shadows_import(self):
+        # Codex finding 3: a `const` declared in a switch case shadows the import
+        # within the switch body; the import is then unused.
+        source = """
+import foo from "./foo";
+
+export function f(x) {
+  switch (x) {
+    case 1: {
+      const foo = () => 1;
+      return foo();
+    }
+  }
+}
+"""
+        delta = _extract(source, file_name="f.ts")
+        assert "foo" in _unused_import_names(delta), (
+            "foo is shadowed by a switch-case local; the import IS unused"
+        )
+
+    def test_type_position_use_survives_value_shadow_in_body(self):
+        # Codex finding 2: a value local `Foo` must NOT hide a type-position use
+        # of imported `Foo` inside the same body (`as Foo`). Type and value
+        # namespaces are separate.
+        source = """
+import { Foo } from "./foo";
+
+export function make(x: unknown) {
+  const Foo = 1;
+  return x as Foo;
+}
+"""
+        delta = _extract(source, file_name="make.ts")
+        assert "Foo" not in _unused_import_names(delta), (
+            "the `as Foo` type use references the imported type, not the value local"
+        )
+
+    def test_var_in_nested_block_hoists_to_function_scope(self):
+        # Codex round-2 finding: `var` hoists to the function scope, so a `var foo`
+        # in a nested block shadows the import for the WHOLE function, including a
+        # reference after the block. (`let`/`const` are block-scoped and do not.)
+        source = """
+import foo from "./foo";
+
+export function f() {
+  {
+    var foo = 1;
+  }
+  return foo();
+}
+"""
+        delta = _extract(source, file_name="f.ts")
+        assert "foo" in _unused_import_names(delta), (
+            "var foo hoists to the function; the import IS shadowed and unused"
+        )
+
+    def test_local_type_shadow_is_out_of_scope(self):
+        # Design decision (bead code_hygiene_mcp-ukr #2): type-NAMESPACE bindings
+        # (local `type`/`interface`/type params) are NOT tracked. A local
+        # `type Foo` therefore does NOT suppress marking imported `Foo` used from
+        # a type-position reference (the return-type annotation below, which
+        # reaches _mark_type_used). This pins the documented current behaviour;
+        # tracking the type namespace is deliberately out of scope for this bead.
+        source = """
+import { Foo } from "./foo";
+
+export function f(): Foo {
+  type Foo = number;
+  return 1 as any;
+}
+"""
+        delta = _extract(source, file_name="f.ts")
+        # Current (documented) behaviour: imported Foo is treated as used even
+        # though a local type alias `Foo` also exists in the body.
+        assert "Foo" not in _unused_import_names(delta), (
+            "local type-namespace bindings are out of scope (bead decision #2); "
+            "the imported Foo is conservatively treated as used"
+        )
+
+    def test_function_expression_param_shadows_import(self):
+        # Codex round-3 finding: an anonymous `function (foo) {}` expression (a
+        # callback) opens a parameter scope just like a declaration/arrow. Its
+        # param `foo` shadows the import; the import is unused.
+        source = """
+import foo from "./foo";
+
+export const x = consume(function (foo) {
+  return foo();
+});
+"""
+        delta = _extract(source, file_name="x.ts")
+        assert "foo" in _unused_import_names(delta), (
+            "the function-expression param foo shadows the import; the import IS unused"
+        )
+
+    def test_function_expression_closure_marks_import_used(self):
+        # Dual guard: a closure use inside a function expression with no shadowing
+        # param is a genuine use of the import.
+        source = """
+import foo from "./foo";
+
+export const x = consume(function () {
+  return foo();
+});
+"""
+        delta = _extract(source, file_name="x.ts")
+        assert "foo" not in _unused_import_names(delta), (
+            "foo is closed over by the function-expression body; it IS used"
+        )
+
+    def test_named_function_expression_self_name_shadows_import(self):
+        # Codex round-4 finding: a NAMED function expression binds its own name
+        # within its body (the classic self-reference binding). `function foo()`
+        # makes `foo()` inside refer to the function itself, not the import.
+        source = """
+import foo from "./foo";
+
+export const x = consume(function foo() {
+  return foo();
+});
+"""
+        delta = _extract(source, file_name="x.ts")
+        assert "foo" in _unused_import_names(delta), (
+            "the named function expression's own name foo shadows the import; "
+            "the import IS unused"
+        )
+
+    def test_class_expression_method_param_shadows_import(self):
+        # Codex round-5 finding: an anonymous `class {}` expression's method still
+        # opens a parameter scope. The method param `foo` shadows the import.
+        source = """
+import foo from "./foo";
+
+export const x = consume(class {
+  method(foo) {
+    return foo();
+  }
+});
+"""
+        delta = _extract(source, file_name="x.ts")
+        assert "foo" in _unused_import_names(delta), (
+            "the class-expression method param foo shadows the import; unused"
+        )
+
+    def test_class_expression_method_closure_marks_import_used(self):
+        # Dual guard: a closure use inside a class-expression method with no
+        # shadowing param is a genuine use of the import.
+        source = """
+import foo from "./foo";
+
+export const x = consume(class {
+  method() {
+    return foo();
+  }
+});
+"""
+        delta = _extract(source, file_name="x.ts")
+        assert "foo" not in _unused_import_names(delta), (
+            "foo is closed over by the class-expression method body; it IS used"
+        )
+
+    def test_named_class_expression_self_name_shadows_import(self):
+        # Codex round-6 finding: a NAMED class expression binds its own name
+        # within the class body (self-reference), shadowing an import of the same
+        # name. `class foo { method() { return foo; } }` -> foo is the class.
+        source = """
+import foo from "./foo";
+
+export const x = consume(class foo {
+  method() {
+    return foo;
+  }
+});
+"""
+        delta = _extract(source, file_name="x.ts")
+        assert "foo" in _unused_import_names(delta), (
+            "the named class expression's own name foo shadows the import; unused"
+        )
