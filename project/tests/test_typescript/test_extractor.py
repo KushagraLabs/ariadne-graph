@@ -79,6 +79,32 @@ def _labels_for(delta: CodeGraphDelta, node_id: str) -> list[str]:
     return node.labels if node is not None else []
 
 
+def test_scipless_relative_import_resolves_source(tmp_path: Path) -> None:
+    """SCIP-less hard case (bead 1u5): a relative import ``./b`` must record its
+    ``resolved_source`` from the BASE extractor alone — no SCIP, no enricher.
+
+    Relative-import resolution used to live only in TreeSitterEnricher (SCIP
+    path), so a genuinely SCIP-less project produced no file->file dep edge for
+    the common ``./x`` import and the fallback recovered nothing. The extractor
+    now shares the same resolver. Real files on disk are required because
+    resolution checks existence.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "b.ts").write_text("export const x = 1;\n")
+    a = tmp_path / "src" / "a.ts"
+    a.write_text("import { x } from './b';\n")
+
+    delta = _extract("import { x } from './b';\n", repo_root=tmp_path, file_name="src/a.ts")
+
+    imports = [n for n in delta.nodes if "CodeImport" in n.labels]
+    assert imports, "no CodeImport node emitted"
+    target = str(tmp_path / "src" / "b.ts")
+    assert any(n.properties.get("resolved_source") == target for n in imports), (
+        f"relative import did not resolve to {target}; "
+        f"got {[n.properties.get('resolved_source') for n in imports]}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Basic extraction
 # ---------------------------------------------------------------------------

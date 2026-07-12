@@ -213,6 +213,29 @@ class FreshnessMixin(BaseModel):
         ),
     )
 
+
+class ResolutionMixin(BaseModel):
+    """Shared in-band resolution-provenance envelope for dep-graph responses.
+
+    Rides the same optional-field mechanism as :class:`FreshnessMixin` (bead
+    hh0): additive, ignorable, no parallel channel. Tells a consumer the
+    confidence of the file->file dep edges behind an analysis response — SCIP
+    definition-resolution vs the tree-sitter IMPORTS fallback (bead 1u5) — so an
+    agent knows whether it is reading precise edges or import-granularity ones.
+    ``None`` when the graph is unknown/unindexed (nothing to report).
+    """
+
+    resolution: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "In-band resolution-provenance envelope: {references_files (int), "
+            "imports_only_files (int), resolution ('scip'|'tree-sitter-imports'|"
+            "'none')}. imports_only_files>0 means some file->file edges are "
+            "import-granularity fallback, not SCIP. None when not indexed."
+        ),
+    )
+
+
 class IndexOutput(BaseModel):
     """Output for code_graph_index tool."""
 
@@ -339,7 +362,7 @@ class FindHotspotsOutput(FreshnessMixin):
     schema_version: str = Field(default=SCHEMA_VERSION, description="Response schema version")
 
 
-class ArchitectureOutput(FreshnessMixin):
+class ArchitectureOutput(FreshnessMixin, ResolutionMixin):
     """Output for code_graph_get_architecture tool."""
 
     summary: dict[str, Any] = Field(default_factory=dict, description="Architecture summary")
@@ -365,7 +388,7 @@ class ExplainEdgeOutput(FreshnessMixin):
     message: str = Field(default="", description="Human-readable status message")
 
 
-class DependencyMatrixOutput(FreshnessMixin):
+class DependencyMatrixOutput(FreshnessMixin, ResolutionMixin):
     """Output for code_graph_get_dependency_matrix tool."""
 
     nodes: list[dict[str, Any]] = Field(default_factory=list, description="Matrix nodes: id, module, production")

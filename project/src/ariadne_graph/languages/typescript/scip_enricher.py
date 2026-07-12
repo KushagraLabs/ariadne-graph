@@ -15,6 +15,7 @@ from typing import Any
 
 from ariadne_graph.core.models import CodeGraphDelta, CodeNode
 from ariadne_graph.languages.typescript.extractor import HAS_TREE_SITTER
+from ariadne_graph.languages.typescript.tsconfig import resolve_relative_import
 
 if HAS_TREE_SITTER:
     from tree_sitter import Language, Parser
@@ -212,25 +213,16 @@ class TreeSitterEnricher:
     def _resolve_relative(import_node: CodeNode, file_path: Path) -> None:
         """Fill ``resolved_source`` for a relative (``./``/``../``) import.
 
-        The Tree-sitter extractor only resolves tsconfig aliases; a relative
-        specifier resolves against the importing file's directory. Records the
-        real target path (trying the common TS/JS extensions) so file-level
-        dependency queries see the edge.
+        Delegates to the shared :func:`resolve_relative_import` SSOT (same logic
+        the base extractor uses SCIP-less), so a relative specifier resolves
+        against the importing file's directory and file-level dependency queries
+        see the edge.
         """
         if import_node.properties.get("resolved_source"):
             return
-        source = str(import_node.properties.get("source", ""))
-        if not source.startswith("."):
-            return
-        base = (file_path.parent / source).resolve()
-        candidates = [base]
-        for ext in (".ts", ".tsx", ".js", ".jsx"):
-            candidates.append(base.with_suffix(ext))
-            candidates.append(base / f"index{ext}")
-        for candidate in candidates:
-            if candidate.is_file():
-                import_node.properties["resolved_source"] = str(candidate)
-                return
+        resolved = resolve_relative_import(str(import_node.properties.get("source", "")), file_path)
+        if resolved:
+            import_node.properties["resolved_source"] = resolved
 
     def _parse(self, file_path: Path, source_bytes: bytes) -> Any | None:
         """Parse the file with Tree-sitter."""

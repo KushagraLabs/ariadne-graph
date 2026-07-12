@@ -15,6 +15,35 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Extensions a bare relative TS/JS specifier may resolve to, plus the index-file
+# form for directory imports (``./foo`` -> ``./foo/index.ts``). Order matters:
+# the first existing candidate wins, matching TS module resolution.
+_RELATIVE_IMPORT_EXTS = (".ts", ".tsx", ".js", ".jsx")
+
+
+def resolve_relative_import(source: str, file_path: Path) -> str | None:
+    """Resolve a relative import specifier (``./x``/``../x``) to a real file.
+
+    SSOT for relative-import resolution, shared by the base Tree-sitter extractor
+    (SCIP-less path) and :class:`~ariadne_graph.languages.typescript.scip_enricher.TreeSitterEnricher`
+    (SCIP path). ``TsConfigResolver.resolve`` only handles ``compilerOptions.paths``
+    aliases; a relative specifier resolves against the importing file's directory
+    instead. Tries the file as-is, common TS/JS extensions, and the directory
+    ``index`` form; returns the absolute path of the first that exists on disk, or
+    ``None`` when the specifier is not relative or nothing matches.
+    """
+    if not source.startswith("."):
+        return None
+    base = (file_path.parent / source).resolve()
+    candidates = [base]
+    for ext in _RELATIVE_IMPORT_EXTS:
+        candidates.append(base.with_suffix(ext))
+        candidates.append(base / f"index{ext}")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
 
 class TsConfigResolver:
     """Resolve TypeScript path aliases using tsconfig ``compilerOptions.paths``.

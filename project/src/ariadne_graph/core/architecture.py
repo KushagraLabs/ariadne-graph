@@ -646,24 +646,106 @@ def _strongly_connected_components(
     return components
 
 
-# File->file dependency edges, definition-resolved: TypeScript REFERENCES +
-# SCIP-resolved Python CALLS only. Shared SSOT — the web layer's
-# full_graph() (web/queries.py) imports this same query for its dep edges.
-_DEP_EDGE_SQL = """
-SELECT json_extract(sn.properties, '$.file_path') AS sf,
-       json_extract(tn.properties, '$.file_path') AS tf
-FROM edges e
-JOIN nodes sn ON sn.graph_id = e.graph_id AND sn.id = e.source
-JOIN nodes tn ON tn.graph_id = e.graph_id AND tn.id = e.target
-WHERE e.graph_id = ?
-  AND (
-        e.rel_type = 'REFERENCES'
-        OR (e.rel_type = 'CALLS'
-            AND json_extract(e.properties, '$.resolved_by') = 'scip-python')
-      )
-  AND json_extract(sn.properties, '$.file_path') IS NOT NULL
-  AND json_extract(tn.properties, '$.file_path') IS NOT NULL
-  AND json_extract(sn.properties, '$.file_path') != json_extract(tn.properties, '$.file_path')
+# File->file dependency edges, definition-resolved. Shared SSOT — the web layer's
+# full_graph() (web/queries.py) imports this same query for its dep edges. Two
+# branches, UNION-ed to a single (sf, tf) shape and de-duplicated:
+#
+#   1. SCIP branch — TypeScript REFERENCES + SCIP-resolved Python CALLS. The
+#      high-confidence, definition-resolved edges.
+#   2. IMPORTS fallback (bead 1u5) — when scip-typescript did not run, the
+#      tree-sitter extractor still emits IMPORTS edges to CodeImport nodes that
+#      carry a tsconfig-resolved ``resolved_source`` (the target file). Those are
+#      genuine file->file dependencies at import granularity. To avoid
+#      double-counting where SCIP *did* run (REFERENCES already subsume imports),
+#      the fallback is gated PER SOURCE FILE: an IMPORTS edge contributes only
+#      when its source file has ZERO outgoing REFERENCES edges. A file SCIP
+#      resolved is served entirely by branch 1; a file SCIP missed falls back to
+#      its imports.
+#
+# Kept deliberately narrow: only IMPORTS-derived file->file edges, never guessed
+# cross-file CALLS (that phantom-edge class — bead ae0 — was expensive to kill).
+#
+# A SCIP dep edge is a TypeScript REFERENCES or a SCIP-resolved Python CALLS.
+# Shared as one template (parametrized by the edge alias) so every place that
+# selects SCIP edges stays consistent.
+def _scip_edge_predicate(edge_alias: str) -> str:
+    return (
+        f"{edge_alias}.rel_type = 'REFERENCES'"
+        f" OR ({edge_alias}.rel_type = 'CALLS'"
+        f" AND json_extract({edge_alias}.properties, '$.resolved_by') = 'scip-python')"
+    )
+
+
+# Two CTEs materialized ONCE per query (bound to one graph_id via the enclosing
+# query's parameter), so the fallback's gates are hash-join lookups rather than a
+# correlated full-graph scan per import — the difference between linear and
+# quadratic on 100k+ node repos:
+#
+#   scip_covered_files — source files with at least one CROSS-FILE SCIP dep edge.
+#     Cross-file matters: an intra-file REFERENCES yields no file->file dep (the
+#     outer query drops sf==tf), so such a file is NOT covered and must still fall
+#     back to its imports. Joins on the indexed ``nodes.file_path`` column.
+#   indexed_files — every indexed CodeFile's path. The fallback's target must be
+#     one of these: TsConfigResolver returns the intended path even when the file
+#     is absent/unindexed, and an unvalidated target would inject a phantom
+#     dependency the matrix/diagnostics can't map.
+def _dep_edge_ctes(param_name: str = "?") -> str:
+    return f"""
+WITH scip_covered_files(file_path) AS (
+    SELECT DISTINCT rsn.file_path
+    FROM edges r
+    JOIN nodes rsn ON rsn.graph_id = r.graph_id AND rsn.id = r.source
+    JOIN nodes rtn ON rtn.graph_id = r.graph_id AND rtn.id = r.target
+    WHERE r.graph_id = {param_name}
+      AND ({_scip_edge_predicate("r")})
+      AND rsn.file_path IS NOT NULL
+      AND rtn.file_path IS NOT NULL
+      AND rsn.file_path != rtn.file_path
+),
+indexed_files(file_path) AS (
+    SELECT DISTINCT file_path
+    FROM nodes
+    WHERE graph_id = {param_name} AND labels LIKE '%"CodeFile"%'
+      AND file_path IS NOT NULL
+)
+"""
+
+
+# ``UNION ALL`` (not ``UNION``): the SCIP branch's row multiplicity is load-
+# bearing — dependency_matrix()/the web graph derive import_count and edge weight
+# from how many symbol/call edges connect two files. The two branches never
+# overlap (the fallback is gated to source files NOT in scip_covered_files), so
+# ALL adds no cross-branch duplicates while preserving that multiplicity.
+_DEP_EDGE_SQL = f"""
+{_dep_edge_ctes()}
+SELECT sf, tf FROM (
+    SELECT sn.file_path AS sf, tn.file_path AS tf
+    FROM edges e
+    JOIN nodes sn ON sn.graph_id = e.graph_id AND sn.id = e.source
+    JOIN nodes tn ON tn.graph_id = e.graph_id AND tn.id = e.target
+    WHERE e.graph_id = ?
+      AND ({_scip_edge_predicate("e")})
+      AND sn.file_path IS NOT NULL
+      AND tn.file_path IS NOT NULL
+
+    UNION ALL
+
+    -- IMPORTS fallback: source file -> the CodeImport target's resolved file,
+    -- for source files NOT SCIP-covered and targets that are indexed CodeFiles.
+    SELECT sn.file_path AS sf,
+           json_extract(imp.properties, '$.resolved_source') AS tf
+    FROM edges e
+    JOIN nodes sn ON sn.graph_id = e.graph_id AND sn.id = e.source
+    JOIN nodes imp ON imp.graph_id = e.graph_id AND imp.id = e.target
+    JOIN indexed_files itf
+        ON itf.file_path = json_extract(imp.properties, '$.resolved_source')
+    LEFT JOIN scip_covered_files scf ON scf.file_path = sn.file_path
+    WHERE e.graph_id = ?
+      AND e.rel_type IN ('IMPORTS', 'IMPORTS_SYMBOL')
+      AND sn.file_path IS NOT NULL
+      AND scf.file_path IS NULL
+)
+WHERE sf IS NOT NULL AND tf IS NOT NULL AND sf != tf
 """
 
 _FILE_SQL = """
@@ -671,6 +753,32 @@ SELECT id, json_extract(properties, '$.file_path') AS file_path
 FROM nodes
 WHERE graph_id = ? AND labels LIKE '%"CodeFile"%'
   AND json_extract(properties, '$.file_path') IS NOT NULL
+"""
+
+# Resolution-coverage provenance (bead 1u5): per source file, which dep-edge
+# branch of _DEP_EDGE_SQL served it. Reuses the SAME two CTEs as _DEP_EDGE_SQL, so
+# the counts describe exactly what the dep SSOT produced (no gate drift) and stay
+# linear on large repos. ``references_files`` = source files with a CROSS-FILE
+# SCIP dep edge (so a Python graph resolved via scip-python CALLS reports
+# ``scip``, not ``none``, and an intra-file-only reference does NOT falsely claim
+# coverage). ``imports_only_files`` = source files NOT SCIP-covered that fell back
+# to an IMPORTS edge with an indexed target.
+_RESOLUTION_COVERAGE_SQL = f"""
+{_dep_edge_ctes()}
+SELECT
+  (SELECT COUNT(*) FROM scip_covered_files) AS references_files,
+  (SELECT COUNT(DISTINCT sn.file_path)
+   FROM edges e
+   JOIN nodes sn ON sn.graph_id = e.graph_id AND sn.id = e.source
+   JOIN nodes imp ON imp.graph_id = e.graph_id AND imp.id = e.target
+   JOIN indexed_files itf
+       ON itf.file_path = json_extract(imp.properties, '$.resolved_source')
+   LEFT JOIN scip_covered_files scf ON scf.file_path = sn.file_path
+   WHERE e.graph_id = ?
+     AND e.rel_type IN ('IMPORTS', 'IMPORTS_SYMBOL')
+     AND sn.file_path IS NOT NULL
+     AND scf.file_path IS NULL
+  ) AS imports_only_files
 """
 
 # rules whose findings this pass owns — cleared before each re-run so re-indexing
@@ -707,7 +815,7 @@ async def persist_architecture_diagnostics(
         file_rows = await file_cursor.fetchall()
         abs_to_file_id: dict[str, str] = {r["file_path"]: r["id"] for r in file_rows}
 
-        dep_cursor = await db.execute(_DEP_EDGE_SQL, (graph_id,))
+        dep_cursor = await db.execute(_DEP_EDGE_SQL, (graph_id, graph_id, graph_id, graph_id))
         dep_rows = await dep_cursor.fetchall()
     finally:
         await db.close()
@@ -788,7 +896,7 @@ async def read_dependency_matrix(
     try:
         file_cursor = await db.execute(_FILE_SQL, (graph_id,))
         file_rows = await file_cursor.fetchall()
-        dep_cursor = await db.execute(_DEP_EDGE_SQL, (graph_id,))
+        dep_cursor = await db.execute(_DEP_EDGE_SQL, (graph_id, graph_id, graph_id, graph_id))
         dep_rows = await dep_cursor.fetchall()
     finally:
         await db.close()
@@ -796,6 +904,51 @@ async def read_dependency_matrix(
     files = [_rel(r["file_path"], repo_root) for r in file_rows]
     dep_edges = [(_rel(r["sf"], repo_root), _rel(r["tf"], repo_root)) for r in dep_rows]
     return dependency_matrix(files, dep_edges, group_by=group_by)
+
+
+async def read_resolution_coverage(
+    store: SQLiteGraphStore,
+    graph_id: str,
+) -> dict[str, object]:
+    """Resolution provenance for the dep SSOT: how each source file was resolved.
+
+    Reports the confidence of what ``_DEP_EDGE_SQL`` produced so a consuming agent
+    knows whether it is looking at SCIP-grade edges or import-granularity
+    fallback:
+
+      * ``references_files`` — source files with SCIP REFERENCES (definition-
+        resolved; the fallback does not touch them).
+      * ``imports_only_files`` — source files with no REFERENCES that fell back to
+        tree-sitter IMPORTS edges (import granularity, no cross-file CALLS).
+      * ``resolution`` — the coarse label: ``scip`` when every resolved file has
+        REFERENCES, ``tree-sitter-imports`` when at least one file is
+        imports-only, ``none`` when nothing resolved.
+
+    Attached to analysis responses via the same envelope mechanism as the hh0
+    freshness field (a mixin field on the output model), never a parallel channel.
+    """
+    db = await store._connect()
+    try:
+        cursor = await db.execute(_RESOLUTION_COVERAGE_SQL, (graph_id, graph_id, graph_id))
+        row = await cursor.fetchone()
+    finally:
+        await db.close()
+
+    references_files = int(row["references_files"] or 0) if row else 0
+    imports_only_files = int(row["imports_only_files"] or 0) if row else 0
+
+    if imports_only_files > 0:
+        resolution = "tree-sitter-imports"
+    elif references_files > 0:
+        resolution = "scip"
+    else:
+        resolution = "none"
+
+    return {
+        "references_files": references_files,
+        "imports_only_files": imports_only_files,
+        "resolution": resolution,
+    }
 
 
 async def _delete_arch_diagnostics(store: SQLiteGraphStore, graph_id: str) -> None:

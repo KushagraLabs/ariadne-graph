@@ -171,7 +171,7 @@ async def full_graph(store: SQLiteGraphStore, graph_id: str, *, repo_root: str) 
             dir_id = "/".join(segments[: depth + 1])
             nodes[dir_id]["worst_level"] = _worse(nodes[dir_id]["worst_level"], diag["worst"])
 
-    xref = await _rows(store, _DEP_EDGE_SQL, (graph_id,))
+    xref = await _rows(store, _DEP_EDGE_SQL, (graph_id, graph_id, graph_id, graph_id))
     weights: dict[tuple[str, str], int] = {}
     for r in xref:
         sf, tf = r["sf"], r["tf"]

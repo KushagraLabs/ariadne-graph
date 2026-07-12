@@ -22,6 +22,7 @@ from ariadne_graph.core.architecture import (
     is_peripheral_path,
     persist_architecture_diagnostics,
     read_dependency_matrix,
+    read_resolution_coverage,
 )
 from ariadne_graph.core.architecture_config import (
     ArchitectureConfig,
@@ -430,6 +431,22 @@ class ToolRegistry:
             return await self.freshness_tracker.compute_freshness(graph_id)
         except Exception as exc:
             logger.warning("Freshness envelope computation failed for %s: %s", graph_id, exc)
+            return None
+
+    async def _resolution_envelope(self, graph_id: str | None) -> dict[str, Any] | None:
+        """Compute the shared in-band resolution-provenance envelope (bead 1u5).
+
+        Delegates to :func:`read_resolution_coverage`; rides the response the same
+        way as :meth:`_freshness_envelope`. Returns ``None`` for an unknown graph
+        so the optional ``resolution`` field stays absent. Never raises — a
+        provenance failure must not break the analysis result it rides along with.
+        """
+        if graph_id is None:
+            return None
+        try:
+            return await read_resolution_coverage(self.graph_store, graph_id)
+        except Exception as exc:
+            logger.warning("Resolution envelope computation failed for %s: %s", graph_id, exc)
             return None
 
     async def _freshness_envelope_multi(self, graph_ids: list[str]) -> dict[str, Any] | None:
@@ -1481,6 +1498,7 @@ class ToolRegistry:
             )
 
         freshness = await self._freshness_envelope(graph_id)
+        resolution = await self._resolution_envelope(graph_id)
         if self.community_analyzer is not None:
             try:
                 summary_obj = await self.community_analyzer.get_architecture_summary(
@@ -1496,6 +1514,7 @@ class ToolRegistry:
                 )
                 paginated = self._paginate_architecture(output, input)
                 paginated.freshness = freshness
+                paginated.resolution = resolution
                 return paginated
             except Exception as exc:
                 logger.warning("CommunityAnalyzer architecture summary failed: %s", exc)
@@ -1503,6 +1522,7 @@ class ToolRegistry:
         fallback = await GraphStoreFallbacks.get_architecture(self.graph_store, graph_id)
         paginated = self._paginate_architecture(fallback, input)
         paginated.freshness = freshness
+        paginated.resolution = resolution
         return paginated
 
     async def handle_explain_edge(self, input: ExplainEdgeInput) -> ExplainEdgeOutput:
@@ -1567,6 +1587,7 @@ class ToolRegistry:
                 f"{len(matrix.edges)} edges"
             ),
             freshness=await self._freshness_envelope(graph_id),
+            resolution=await self._resolution_envelope(graph_id),
         )
 
     async def handle_audit_public_surfaces(
@@ -1623,7 +1644,7 @@ class ToolRegistry:
         try:
             file_cursor = await db.execute(_FILE_SQL, (graph_id,))
             file_rows = await file_cursor.fetchall()
-            dep_cursor = await db.execute(_DEP_EDGE_SQL, (graph_id,))
+            dep_cursor = await db.execute(_DEP_EDGE_SQL, (graph_id, graph_id, graph_id, graph_id))
             dep_rows = await dep_cursor.fetchall()
             import_cursor = await db.execute(_IMPORT_FROM_MODULE_SQL, (graph_id,))
             import_rows = await import_cursor.fetchall()

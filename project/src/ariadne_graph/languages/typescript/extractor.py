@@ -22,7 +22,10 @@ except ImportError:
 
 from ariadne_graph.core.models import CodeEdge, CodeGraphDelta, CodeNode
 from ariadne_graph.languages.base import UniqueIdMixin
-from ariadne_graph.languages.typescript.tsconfig import TsConfigResolver
+from ariadne_graph.languages.typescript.tsconfig import (
+    TsConfigResolver,
+    resolve_relative_import,
+)
 
 # Identifier tokens inside a rendered type expression (e.g. "Array<Widget>").
 # Used to attribute type-position usage back to imports (bead
@@ -363,7 +366,12 @@ class TypeScriptFactExtractor(UniqueIdMixin):
             "from_module": source,
         }
 
-        resolved_source = self._tsconfig_resolver.resolve(source)
+        # tsconfig aliases first; fall back to relative-specifier resolution so a
+        # SCIP-less run still records ``./x``/``../x`` targets (the common case).
+        # Same SSOT the enricher uses on the SCIP path.
+        resolved_source = self._tsconfig_resolver.resolve(source) or resolve_relative_import(
+            source, self.file_path
+        )
         if resolved_source:
             properties["resolved_source"] = resolved_source
             try:

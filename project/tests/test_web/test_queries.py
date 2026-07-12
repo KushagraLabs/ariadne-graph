@@ -181,6 +181,62 @@ async def test_dep_edges_from_scip_resolved_python_calls(store: SQLiteGraphStore
          "weight": 1, "kind": "dep", "violation": False}]
 
 
+def _import(node_id: str, graph_id: str, src_path: str, target_path: str) -> CodeNode:
+    """A CodeImport node living in ``src_path`` that resolves to ``target_path``."""
+    return CodeNode(
+        id=node_id,
+        graph_id=graph_id,
+        labels=["KnowledgeNode", "CodeImport"],
+        properties={
+            "name": Path(target_path).name,
+            "file_path": src_path,
+            "resolved_source": target_path,
+        },
+    )
+
+
+def _module(node_id: str, graph_id: str, path: str) -> CodeNode:
+    return CodeNode(
+        id=node_id,
+        graph_id=graph_id,
+        labels=["KnowledgeNode", "CodeModule"],
+        properties={"name": path, "file_path": path},
+    )
+
+
+async def test_dep_edges_from_scipless_imports_fallback(store: SQLiteGraphStore) -> None:
+    """SCIP-less consistency (bead 1u5): with NO REFERENCES, the SSOT _DEP_EDGE_SQL
+    falls back to tree-sitter IMPORTS, so the web graph view still draws the file->
+    file dep edge — identical to what read_dependency_matrix would produce, since
+    both consume the exact same query.
+    """
+    repo = "/Users/x/Documents/ts_repo"
+    await store.add_nodes_batch(
+        "gts",
+        [
+            _file("f_a", "gts", f"{repo}/src/a.ts"),
+            _file("f_b", "gts", f"{repo}/src/b.ts"),
+            _module("m_a", "gts", f"{repo}/src/a.ts"),
+            _import("imp", "gts", f"{repo}/src/a.ts", f"{repo}/src/b.ts"),
+        ],
+    )
+    await store.add_edges_batch(
+        "gts",
+        [CodeEdge(source="m_a", target="imp", graph_id="gts", rel_type="IMPORTS", properties={})],
+    )
+
+    g = await queries.full_graph(store, "gts", repo_root=repo)
+    assert _edge_kinds(g, "dep") == [
+        {
+            "source": f"{repo}/src/a.ts",
+            "target": f"{repo}/src/b.ts",
+            "weight": 1,
+            "kind": "dep",
+            "violation": False,
+        }
+    ]
+
+
 async def test_peripheral_source_edges_dropped(store: SQLiteGraphStore) -> None:
     """The hard case: dep edges ORIGINATING from a peripheral organ (tests, scripts,
     tools, bin) are omitted entirely — not merely un-flagged — so the core wiring
