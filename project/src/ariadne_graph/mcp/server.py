@@ -31,6 +31,7 @@ from ariadne_graph.mcp.schemas import (
     DeleteProjectInput,
     DetectChangesInput,
     ExplainEdgeInput,
+    FindEquivalentInput,
     FindHotspotsInput,
     GetArchitectureInput,
     GetDependencyMatrixInput,
@@ -44,6 +45,7 @@ from ariadne_graph.mcp.schemas import (
     RetrieveInput,
     SearchCodeInput,
     SearchSemanticInput,
+    SuggestPlacementInput,
     TraceDependenciesInput,
 )
 from ariadne_graph.mcp.tools import ToolRegistry
@@ -564,6 +566,89 @@ async def code_graph_list_diagnostics(
         limit=limit,
     )
     result = await registry.handle_list_diagnostics(input_data)
+    return result.model_dump()
+
+
+# ============================================================================
+# PLACEMENT + DUPLICATE-CHECK TOOLS (2) — bead code_hygiene_mcp-42i
+# ============================================================================
+
+@mcp.tool()
+async def code_graph_suggest_placement(
+    repo_path: str,
+    description: str = "",
+    depends_on: list[str] | None = None,
+    consumed_by: list[str] | None = None,
+    limit: int = 5,
+) -> dict[str, Any]:
+    """Recommend which module a new component should live in.
+
+    Prevents structural drift: given a short description of a new component plus
+    the files/symbols it would depend on and the ones that would consume it,
+    returns ranked candidate modules. Each candidate lists the layering
+    VIOLATIONS placing the component there would create (e.g. an upward import),
+    so the winner is the module with the fewest violations and the best
+    co-location. Uses the declared `.ariadne/architecture.yml` module map when
+    present, else a directory-organ heuristic (works without config).
+
+    Args:
+        repo_path: Absolute or relative path to the repository root.
+        description: Short description of the new component (used in rationale).
+        depends_on: Files/symbols the new component would import/depend on.
+        consumed_by: Files/symbols that would import/consume the new component.
+        limit: Max candidate modules to return (1-50).
+
+    Returns:
+        Dict with ranked candidate modules, each with its violations and rationale.
+    """
+    registry = _get_registry()
+    input_data = SuggestPlacementInput(
+        repo_path=repo_path,
+        description=description,
+        depends_on=depends_on or [],
+        consumed_by=consumed_by or [],
+        limit=limit,
+    )
+    result = await registry.handle_suggest_placement(input_data)
+    return result.model_dump()
+
+
+@mcp.tool()
+async def code_graph_find_equivalent(
+    repo_path: str,
+    description: str = "",
+    signature: str | None = None,
+    types: list[str] | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Find existing symbols that may already implement a described component.
+
+    Prevents duplication: given a description and/or signature, returns ranked
+    existing symbols with similarity scores and rationale strings, framed as
+    needs-human-judgement — these are similarity hits, NOT an auto-verdict on
+    duplication. Requires the semantic extra; without it the response is an
+    explicit degraded-mode message (retrieval quality is degraded), never empty
+    silence.
+
+    Args:
+        repo_path: Absolute or relative path to the repository root.
+        description: Natural-language description of the component's behaviour.
+        signature: Optional signature/name to bias the search.
+        types: Optional node-type labels to filter by (e.g. 'CodeFunction').
+        limit: Max candidate symbols to return (1-50).
+
+    Returns:
+        Dict with ranked existing-symbol candidates and a needs_human_judgement flag.
+    """
+    registry = _get_registry()
+    input_data = FindEquivalentInput(
+        repo_path=repo_path,
+        description=description,
+        signature=signature,
+        types=types or [],
+        limit=limit,
+    )
+    result = await registry.handle_find_equivalent(input_data)
     return result.model_dump()
 
 

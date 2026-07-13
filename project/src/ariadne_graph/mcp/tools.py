@@ -1,4 +1,4 @@
-"""ToolRegistry — all 21 MCP tool handlers."""
+"""ToolRegistry — all 23 MCP tool handlers."""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ import asyncio
 import contextlib
 import fnmatch
 import hashlib
+import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -15,6 +17,7 @@ import xxhash
 
 from ariadne_graph.core.architecture import (
     _dir_of,
+    _organ,
     _read_code_files,
     _rel,
     _sql_connect,
@@ -36,7 +39,13 @@ if TYPE_CHECKING:
 from ariadne_graph.core.capabilities import get_capabilities
 from ariadne_graph.core.communities import CommunityAnalyzer
 from ariadne_graph.core.config import AnalyzerConfig
-from ariadne_graph.core.embeddings import EmbeddingProvider, EmbeddingService
+from ariadne_graph.core.embeddings import (
+    EMBEDDING_TEXT_VERSION,
+    EmbeddingProvider,
+    EmbeddingService,
+    LocalEmbeddingProvider,
+    embedding_version_tag,
+)
 from ariadne_graph.core.freshness import FreshnessTracker
 from ariadne_graph.core.incremental_sync import IncrementalSync
 from ariadne_graph.core.models import CodeNode, ProjectRecord
@@ -44,6 +53,8 @@ from ariadne_graph.core.retrieval import GraphRetriever
 from ariadne_graph.core.search import HybridSearcher
 from ariadne_graph.core.snippets import SnippetExtractor
 from ariadne_graph.graphstores.base import GraphStore, SearchableGraphStore
+from ariadne_graph.graphstores.memory import MemoryGraphStore
+from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
 from ariadne_graph.languages.base import LanguageAdapter
 from ariadne_graph.mcp.fallbacks import GraphStoreFallbacks
 from ariadne_graph.mcp.schemas import (
@@ -60,8 +71,11 @@ from ariadne_graph.mcp.schemas import (
     DependencyMatrixOutput,
     DetectChangesInput,
     DetectChangesOutput,
+    EquivalentCandidate,
     ExplainEdgeInput,
     ExplainEdgeOutput,
+    FindEquivalentInput,
+    FindEquivalentOutput,
     FindHotspotsInput,
     FindHotspotsOutput,
     GetArchitectureInput,
@@ -79,6 +93,7 @@ from ariadne_graph.mcp.schemas import (
     ListDiagnosticsOutput,
     LumenRetrieveInput,
     LumenRetrieveOutput,
+    PlacementCandidate,
     ProjectListOutput,
     RetrieveInput,
     RetrieveOutput,
@@ -86,6 +101,8 @@ from ariadne_graph.mcp.schemas import (
     SearchCodeOutput,
     SearchSemanticInput,
     SearchSemanticOutput,
+    SuggestPlacementInput,
+    SuggestPlacementOutput,
     TraceDependenciesInput,
     TraceDependenciesOutput,
 )
@@ -101,6 +118,61 @@ def _graph_id_from_repo_path(repo_path: str) -> str:
     """Derive a stable graph_id from a repository path."""
     resolved = str(Path(repo_path).resolve())
     return hashlib.sha256(resolved.encode()).hexdigest()[:16]
+
+
+# Node labels that denote a DEFINITION of a symbol (as opposed to an import,
+# usage, file, or diagnostic). Used by placement symbol resolution and as the
+# default type filter for find_equivalent — both want real definitions, not the
+# file/import/module nodes that also carry the name. Covers Python (function/
+# method/class/variable) AND TypeScript (interface/type-alias/hook/react-component)
+# definition kinds the extractors emit.
+_DEFINITION_LABELS = frozenset(
+    {
+        "CodeFunction",
+        "CodeMethod",
+        "CodeClass",
+        "CodeVariable",
+        "CodeInterface",
+        "CodeTypeAlias",
+        "CodeHook",
+        "CodeReactComponent",
+    }
+)
+
+# Upper bound on the semantic pool find_equivalent fetches when the type filter
+# means matching definitions may rank below non-matching nodes. We fetch the whole
+# graph up to this ceiling so the post-fetch filter can't drop a match that only
+# exists past a small window; beyond it the tool warns rather than silently caps.
+_EQUIVALENT_POOL_CEILING = 5000
+
+
+def _record_props(node: dict[str, Any]) -> dict[str, Any]:
+    """Node properties from a store record, tolerant of both shapes: SQLite/Memory
+    nest them under ``properties``; Neo4j's ``n {.*, id, labels}`` FLATTENS them to
+    the top level. Prefer the nested dict; else treat the record itself as the
+    property bag (dropping the structural id/labels keys)."""
+    props = node.get("properties")
+    if isinstance(props, dict):
+        return props
+    return {k: v for k, v in node.items() if k not in ("id", "labels", "properties")}
+
+
+def _record_labels(node: dict[str, Any]) -> list[Any]:
+    """Node labels from a store record (top-level on both shapes)."""
+    labels = node.get("labels")
+    return labels if isinstance(labels, list) else []
+
+
+def _parse_embedding_version(tag: str | None) -> int | None:
+    """Extract the text-schema version N from a "{model}#v{N}" embedding tag.
+
+    Returns None for legacy vectors written before the tag existed (model was
+    NULL) or any unrecognised tag — those are treated as stale.
+    """
+    if not tag or "#v" not in tag:
+        return None
+    suffix = tag.rsplit("#v", 1)[-1]
+    return int(suffix) if suffix.isdigit() else None
 
 
 def _norm_file_key(file_path: str | None) -> str | None:
@@ -363,7 +435,7 @@ def _audit_public_surfaces(
 
 
 class ToolRegistry:
-    """Holds all 21 MCP tool handlers and their shared resources."""
+    """Holds all 23 MCP tool handlers and their shared resources."""
 
     def __init__(
         self,
@@ -950,8 +1022,100 @@ class ToolRegistry:
             dirty_files=dirty_files,
             sync_enabled=sync_enabled,
             capabilities=get_capabilities(),
+            embeddings=await self._embedding_status(graph_id),
             message=f"Indexed {file_count} files; {len(dirty_files)} files changed since last index",
         )
+
+    async def _embedding_status(self, graph_id: str) -> dict[str, Any]:
+        """Embedding provenance for a graph: whether stored vectors match the
+        CURRENT ``{model}#v{version}`` tag, or are stale (built by an older text
+        schema OR a different embedding model — both make stored vectors unusable).
+
+        Reads the per-vector ``model`` tags written by
+        :meth:`EmbeddingService.embed_nodes` and compares the FULL tag against the
+        current provider's expected tag (not just the version suffix — a model
+        swap at the same schema version is just as stale). Decision (1): staleness
+        is REPORTED here so the operator re-indexes; it is never silently
+        auto-re-embedded inside this read-only status call, and a stale-but-reused
+        vector is surfaced rather than hidden. Empty when the store is not SQLite.
+        """
+        current_version = EMBEDDING_TEXT_VERSION
+        # Expected full tag for the current model, when a provider is configured.
+        current_tag = (
+            embedding_version_tag(self.embedding_provider.model_name)
+            if self.embedding_provider is not None
+            else None
+        )
+        base: dict[str, Any] = {
+            "current_version": current_version,
+            "current_tag": current_tag,
+            "stored_tags": [],
+            "stale": False,
+            "embedded_count": 0,
+            # Provenance is only queryable on SQLite (the model tag lives in the
+            # SQLite embeddings table). For other backends we CANNOT read it, so
+            # 'supported' is False and embedded_count 0 means "unknown", NOT
+            # "zero embeddings" — callers must not treat it as an empty index.
+            "supported": True,
+        }
+        if not isinstance(self.graph_store, SQLiteGraphStore):
+            return {**base, "supported": False}
+        try:
+            db = await self.graph_store._connect()
+            try:
+                cur = await db.execute(
+                    "SELECT model, COUNT(*) AS n FROM embeddings WHERE graph_id = ? GROUP BY model",
+                    (graph_id,),
+                )
+                rows = await cur.fetchall()
+                # Eligibility denominator = nodes the index CAN embed. The index
+                # embeds nodes per (re)indexed FILE (via nodes_by_file), so a node
+                # with no file_path — SCIP CodeExternalModule / external import nodes
+                # — is never embeddable and must NOT count against coverage, or a
+                # fully-rebuilt index would look permanently partial. Counting only
+                # file-backed nodes lets us still detect a genuinely partial index
+                # (semantic enabled on an already-indexed repo, only some files
+                # re-embedded).
+                ncur = await db.execute(
+                    "SELECT COUNT(*) AS n FROM nodes "
+                    "WHERE graph_id = ? AND file_path IS NOT NULL AND file_path != ''",
+                    (graph_id,),
+                )
+                nrow = await ncur.fetchone()
+                total_nodes = int(nrow["n"]) if nrow else 0
+            finally:
+                await db.close()
+        except Exception as exc:
+            logger.warning("Embedding status read failed for %s: %s", graph_id, exc)
+            return {**base, "supported": False}
+
+        stored_tags: list[str | None] = []
+        embedded_count = 0
+        stale = False
+        for row in rows:
+            tag = row["model"]
+            embedded_count += int(row["n"])
+            stored_tags.append(tag)
+            # Stale if the version differs from current, or (when we know the
+            # current provider's tag) the full model#version tag differs.
+            version_mismatch = _parse_embedding_version(tag) != current_version
+            tag_mismatch = current_tag is not None and tag != current_tag
+            if version_mismatch or tag_mismatch:
+                stale = True
+        # Coverage: fraction of graph nodes that carry a vector. Materially <1.0
+        # means the index is partial and find_equivalent would miss the unembedded
+        # files. (A small slack absorbs benign off-by-a-few from node churn.)
+        coverage = (embedded_count / total_nodes) if total_nodes else 0.0
+        return {
+            **base,
+            "stored_tags": sorted({t for t in stored_tags if t is not None})
+            + ([None] if any(t is None for t in stored_tags) else []),
+            "stale": stale and embedded_count > 0,
+            "embedded_count": embedded_count,
+            "eligible_count": total_nodes,
+            "coverage": round(coverage, 3),
+            "coverage_complete": embedded_count > 0 and coverage >= 0.95,
+        }
 
     async def handle_capabilities(self, input: CapabilitiesInput) -> CapabilitiesOutput:
         """Return the runtime capability report for optional features."""
@@ -1074,6 +1238,21 @@ class ToolRegistry:
             freshness=canonical.freshness,
         )
 
+    def _semantic_ready(self) -> bool:
+        """Whether semantic search can actually run (not just is wired).
+
+        A :class:`LocalEmbeddingProvider` imports ``sentence_transformers`` lazily,
+        so its mere presence is not readiness — we check the runtime capability.
+        A CUSTOM provider (any other :class:`EmbeddingProvider`) is trusted as
+        ready: it does not depend on the local extra, so gating it on
+        ``sentence_transformers`` would wrongly disable a valid configuration.
+        """
+        if self.searcher is None or self.embedding_provider is None:
+            return False
+        if isinstance(self.embedding_provider, LocalEmbeddingProvider):
+            return bool(get_capabilities()["features"]["semantic_embeddings"]["available"])
+        return True
+
     async def handle_search_semantic(self, input: SearchSemanticInput) -> SearchSemanticOutput:
         """Search the graph using semantic (vector) similarity."""
         if self.searchable_store is None:
@@ -1082,14 +1261,21 @@ class ToolRegistry:
                 message="Semantic search is not available. No SearchableGraphStore configured.",
             )
 
-        if self.searcher is None or self.embedding_provider is None:
+        if not self._semantic_ready():
             return SearchSemanticOutput(
                 hits=[],
                 message=(
-                    "Semantic search requires the semantic extra. "
-                    'Install with: pip install -e ".[semantic]"'
+                    "DEGRADED: semantic (vector) search is OFF — the semantic extra is "
+                    "not installed, so retrieval quality is degraded and behavioural "
+                    "matches will be missed. Keyword search (code_graph_search_code) "
+                    'still works. Install with: pip install -e ".[semantic]" and re-index.'
                 ),
             )
+
+        # _semantic_ready() guarantees a searcher; bind a non-optional local so
+        # the type is narrowed (mypy does not track the helper's postcondition).
+        searcher = self.searcher
+        assert searcher is not None
 
         # Search across the requested repo, or all known graphs if none specified.
         if input.repo_path:
@@ -1105,7 +1291,7 @@ class ToolRegistry:
         all_hits: list[dict[str, Any]] = []
         for graph_id in graph_ids:
             try:
-                hits = await self.searcher.search(
+                hits = await searcher.search(
                     graph_id,
                     input.query_text,
                     limit=input.limit,
@@ -2327,3 +2513,711 @@ class ToolRegistry:
             )
 
         return "\n".join(lines)
+
+    # ==================================================================
+    # PLACEMENT + DUPLICATE-CHECK TOOLS (bead code_hygiene_mcp-42i)
+    # ==================================================================
+
+    async def handle_suggest_placement(
+        self, input: SuggestPlacementInput
+    ) -> SuggestPlacementOutput:
+        """Recommend where a described new component should live.
+
+        Composes existing internals only (no new analysis engine): the declared
+        module map (:class:`ArchitectureConfig`) plus the candidate modules derived
+        from the graph's files (organ of each production file). References in
+        ``depends_on``/``consumed_by`` are resolved to their owning modules — a
+        file path directly, or a symbol name via the graph's symbol resolver.
+
+        DECISION (2): works WITHOUT a `.ariadne/architecture.yml`, but its power
+        DEPENDS on one. WITH a declared ``may_depend_on`` map it derives the
+        layering VIOLATIONS each placement would create (candidate -> dep must be
+        allowed; consumer -> candidate must be allowed) and ranks fewest-violations
+        first. WITHOUT config, import DIRECTION is undecidable (module names
+        collapse to bare organs), so it does NOT fabricate zero-violation verdicts:
+        it ranks by co-location and states plainly that direction was not checked.
+        Unresolved references are reported, never silently dropped. Guidance, never
+        a verdict.
+        """
+        repo_path = str(Path(input.repo_path).resolve())
+        graph_id = self._get_graph_id(repo_path)
+
+        exists = await self._graph_exists(graph_id)
+        if not exists:
+            return SuggestPlacementOutput(message="Repository has not been indexed yet")
+
+        arch_config = load_architecture_config(Path(repo_path))
+
+        # Candidate module universe: declared modules (if any) UNION the organs of
+        # every indexed production file. Peripheral organs (tests/scripts) are not
+        # placement targets for production code — including a DECLARED module whose
+        # owned paths are all peripheral (e.g. a config module for 'tests/'); adding
+        # every configured module unconditionally would re-introduce it as a target.
+        file_rows = await self._get_all_files(graph_id)
+        rel_files = [_rel(fp, repo_path) for fp in file_rows]
+        candidate_modules: set[str] = set()
+        for rel in rel_files:
+            if is_peripheral_path(rel):
+                continue
+            candidate_modules.add(self._module_of(rel, arch_config))
+        if arch_config is not None:
+            for name, spec in arch_config.modules.items():
+                # Skip a module all of whose owned path globs are peripheral.
+                if spec.paths and all(is_peripheral_path(p) for p in spec.paths):
+                    continue
+                candidate_modules.add(name)
+        candidate_modules.discard("")
+
+        if not candidate_modules:
+            return SuggestPlacementOutput(
+                config_used=arch_config is not None,
+                message="No candidate modules found (repository has no production files).",
+            )
+
+        dep_modules, dep_problems = await self._modules_of_refs(
+            graph_id, input.depends_on, repo_path, rel_files, arch_config
+        )
+        # Consumers: exclude peripheral-PATH consumers (co-located tests etc.) at
+        # resolution, before the path collapses to a possibly-non-peripheral module.
+        consumer_modules, con_problems = await self._modules_of_refs(
+            graph_id, input.consumed_by, repo_path, rel_files, arch_config,
+            exclude_peripheral=True,
+        )
+        unresolved = dep_problems + con_problems
+
+        # Placement ranks by dependency DIRECTION + co-location — it needs at least
+        # one usable dependency or consumer to say anything meaningful. With none
+        # (description-only, or every reference unresolved), every candidate scores
+        # equally and any order would be arbitrary. Say so rather than present an
+        # alphabetical list as a recommendation. (The description is not a placement
+        # signal — that is find_equivalent's job.)
+        if not dep_modules and not consumer_modules:
+            msg = (
+                "Placement needs at least one resolvable dependency (depends_on) or "
+                "consumer (consumed_by) to rank modules — a description alone cannot "
+                "determine placement. Supply the files/symbols the component would "
+                "import or that would import it."
+            )
+            if unresolved:
+                msg += (
+                    f" (all {len(unresolved)} supplied reference(s) were unresolved or "
+                    f"ambiguous: {', '.join(unresolved)})"
+                )
+            return SuggestPlacementOutput(
+                candidates=[],
+                config_used=arch_config is not None,
+                message=msg,
+                freshness=await self._freshness_envelope(graph_id),
+            )
+
+        # Direction (layering) violations are only decidable with a declared
+        # ``may_depend_on`` map. Without config, module names collapse to bare
+        # organs and import DIRECTION is genuinely unknown — so we do NOT fabricate
+        # zero-violation verdicts; we rank by co-location and say direction was not
+        # checked. (Finding: the old heuristic silently reported zero violations.)
+        check_direction = arch_config is not None
+
+        candidates: list[PlacementCandidate] = []
+        candidate_unknowns: dict[str, int] = {}
+        for module in sorted(candidate_modules):
+            violations: list[dict[str, Any]] = []
+            unknowns = 0  # pairs whose direction could not be checked (undeclared endpoint)
+            # check_direction is True iff arch_config is not None; bind a
+            # non-optional local so the type is narrowed for _placement_check.
+            if arch_config is not None and check_direction:
+                # The component sits in `module` and imports each dependency: module -> dep.
+                for dep_mod in sorted(dep_modules):
+                    if dep_mod == module:
+                        continue
+                    verdict = self._placement_check(module, dep_mod, arch_config)
+                    if verdict == "violation":
+                        violations.append(
+                            {"direction": "depends_on", "from": module, "to": dep_mod,
+                             "rule": "config"}
+                        )
+                    elif verdict == "unknown":
+                        unknowns += 1
+                # Each consumer imports the component: consumer -> module.
+                # Peripheral consumers were already dropped by _modules_of_refs on
+                # the actual PATH (exclude_peripheral=True); we must NOT re-test the
+                # MODULE NAME here — a production module legitimately named 'tests'
+                # or 'scripts' would otherwise have its real constraint discarded.
+                for con_mod in sorted(consumer_modules):
+                    if con_mod == module:
+                        continue
+                    verdict = self._placement_check(con_mod, module, arch_config)
+                    if verdict == "violation":
+                        violations.append(
+                            {"direction": "consumed_by", "from": con_mod, "to": module,
+                             "rule": "config"}
+                        )
+                    elif verdict == "unknown":
+                        unknowns += 1
+
+            candidate_unknowns[module] = unknowns
+            # Co-location bonus: sharing a module with a stated dependency or
+            # consumer is the cheapest, most cohesive placement. A violation costs
+            # 1.0; an UNKNOWN pair costs a smaller 0.4 — it is NOT verified-safe, so
+            # it must rank below a fully-checked zero-violation candidate but above
+            # a known violation.
+            colocated = len((dep_modules | consumer_modules) & {module})
+            score = -float(len(violations)) - 0.4 * unknowns + 0.25 * colocated
+            rationale = self._placement_rationale(
+                module, dep_modules, consumer_modules, violations, check_direction, unknowns
+            )
+            candidates.append(
+                PlacementCandidate(
+                    module=module, violations=violations, rationale=rationale, score=score
+                )
+            )
+
+        candidates.sort(
+            key=lambda c: (-c.score, len(c.violations), candidate_unknowns.get(c.module, 0), c.module)
+        )
+        candidates = candidates[: input.limit]
+
+        parts = [f"Ranked {len(candidates)} candidate module(s)"]
+        if not check_direction:
+            parts.append(
+                "no .ariadne/architecture.yml: ranked by co-location only — import "
+                "direction (layering) violations were NOT checked (add a may_depend_on map to enable)"
+            )
+        if unresolved:
+            parts.append(
+                f"{len(unresolved)} reference(s) could not be used and were excluded "
+                f"(unresolved or ambiguous — supply a file path or qualified symbol): "
+                f"{', '.join(unresolved)}"
+            )
+        return SuggestPlacementOutput(
+            candidates=candidates,
+            config_used=check_direction,
+            message="; ".join(parts),
+            freshness=await self._freshness_envelope(graph_id),
+        )
+
+    def _module_of(self, rel: str, arch_config: ArchitectureConfig | None) -> str:
+        """Module bucket for a repo-relative file: the declared module when a
+        config matches, else the top-level organ (its directory 'organ'). A
+        root-level file (no directory) buckets to a stable ``(root)`` module —
+        never its own filename — so a flat repo yields one module, not one per
+        file (mirrors change_briefing's ``_module_of``)."""
+        if arch_config is not None:
+            mod = arch_config.module_of(rel)
+            if mod:
+                return mod
+        organ = _organ(_dir_of(rel))
+        return organ if organ else "(root)"
+
+    async def _modules_of_refs(
+        self,
+        graph_id: str,
+        refs: list[str],
+        repo_path: str,
+        rel_files: list[str],
+        arch_config: ArchitectureConfig | None,
+        *,
+        exclude_peripheral: bool = False,
+    ) -> tuple[set[str], list[str]]:
+        """Resolve dependency/consumer references (file paths OR symbol names) to
+        their owning modules. Returns (modules, problems) — a ref that resolves to
+        no file/symbol, or to an AMBIGUOUS symbol defined in several files, is
+        reported in ``problems`` (never silently dropped, never silently guessed),
+        so the caller can surface that placement was ranked on partial inputs.
+
+        ``exclude_peripheral`` (used for CONSUMERS): a reference whose resolved
+        PATH is peripheral (a co-located test like ``server/foo.test.ts`` or a
+        ``tests/`` file) is exempt from layering and dropped here — its
+        peripheral status must be judged on the path, BEFORE the path collapses to
+        a (possibly non-peripheral) module name like ``server`` or ``qa``. Not a
+        'problem' — it is a valid consumer that simply cannot cause a violation."""
+        file_set = set(rel_files)
+        out: set[str] = set()
+        problems: list[str] = []
+        for ref in refs:
+            rel = self._ref_to_rel(ref, repo_path, file_set)
+            if rel is None:
+                # Not a file path — try resolving it as a symbol name to its file.
+                rel, note = await self._symbol_ref_to_rel(graph_id, ref, repo_path)
+                if rel is None:
+                    problems.append(f"{ref} ({note})" if note else ref)
+                    continue
+            if exclude_peripheral and is_peripheral_path(rel):
+                continue  # peripheral consumer — exempt from layering, judged by path
+            mod = self._module_of(rel, arch_config)
+            if mod:
+                out.add(mod)
+            else:
+                problems.append(ref)
+        return out, problems
+
+    @staticmethod
+    def _ref_to_rel(ref: str, repo_path: str, file_set: set[str]) -> str | None:
+        """Normalise a FILE-path reference to a repo-relative path THAT IS IN THE
+        INDEX. Only indexed paths resolve — a path (absolute or relative) that is
+        not an indexed file returns None so the caller falls through to symbol
+        resolution and, failing that, reports it unresolved. This prevents a typo
+        like ``shraed/contracts.py`` from inventing a bogus ``shraed`` module."""
+        if not ref:
+            return None
+        # Normalise BOTH absolute and relative refs against the repo root so that
+        # './shared/x.py' or 'server/../shared/x.py' resolve to the same
+        # repo-relative key the index stores. Falls back to the raw ref only when
+        # it is already a clean relative path (keeps the unique-suffix match below
+        # working for bare 'x.py' inputs).
+        p = Path(ref)
+        abs_path = p if p.is_absolute() else Path(repo_path) / p
+        candidate = _rel(str(abs_path.resolve()), repo_path)
+        if candidate in file_set:
+            return candidate
+        if ref in file_set:
+            return ref
+        # unique suffix match (e.g. 'contracts.py' -> 'shared/contracts.py')
+        matches = [f for f in file_set if f == candidate or f.endswith("/" + candidate)]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    async def _symbol_ref_to_rel(
+        self, graph_id: str, symbol: str, repo_path: str
+    ) -> tuple[str | None, str | None]:
+        """Resolve a bare symbol name to the repo-relative file that DEFINES it.
+
+        Returns ``(rel, note)``: ``rel`` is the file when the symbol maps to
+        EXACTLY ONE definition file; when several files define a symbol of that
+        name it is AMBIGUOUS — we do NOT silently pick one (that would attribute a
+        placement constraint to the wrong module), returning ``(None, "ambiguous:
+        defined in N files")`` so the caller reports it and asks for a qualified
+        symbol or file path. ``(None, "not found")`` when nothing matches."""
+        if not symbol:
+            return None, None
+        # A fully-qualified symbol (a node id like 'server.util.helper') is
+        # UNAMBIGUOUS — resolve it directly by id first, so the disambiguation we
+        # advise ("supply a qualified symbol") actually works.
+        try:
+            id_rows = await self.graph_store.query(
+                graph_id, "node_by_id", params={"node_id": symbol}
+            )
+        except Exception as exc:
+            logger.warning("Placement symbol id lookup failed for %r: %s", symbol, exc)
+            id_rows = []
+        for row in id_rows:
+            node = row.get("n", row)
+            # Only accept a DEFINITION node — a qualified id that matches a
+            # CodeImport/usage/diagnostic node must NOT be resolved to that usage's
+            # file (that would attribute the constraint to the wrong module), same
+            # as the name lookup below filters by definition labels.
+            if not (set(_record_labels(node)) & _DEFINITION_LABELS):
+                continue
+            fp = _record_props(node).get("file_path")
+            if fp:
+                return _rel(fp, repo_path), None
+
+        # Distinct DEFINITION files for this exact name (functions/classes/methods
+        # /… — not imports/usages, which would over-count files that merely mention
+        # it). SQLite and Neo4j ``node_by_name`` return EVERY match, so use it — a
+        # cheap indexed lookup. ONLY MemoryGraphStore returns just the first match
+        # (hiding ambiguity), so fall back to a full scan there (its graphs are
+        # small). We must NOT silently pick one file when several define the name.
+        if isinstance(self.graph_store, MemoryGraphStore):
+            try:
+                rows = await self.graph_store.query(graph_id, "nodes")
+            except Exception as exc:
+                logger.warning("Placement symbol resolution failed for %r: %s", symbol, exc)
+                return None, "resolution error"
+        else:
+            try:
+                rows = await self.graph_store.query(
+                    graph_id, "node_by_name", params={"name": symbol}
+                )
+            except Exception as exc:
+                logger.warning("Placement symbol resolution failed for %r: %s", symbol, exc)
+                return None, "resolution error"
+
+        def_files: set[str] = set()
+        for row in rows:
+            node = row.get("n", row)
+            labels = set(_record_labels(node))
+            if not (labels & _DEFINITION_LABELS):
+                continue
+            props = _record_props(node)
+            if str(props.get("name", "")) != symbol:
+                continue
+            fp = props.get("file_path")
+            if fp:
+                def_files.add(_rel(fp, repo_path))
+
+        if not def_files:
+            return None, "not found"
+        if len(def_files) > 1:
+            return None, f"ambiguous: defined in {len(def_files)} files"
+        return next(iter(def_files)), None
+
+    def _placement_check(
+        self, src_mod: str, dst_mod: str, arch_config: ArchitectureConfig
+    ) -> str:
+        """Tristate direction check for ``src_mod`` -> ``dst_mod`` against the
+        declared module map: ``"allowed"``, ``"violation"``, or ``"unknown"``.
+
+        A config may cover only PART of a repo: files outside every declared
+        ``paths`` glob fall back to a directory-organ bucket that is NOT a declared
+        module. For such an undeclared endpoint the config has no rule, so the
+        direction is genuinely UNKNOWN — distinct from an explicitly ALLOWED pair.
+        We must not collapse unknown into allowed (that would rank an unchecked
+        candidate as verified-safe) nor into violation (that would invent a
+        finding). Only when BOTH endpoints are declared do we return the map's
+        allowed/violation verdict."""
+        if src_mod == dst_mod:
+            return "allowed"
+        if src_mod not in arch_config.modules or dst_mod not in arch_config.modules:
+            return "unknown"
+        return "allowed" if arch_config.allows(src_mod, dst_mod) else "violation"
+
+    @staticmethod
+    def _placement_rationale(
+        module: str,
+        dep_modules: set[str],
+        consumer_modules: set[str],
+        violations: list[dict[str, Any]],
+        check_direction: bool,
+        unknowns: int,
+    ) -> str:
+        bits: list[str] = []
+        if module in dep_modules:
+            bits.append("co-located with a stated dependency")
+        if module in consumer_modules:
+            bits.append("co-located with a stated consumer")
+        if not check_direction:
+            bits.append("layering direction not checked (no architecture.yml)")
+        else:
+            if violations:
+                bits.append(f"would introduce {len(violations)} layering violation(s)")
+            if unknowns:
+                # NOT verified-safe: some relationship touches an undeclared module.
+                bits.append(
+                    f"{unknowns} relationship(s) not checked (endpoint not a declared module)"
+                )
+            if not violations and not unknowns:
+                bits.append("introduces no layering violations")
+        return "; ".join(bits) if bits else "candidate module"
+
+    async def _fetch_node_record(self, graph_id: str, node_id: str) -> dict[str, Any] | None:
+        """Hydrate a node record by id (semantic hits carry only node_id+score)."""
+        if not node_id:
+            return None
+        try:
+            rows = await self.graph_store.query(
+                graph_id, "node_by_id", params={"node_id": node_id}
+            )
+        except Exception as exc:
+            logger.warning("find_equivalent node hydration failed for %s: %s", node_id, exc)
+            return None
+        if rows:
+            record = rows[0].get("n", rows[0])
+            return record if isinstance(record, dict) else None
+        return None
+
+    async def _hydrate_nodes_batch(
+        self, graph_id: str, node_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch many node records at once -> {node_id: record}. Replaces an N+1 of
+        per-hit ``node_by_id`` lookups (find_equivalent hydrates up to a whole-graph
+        pool). SQLite runs a single chunked ``id IN (...)`` query; other stores fall
+        back to one ``nodes`` scan filtered in Python (still one round trip)."""
+        wanted = {nid for nid in node_ids if nid}
+        if not wanted:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        if isinstance(self.graph_store, SQLiteGraphStore):
+            id_list = list(wanted)
+            db = await self.graph_store._connect()
+            try:
+                # Chunk to stay under SQLite's variable limit (999).
+                for i in range(0, len(id_list), 800):
+                    chunk = id_list[i : i + 800]
+                    placeholders = ",".join("?" * len(chunk))
+                    cur = await db.execute(
+                        f"SELECT id, labels, properties FROM nodes "
+                        f"WHERE graph_id = ? AND id IN ({placeholders})",
+                        (graph_id, *chunk),
+                    )
+                    for row in await cur.fetchall():
+                        out[row["id"]] = {
+                            "id": row["id"],
+                            "labels": json.loads(row["labels"]) if row["labels"] else [],
+                            "properties": json.loads(row["properties"]) if row["properties"] else {},
+                        }
+            finally:
+                await db.close()
+            return out
+        # Non-SQLite: one scan, filter to wanted ids. Normalise each record to the
+        # nested {id,labels,properties} shape so downstream reads are backend-
+        # agnostic (Neo4j flattens properties to the top level).
+        with contextlib.suppress(Exception):
+            for row in await self.graph_store.query(graph_id, "nodes"):
+                rec = row.get("n", row)
+                nid = str(rec.get("id", ""))
+                if nid in wanted:
+                    out[nid] = {
+                        "id": nid,
+                        "labels": _record_labels(rec),
+                        "properties": _record_props(rec),
+                    }
+        return out
+
+    async def _get_all_files(self, graph_id: str) -> list[str]:
+        """Absolute file paths of every CodeFile in the graph.
+
+        Sourced through the backend-agnostic ``_read_code_files`` helper (bead
+        420's SSOT for indexed-file rows) so this works on any GraphStore, not
+        just SQLite — the same (id, file_path) rows the old ``_FILE_SQL`` query
+        produced, via the store protocol.
+        """
+        rows = await _read_code_files(self.graph_store, graph_id)
+        return sorted({file_path for _nid, file_path in rows})
+
+    async def handle_find_equivalent(
+        self, input: FindEquivalentInput
+    ) -> FindEquivalentOutput:
+        """Surface existing symbols that may already implement a described component.
+
+        Reuses the semantic search path (no second embedding pipeline): embeds the
+        description (+ optional signature) and reranks the hits with a same-module
+        bonus and rationale strings. Explicitly framed as needs-human-judgement —
+        no auto-verdict, no ``is_duplicate`` flag.
+
+        DEGRADED MODE: semantic search is off unless the semantic extra is
+        installed. When it is missing this returns an EXPLICIT message (with the
+        install hint) and ``semantic_available=False`` — never empty silence, so a
+        consumer knows retrieval quality is degraded rather than seeing "no
+        duplicates found".
+        """
+        # Loud degraded-mode announcement when semantic retrieval is unavailable.
+        # Readiness is checked via _semantic_ready() (a lazy LocalEmbeddingProvider
+        # needs the runtime extra; a custom provider is trusted) — provider!=None
+        # is not the same as ready.
+        if not self._semantic_ready():
+            return FindEquivalentOutput(
+                candidates=[],
+                semantic_available=False,
+                message=(
+                    "DEGRADED: duplicate detection needs semantic (vector) search, which "
+                    "requires the semantic extra. Without it this tool cannot find "
+                    'behavioural duplicates. Install with: pip install -e ".[semantic]" '
+                    "and re-index."
+                ),
+            )
+
+        repo_path = str(Path(input.repo_path).resolve())
+        graph_id = self._get_graph_id(repo_path)
+        exists = await self._graph_exists(graph_id)
+        if not exists:
+            return FindEquivalentOutput(
+                candidates=[], semantic_available=True,
+                message="Repository has not been indexed yet",
+            )
+
+        query = input.description.strip()
+        if input.signature:
+            query = f"{query} {input.signature}".strip()
+        if not query:
+            return FindEquivalentOutput(
+                candidates=[], semantic_available=True,
+                message="Provide a description and/or signature to search for equivalents.",
+            )
+
+        # The semantic extra is installed but this graph may still have NO vectors
+        # (indexed before the extra was added, or embedding previously failed), OR
+        # STALE vectors from a different model/text-schema. Searching stale vectors
+        # of a different-dimension model raises a shape mismatch in the brute-force
+        # fallback, so we refuse and give the same force-rebuild guidance rather
+        # than crash or silently report 0 matches.
+        emb_status = await self._embedding_status(graph_id)
+        if emb_status.get("supported"):
+            if emb_status.get("embedded_count", 0) == 0:
+                return FindEquivalentOutput(
+                    candidates=[], semantic_available=True,
+                    message=(
+                        "DEGRADED: this repository has no stored embeddings, so duplicate "
+                        "detection cannot run. A normal re-index will NOT backfill them (no files "
+                        "changed) — run code_graph_index with force_rebuild=True (semantic extra "
+                        "installed) to generate vectors for the whole graph."
+                    ),
+                    freshness=await self._freshness_envelope(graph_id),
+                )
+            if emb_status.get("stale"):
+                return FindEquivalentOutput(
+                    candidates=[], semantic_available=True,
+                    message=(
+                        "DEGRADED: stored embeddings are STALE (built by a different model or an "
+                        "older text schema than the current provider), so duplicate detection "
+                        "cannot safely search them — a model/dimension change would mismatch. "
+                        "Run code_graph_index with force_rebuild=True to re-embed the whole graph."
+                    ),
+                    freshness=await self._freshness_envelope(graph_id),
+                )
+
+        # Default to real definitions (functions/methods/classes) — the tool
+        # promises existing-SYMBOL candidates, so files/imports/modules/diagnostics
+        # must not occupy the window and hide the relevant symbol. An explicit
+        # ``types`` overrides this default.
+        if input.types:
+            type_set = {t.lower() for t in input.types}
+        else:
+            type_set = {label.lower() for label in _DEFINITION_LABELS}
+
+        # The searcher has no label filter and matching definitions can rank below
+        # non-matching nodes (files/imports/…), so a small fixed window would starve
+        # a typed search. Fetch a pool sized to the WHOLE graph (bounded by its node
+        # count) so every type-matching definition is in reach — the store returns
+        # top-N by similarity, so this is a strict superset of any smaller window and
+        # the post-fetch filter cannot then drop a match that only exists past the
+        # cap. A ceiling keeps a pathological giant graph bounded (reported below).
+        # _semantic_ready() above guarantees a searcher; bind a non-optional local
+        # so the type is narrowed (mypy does not track the helper's postcondition).
+        searcher = self.searcher
+        assert searcher is not None
+        node_count = int(emb_status.get("eligible_count") or 0)
+        raw_limit = min(node_count or _EQUIVALENT_POOL_CEILING, _EQUIVALENT_POOL_CEILING)
+        try:
+            hits = await searcher.search(
+                graph_id, query, limit=raw_limit, search_type="semantic"
+            )
+        except Exception as exc:
+            logger.warning("find_equivalent semantic search failed for %s: %s", graph_id, exc)
+            return FindEquivalentOutput(
+                candidates=[], semantic_available=True,
+                message=f"Semantic search failed: {exc}",
+            )
+
+        # On a backend where we cannot read embedding provenance (non-SQLite),
+        # zero hits is genuinely AMBIGUOUS: it may mean "no similar symbol" OR "no
+        # vectors indexed" (indexed before the extra; a normal re-index won't
+        # backfill). Do not present that as a confident all-clear.
+        if not hits and not emb_status.get("supported"):
+            return FindEquivalentOutput(
+                candidates=[], semantic_available=True,
+                message=(
+                    "DEGRADED: no semantic hits, and this backend cannot report whether "
+                    "embeddings exist — a missing/never-generated vector index looks "
+                    "identical to 'no duplicate' here. If the repo was indexed before the "
+                    "semantic extra, re-index with force_rebuild=True before trusting an "
+                    "empty result."
+                ),
+                freshness=await self._freshness_envelope(graph_id),
+            )
+
+        # The semantic searcher returns node_id + score only, so we must hydrate
+        # labels/props. Doing that per hit is an N+1 (up to the whole pool); fetch
+        # the needed records in ONE batch keyed by id instead.
+        need_ids = [
+            str(h.get("node_id", ""))
+            for h in hits
+            if not isinstance(h.get("node"), dict) or not h.get("node")
+        ]
+        hydrated = await self._hydrate_nodes_batch(graph_id, need_ids)
+
+        candidates: list[EquivalentCandidate] = []
+        for hit in hits:
+            node = hit.get("node")
+            if not isinstance(node, dict) or not node:
+                node = hydrated.get(str(hit.get("node_id", "")))
+            if not isinstance(node, dict) or not node:
+                continue
+            # Backend-agnostic reads (Neo4j flattens properties to the top level).
+            labels = [str(x).lower() for x in _record_labels(node)]
+            if not (type_set & set(labels)):
+                continue
+            props = _record_props(node)
+            name = str(props.get("name", "")) or str(node.get("id", ""))
+            file_abs = str(props.get("file_path", ""))
+            file_rel = _rel(file_abs, repo_path) if file_abs else ""
+            module = str(props.get("module", "")) or (
+                _organ(_dir_of(file_rel)) if file_rel else ""
+            )
+            similarity = float(hit.get("score", 0.0))
+            candidates.append(
+                EquivalentCandidate(
+                    name=name,
+                    node_id=str(hit.get("node_id", node.get("id", ""))),
+                    module=module,
+                    file=file_rel,
+                    similarity=similarity,
+                    score=similarity,  # reranked below
+                    rationale="",
+                )
+            )
+
+        # Same-module bonus: if a signature hints a module/file, favour hits that
+        # already live there (a duplicate is most likely near its neighbours). Match
+        # on TOKEN BOUNDARIES, and ONLY when the hint is an actual QUALIFIED module
+        # or path (it contains a '.' or '/') — a bare signature word like the
+        # parameter in 'def transform(api)' must NOT earn module 'api' the bonus.
+        # A qualified hint ('shared.datetime' / 'shared/datetime.ts') tokenizes to
+        # {'shared','datetime',...}; award the bonus when ALL of the module's path
+        # tokens appear in the hint's tokens.
+        def _tokens(s: str) -> set[str]:
+            return {t for t in re.split(r"[^a-z0-9]+", s.lower()) if t}
+
+        raw_hint = input.signature or ""
+        # Only a hint that actually names a qualified module/path can locate a module.
+        hint_is_qualified = ("." in raw_hint) or ("/" in raw_hint)
+        hint_tokens = _tokens(raw_hint) if hint_is_qualified else set()
+        for c in candidates:
+            bonus = 0.0
+            reasons = [f"semantic similarity {c.similarity:.3f} to the description"]
+            mod_tokens = _tokens(c.module) if c.module else set()
+            # Drop bare file extensions so 'shared/datetime.ts' matches a hint that
+            # only names 'shared' and 'datetime'.
+            mod_tokens -= {"ts", "tsx", "js", "jsx", "py", "mjs", "cjs"}
+            if hint_is_qualified and mod_tokens and mod_tokens <= hint_tokens:
+                bonus += 0.1
+                reasons.append(f"same module as the hint ({c.module})")
+            c.score = c.similarity + bonus
+            c.rationale = "; ".join(reasons)
+
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        candidates = candidates[: input.limit]
+
+        msg = (
+            f"{len(candidates)} candidate(s) that MIGHT already do this — "
+            "similarity hits only; a human must judge true duplication."
+        )
+        # Partial-index caveat: after enabling semantic on an already-indexed repo,
+        # an incremental index embeds only changed files, so most nodes have no
+        # vector and unembedded files can't surface. Warn (results are real but
+        # incomplete) rather than present them as an exhaustive search.
+        if emb_status.get("supported") and not emb_status.get("coverage_complete"):
+            cov = emb_status.get("coverage", 0.0)
+            msg += (
+                f" NOTE: only {cov:.0%} of graph nodes are embedded — this index is "
+                "PARTIAL (likely embedded incrementally after enabling semantic), so "
+                "duplicates in unembedded files are missed. Run code_graph_index with "
+                "force_rebuild=True to embed the whole graph."
+            )
+        # Provenance caveat: on a backend where the embedding tag is not readable
+        # (non-SQLite), we cannot verify the stored vectors match the current
+        # model/schema — the SQLite path refuses stale vectors, but here we can
+        # only WARN. Surface it rather than present the results as fully trusted.
+        if not emb_status.get("supported"):
+            msg += (
+                " NOTE: embedding provenance is unreadable on this backend, so these "
+                "vectors could be stale (a model/schema change would degrade or "
+                "invalidate similarity). Re-index with force_rebuild=True if the "
+                "embedding model changed."
+            )
+        # No silent caps: we fetch a whole-graph pool, so a match is missed only on
+        # a pathologically large graph where the pool hit the hard _POOL_CEILING AND
+        # the store returned a full page (more nodes exist beyond it). Warn only then.
+        if raw_limit >= _EQUIVALENT_POOL_CEILING and len(hits) >= raw_limit:
+            msg += (
+                f" NOTE: this graph exceeds the {_EQUIVALENT_POOL_CEILING}-hit semantic pool "
+                "ceiling, so a type-matching symbol ranked below it may be missing — "
+                "narrow the description to widen effective coverage."
+            )
+        return FindEquivalentOutput(
+            candidates=candidates,
+            needs_human_judgement=True,
+            semantic_available=True,
+            message=msg,
+            freshness=await self._freshness_envelope(graph_id),
+        )

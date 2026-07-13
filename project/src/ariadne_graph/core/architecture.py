@@ -788,7 +788,13 @@ async def _read_code_files(store: GraphStore, graph_id: str) -> list[tuple[str, 
     for row in rows:
         node = row.get("n", row)
         node_id = node.get("id")
-        file_path = (node.get("properties") or {}).get("file_path")
+        # Tolerant of both record shapes: SQLite/Memory nest properties under
+        # ``properties``; Neo4j's ``n {.*, id, labels}`` FLATTENS them to the top
+        # level. Prefer the nested dict, else read from the record itself — else
+        # this silently returns [] on Neo4j.
+        props = node.get("properties")
+        props = props if isinstance(props, dict) else node
+        file_path = props.get("file_path")
         if node_id and file_path:
             out.append((node_id, file_path))
     return out

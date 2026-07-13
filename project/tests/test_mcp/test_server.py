@@ -38,3 +38,5 @@ class TestInitialiseRegistry:
         assert "code_graph_capabilities" in tools
         assert "code_graph_list_diagnostics" in tools
         assert "lumen_code_graph_retrieve" in tools
+        assert "code_graph_suggest_placement" in tools
+        assert "code_graph_find_equivalent" in tools

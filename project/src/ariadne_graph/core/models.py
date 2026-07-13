@@ -80,6 +80,11 @@ class EmbeddingPayload(BaseModel):
     graph_id: str
     text: str = Field(description="Text to embed (for regeneration)")
     embedding: list[float] | None = None
+    model: str | None = Field(
+        default=None,
+        description="Provenance tag stored per vector: '{model_name}#v{EMBEDDING_TEXT_VERSION}' "
+        "so stale (wrong-version) vectors are detectable — see index_status.",
+    )
 
 
 class SearchHit(BaseModel):

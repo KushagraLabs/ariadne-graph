@@ -14,6 +14,23 @@ from ariadne_graph.graphstores.base import SearchableGraphStore
 
 logger = logging.getLogger(__name__)
 
+# Bumped whenever _build_node_text changes what it feeds the embedder. Stored
+# per-embedding in the `model` column (as "{model_name}#v{N}") so a later index
+# can detect stale vectors and flag re-indexing — see FreshnessTracker / the
+# index_status embedding_version report. v1 = name+type+module+first-doc-line;
+# v2 (bead 42i) = adds signature + parameter names + full docstring.
+EMBEDDING_TEXT_VERSION = 2
+
+
+def embedding_version_tag(model_name: str) -> str:
+    """Per-vector provenance tag: ``"{model_name}#v{EMBEDDING_TEXT_VERSION}"``.
+
+    Stored in the ``embeddings.model`` column so a later index can tell whether
+    a stored vector was produced by the current model + text schema; a mismatch
+    means the vectors are stale and the repo should be re-indexed.
+    """
+    return f"{model_name}#v{EMBEDDING_TEXT_VERSION}"
+
 
 @runtime_checkable
 class EmbeddingProvider(Protocol):
@@ -159,7 +176,14 @@ class LocalEmbeddingProvider:
 def _build_node_text(node: CodeNode) -> str:
     """Build a text representation of a node for embedding.
 
-    Format: "{name} {type} in {module}: {docstring or first line}"
+    Format (EMBEDDING_TEXT_VERSION v2): "{name} {type} in {module}
+    {signature} ({param names}): {FULL docstring or first source line}".
+
+    v2 (bead 42i) enriches the thin v1 text (name+type+module+first-doc-line)
+    with the signature, parameter names, and the FULL docstring so behavioural
+    duplicates — two helpers that do the same thing under different names — land
+    near each other in vector space. Bumping EMBEDDING_TEXT_VERSION forces a
+    re-embed; stale vectors are surfaced via index_status, not silently reused.
 
     Args:
         node: The code node to represent as text.
@@ -172,20 +196,51 @@ def _build_node_text(node: CodeNode) -> str:
     node_type = _infer_node_type(node)
     module = props.get("module", "")
 
-    # Try docstring first, then first line of body
-    description = props.get("docstring", "")
-    if not description:
-        source_lines = props.get("source", "").splitlines()
-        if source_lines:
-            description = source_lines[0].strip()
-
     parts = [name, node_type]
     if module:
         parts.append(f"in {module}")
+
+    signature = str(props.get("signature", "")).strip()
+    if signature:
+        parts.append(signature)
+
+    # Parameter names (when captured separately from the signature) add the
+    # domain vocabulary that distinguishes, e.g., a date helper from a money one.
+    params = props.get("parameters") or props.get("params")
+    if isinstance(params, list) and params:
+        names = [_param_name(p) for p in params]
+        names = [n for n in names if n]
+        if names:
+            parts.append(f"({', '.join(names)})")
+
+    # FULL docstring (v1 used only its first line). Python nodes carry it in
+    # ``docstring``; SCIP/TypeScript nodes carry JSDoc in ``documentation`` (the
+    # ScipGraphTranslator's field) — read both so TS equivalence expressed in
+    # JSDoc is embedded too. Fall back to the node's ``snippet`` (every extractor
+    # — Python classes, Tree-sitter TS — emits one) so those kinds get behavioural
+    # text too, then the first ``source`` line.
+    description = (
+        str(props.get("docstring", "")).strip()
+        or str(props.get("documentation", "")).strip()
+        or str(props.get("snippet", "")).strip()
+    )
+    if not description:
+        source_lines = str(props.get("source", "")).splitlines()
+        if source_lines:
+            description = source_lines[0].strip()
     if description:
         parts.append(f": {description}")
 
     return " ".join(parts)
+
+
+def _param_name(param: Any) -> str:
+    """Best-effort parameter name from a str or a dict-shaped param record."""
+    if isinstance(param, str):
+        return param.strip()
+    if isinstance(param, dict):
+        return str(param.get("name", "")).strip()
+    return ""
 
 
 def _infer_node_type(node: CodeNode) -> str:
@@ -240,6 +295,9 @@ class EmbeddingService:
 
         embeddings = await self.provider.embed(texts)
 
+        # Provenance tag: which model + which text schema produced these vectors.
+        model_tag = embedding_version_tag(self.provider.model_name)
+
         rows: list[EmbeddingPayload] = []
         for node, text, embedding in zip(nodes, texts, embeddings, strict=False):
             rows.append(
@@ -248,6 +306,7 @@ class EmbeddingService:
                     graph_id=graph_id,
                     text=text,
                     embedding=embedding,
+                    model=model_tag,
                 )
             )
 

@@ -603,3 +603,101 @@ class TestDeterminism:
         edges1 = sorted((e.source, e.rel_type, e.target) for e in delta1.edges)
         edges2 = sorted((e.source, e.rel_type, e.target) for e in delta2.edges)
         assert edges1 == edges2
+
+
+# ---------------------------------------------------------------------------
+# Behavioural text for embeddings (bead 42i)
+# ---------------------------------------------------------------------------
+
+class TestEmbeddingProps:
+    """The extractor must emit signature/parameters/docstring so the embedding
+    text builder has real behavioural text (not just name/type/module). Without
+    this, code_graph_find_equivalent cannot catch differently-named duplicates.
+    """
+
+    def test_function_props_carry_signature_params_and_docstring(self):
+        source = (
+            "def format_date_range(start, end, sep='-'):\n"
+            '    """Format a start/end date pair into a human range string."""\n'
+            "    return f'{start}{sep}{end}'\n"
+        )
+        delta = _extract(source)
+        fn = _node_by_id(delta, "mymodule.format_date_range")
+        assert fn is not None
+        props = fn.properties
+        assert props["parameters"] == ["start", "end", "sep"]
+        assert props["signature"].startswith("def format_date_range(")
+        assert "start" in props["signature"] and "sep" in props["signature"]
+        assert props["docstring"] == "Format a start/end date pair into a human range string."
+
+    def test_method_params_exclude_self_and_embedding_text_is_enriched(self):
+        from ariadne_graph.core.embeddings import _build_node_text
+
+        source = (
+            "class Formatter:\n"
+            "    def render(self, value, width):\n"
+            '        """Render a value at a fixed width."""\n'
+            "        return str(value).ljust(width)\n"
+        )
+        delta = _extract(source)
+        method = _node_by_id(delta, "mymodule.Formatter.render")
+        assert method is not None
+        # self/cls are stripped from the parameter list used for embedding vocab.
+        assert method.properties["parameters"] == ["value", "width"]
+        # the real extracted node produces enriched embedding text end-to-end.
+        text = _build_node_text(method)
+        assert "render" in text and "value" in text and "width" in text
+        assert "Render a value at a fixed width." in text
+
+    def test_only_leading_receiver_is_dropped(self):
+        """A non-leading parameter named 'self'/'cls' is a REAL argument and must
+        be kept — only a leading receiver is stripped."""
+        source = "def convert(value, cls):\n    return cls(value)\n"
+        delta = _extract(source)
+        fn = _node_by_id(delta, "mymodule.convert")
+        assert fn is not None
+        # 'cls' here is a real second parameter, NOT a receiver — keep it.
+        assert fn.properties["parameters"] == ["value", "cls"]
+
+    def test_class_docstring_is_stored_for_embedding(self):
+        """A CodeClass node must carry its docstring so a differently-named class
+        with a descriptive docstring can surface as an equivalent (bead 42i)."""
+        source = (
+            "class DateRangeFormatter:\n"
+            '    """Formats a start/end date pair into a human range string."""\n'
+            "    pass\n"
+        )
+        delta = _extract(source)
+        cls = _node_by_id(delta, "mymodule.DateRangeFormatter")
+        assert cls is not None
+        assert "CodeClass" in cls.labels
+        assert cls.properties.get("docstring") == (
+            "Formats a start/end date pair into a human range string."
+        )
+
+    def test_module_level_leading_cls_is_kept(self):
+        """A module-level function's leading 'cls' is an ORDINARY argument, not a
+        receiver — it must be kept (only real methods drop the receiver)."""
+        source = "def convert(cls, value):\n    return cls(value)\n"
+        delta = _extract(source)
+        fn = _node_by_id(delta, "mymodule.convert")
+        assert fn is not None
+        assert fn.properties["parameters"] == ["cls", "value"]
+
+    def test_staticmethod_leading_self_is_kept(self):
+        """A @staticmethod has no receiver, so a leading 'self' is a real argument
+        and must be kept; a plain instance method drops its receiver."""
+        source = (
+            "class C:\n"
+            "    @staticmethod\n"
+            "    def convert(self, value):\n"
+            "        return value\n"
+            "    def method(self, value):\n"
+            "        return value\n"
+        )
+        delta = _extract(source)
+        static = _node_by_id(delta, "mymodule.C.convert")
+        method = _node_by_id(delta, "mymodule.C.method")
+        assert static is not None and method is not None
+        assert static.properties["parameters"] == ["self", "value"]  # kept
+        assert method.properties["parameters"] == ["value"]  # receiver dropped

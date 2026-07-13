@@ -1319,7 +1319,7 @@ class SQLiteGraphStore:
                     (graph_id, node_id, model, vector, dimensions)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (graph_id, row.node_id, None, vec_blob, dimensions),
+                    (graph_id, row.node_id, row.model, vec_blob, dimensions),
                 )
 
                 # Also upsert into sqlite-vec virtual table if available

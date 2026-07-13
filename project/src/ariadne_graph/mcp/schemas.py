@@ -1,4 +1,4 @@
-"""Pydantic input/output schemas for all 21 MCP tools."""
+"""Pydantic input/output schemas for all 23 MCP tools."""
 
 from __future__ import annotations
 
@@ -257,6 +257,17 @@ class IndexStatusOutput(BaseModel):
     capabilities: dict[str, Any] = Field(
         default_factory=dict,
         description="Runtime capability report for optional features",
+    )
+    embeddings: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Embedding provenance: {current_version, current_tag, stored_tags, stale, "
+            "embedded_count, supported}. 'stale' is True when stored vectors were built by an "
+            "older text schema OR a different embedding model than the current provider. Stale "
+            "vectors are reused by search until a force-rebuild re-index refreshes them. "
+            "'supported' is False on non-SQLite backends where provenance cannot be read — then "
+            "embedded_count 0 means UNKNOWN, not zero."
+        ),
     )
     message: str = Field(default="", description="Human-readable status message")
 
@@ -551,5 +562,108 @@ class ChangeBriefingOutput(FreshnessMixin):
     truncated: dict[str, Any] = Field(
         default_factory=dict,
         description="Explicit truncation notes, e.g. {callers: {shown, total}} — no silent caps",
+    )
+    message: str = Field(default="", description="Human-readable status message")
+
+
+# ============================================================================
+# Placement + duplicate-check (bead code_hygiene_mcp-42i)
+# ============================================================================
+
+class SuggestPlacementInput(BaseModel):
+    """Input for code_graph_suggest_placement tool."""
+
+    repo_path: str = Field(description="Absolute or relative path to repository root")
+    description: str = Field(
+        default="", description="Short description of the new component (for rationale prose)"
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="Files/symbols the new component would import/depend on (repo-relative or absolute)",
+    )
+    consumed_by: list[str] = Field(
+        default_factory=list,
+        description="Files/symbols that would import/consume the new component",
+    )
+    limit: int = Field(default=5, ge=1, le=50, description="Max candidate modules to return")
+
+
+class PlacementCandidate(BaseModel):
+    """One ranked candidate module for a new component."""
+
+    module: str = Field(description="Candidate module name (declared module or top-level organ)")
+    violations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Layering violations placing the component here would create: "
+        "[{direction, from, to, rule}]",
+    )
+    rationale: str = Field(default="", description="Why this module ranks where it does")
+    score: float = Field(default=0.0, description="Ranking score (higher is better)")
+
+
+class SuggestPlacementOutput(FreshnessMixin):
+    """Output for code_graph_suggest_placement tool.
+
+    Composed from the arch-config module map + dependency matrix (no new analysis
+    engine). Each candidate lists the violations placing the component there would
+    create, so the choice is auditable — this is guidance, not a verdict.
+    """
+
+    candidates: list[PlacementCandidate] = Field(
+        default_factory=list, description="Ranked candidate modules (best first)"
+    )
+    config_used: bool = Field(
+        default=False,
+        description="True when .ariadne/architecture.yml drove violations; False = directory heuristic",
+    )
+    message: str = Field(default="", description="Human-readable status message")
+
+
+class FindEquivalentInput(BaseModel):
+    """Input for code_graph_find_equivalent tool."""
+
+    repo_path: str = Field(description="Absolute or relative path to repository root")
+    description: str = Field(
+        default="", description="Natural-language description of the component's behaviour"
+    )
+    signature: str | None = Field(
+        default=None, description="Optional signature/name to bias the search"
+    )
+    types: list[str] = Field(
+        default_factory=list, description="Optional node-type labels to filter by (e.g. CodeFunction)"
+    )
+    limit: int = Field(default=10, ge=1, le=50, description="Max candidate symbols to return")
+
+
+class EquivalentCandidate(BaseModel):
+    """One existing symbol that may already do what the caller described."""
+
+    name: str = Field(description="Symbol name")
+    node_id: str = Field(default="", description="Graph node id (for follow-up retrieval)")
+    module: str = Field(default="", description="Owning module/file of the symbol")
+    file: str = Field(default="", description="Repo-relative file path")
+    score: float = Field(default=0.0, description="Rerank score (similarity + same-module bonus)")
+    similarity: float = Field(default=0.0, description="Raw semantic similarity score")
+    rationale: str = Field(default="", description="Why this surfaced — NOT a verdict")
+
+
+class FindEquivalentOutput(FreshnessMixin):
+    """Output for code_graph_find_equivalent tool.
+
+    Ranked existing symbols that MIGHT already implement the described behaviour.
+    Explicitly framed as needs-human-judgement: no auto-verdict, no is_duplicate
+    flag. Empty with an explicit degraded-mode message when the semantic extra is
+    not installed (retrieval quality is degraded), never empty silence.
+    """
+
+    candidates: list[EquivalentCandidate] = Field(
+        default_factory=list, description="Ranked candidate existing symbols (best first)"
+    )
+    needs_human_judgement: bool = Field(
+        default=True,
+        description="Always True: these are similarity hits, a human must judge true duplication",
+    )
+    semantic_available: bool = Field(
+        default=False, description="False = semantic extra missing, results degraded (see message)"
     )
     message: str = Field(default="", description="Human-readable status message")

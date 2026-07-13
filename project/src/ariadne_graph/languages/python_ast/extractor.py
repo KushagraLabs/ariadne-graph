@@ -44,6 +44,40 @@ def _get_ast_node_source(
         return ""
 
 
+def _param_names(args: ast.arguments, *, drop_receiver: bool = False) -> list[str]:
+    """Ordered parameter names of a function (positional, *args, keyword-only,
+    **kwargs). When ``drop_receiver`` is True (a real instance/class method — NOT
+    a staticmethod or module-level function), the leading ``self``/``cls`` receiver
+    is dropped; otherwise every parameter is kept, so a module-level
+    ``def convert(cls, value)`` or a ``@staticmethod def convert(self, value)``
+    keeps its real first argument. Used for embedding text (bead 42i)."""
+    names: list[str] = []
+    names.extend(a.arg for a in getattr(args, "posonlyargs", []))
+    names.extend(a.arg for a in args.args)
+    if args.vararg:
+        names.append(args.vararg.arg)
+    names.extend(a.arg for a in args.kwonlyargs)
+    if args.kwarg:
+        names.append(args.kwarg.arg)
+    if drop_receiver and names and names[0] in ("self", "cls"):
+        names = names[1:]
+    return names
+
+
+def _function_signature(name: str, args: ast.arguments, is_async: bool) -> str:
+    """A compact one-line signature string for embedding text (bead 42i).
+
+    ``ast.unparse`` renders the argument list including annotations/defaults; we
+    prefix def/async def and the function name. Best-effort — a render failure
+    falls back to just the name so extraction never breaks on an odd node."""
+    prefix = "async def" if is_async else "def"
+    try:
+        rendered = ast.unparse(args)
+    except Exception:
+        return f"{prefix} {name}(...)"
+    return f"{prefix} {name}({rendered})"
+
+
 def _module_name_from_path(file_path: Path, repo_root: Path) -> str:
     """Derive a dotted module name from a file path relative to repo root.
 
@@ -406,6 +440,12 @@ class PythonFactExtractor(UniqueIdMixin, ast.NodeVisitor):
             "snippet": snippet,
             **line_info,
         }
+        # Class docstring as behavioural text for embeddings (bead 42i): a
+        # differently-named class with a descriptive docstring should surface as an
+        # equivalent (classes are in the default find_equivalent type set).
+        class_doc = ast.get_docstring(node)
+        if class_doc:
+            props["docstring"] = class_doc
 
         # Detect decorators
         is_dataclass = False
@@ -512,6 +552,25 @@ class PythonFactExtractor(UniqueIdMixin, ast.NodeVisitor):
             "is_async": is_async,
             **line_info,
         }
+
+        # Behavioural text for embeddings (bead 42i): the signature, parameter
+        # names, and full docstring let semantic search catch differently-named
+        # duplicates. Cheap to derive here from the AST node we already have; the
+        # embedding text builder (core/embeddings._build_node_text) reads these.
+        # A leading self/cls is a receiver ONLY on a real instance/class method
+        # (inside a class and not @staticmethod) — drop it just there, so a
+        # module-level or static function keeps its real first argument.
+        decorated_static = any(
+            _name_from_expr(d.func if isinstance(d, ast.Call) else d) == "staticmethod"
+            for d in node.decorator_list
+        )
+        drop_receiver = is_method and not decorated_static
+        param_names = _param_names(node.args, drop_receiver=drop_receiver)
+        props["parameters"] = param_names
+        props["signature"] = _function_signature(func_name, node.args, is_async)
+        docstring = ast.get_docstring(node)
+        if docstring:
+            props["docstring"] = docstring
 
         # Detect decorators
         decorator_names: list[str] = []
