@@ -113,6 +113,27 @@ class GraphStore(Protocol):
         """Release any resources held by the store (connections, drivers, etc.)."""
         ...
 
+    # --- Architecture-hygiene capability (bead code_hygiene_mcp-420) ---------
+    #
+    # File->file dependency SOURCING for the whole-graph architecture pass
+    # (cycles, dependency matrix, public-surface audit). A backend that cannot
+    # produce these edges sets ``supports_dep_edges = False`` and callers report
+    # the analysis as UNSUPPORTED — never a silent skip, the bug this replaced.
+    supports_dep_edges: bool
+
+    async def dep_edges(self, graph_id: str) -> list[tuple[str, str]]:
+        """Return cross-file ``(src_file, dst_file)`` dependency edges.
+
+        Implements the semantics of ``core.architecture._DEP_EDGE_SQL``: one
+        tuple per contributing edge (multiplicity is load-bearing — the matrix
+        derives ``import_count``/weight from it), abs file paths, ``src != dst``.
+        Two branches, unioned: SCIP REFERENCES + scip-resolved Python CALLS, plus
+        a tree-sitter IMPORTS fallback for source files with no cross-file SCIP
+        edge. Stores with ``supports_dep_edges = False`` raise
+        ``NotImplementedError``.
+        """
+        ...
+
 
 @runtime_checkable
 class SearchableGraphStore(GraphStore, Protocol):

@@ -15,7 +15,6 @@ from __future__ import annotations
 from typing import Any
 
 from ariadne_graph.core.architecture import (
-    _DEP_EDGE_SQL,
     PERIPHERAL_ORGANS,
     is_deep_import,
 )
@@ -171,10 +170,12 @@ async def full_graph(store: SQLiteGraphStore, graph_id: str, *, repo_root: str) 
             dir_id = "/".join(segments[: depth + 1])
             nodes[dir_id]["worst_level"] = _worse(nodes[dir_id]["worst_level"], diag["worst"])
 
-    xref = await _rows(store, _DEP_EDGE_SQL, (graph_id, graph_id, graph_id, graph_id))
+    # Same dep-edge SSOT the architecture pass uses, sourced through the store
+    # capability (bead code_hygiene_mcp-420) so there is one code path, not a
+    # second raw-SQL copy of _DEP_EDGE_SQL here.
+    xref = await store.dep_edges(graph_id)
     weights: dict[tuple[str, str], int] = {}
-    for r in xref:
-        sf, tf = r["sf"], r["tf"]
+    for sf, tf in xref:
         if sf not in files or tf not in files:
             continue
         # Drop edges originating from peripheral organs (tests/scripts/…) — they

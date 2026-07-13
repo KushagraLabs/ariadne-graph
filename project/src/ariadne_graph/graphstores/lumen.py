@@ -64,6 +64,36 @@ class LumenGraphStore:
         """Close the delegate store."""
         await self._delegate.close()
 
+    @property
+    def supports_dep_edges(self) -> bool:
+        """Mirror the delegate's dep_edges capability (bead code_hygiene_mcp-420).
+
+        A Lumen wrapper around a SQLite/Memory delegate MUST NOT silently lose
+        architecture hygiene — the exact silent-skip this bead removed. Reported
+        as a property so it tracks the delegate rather than freezing at wrap time.
+        """
+        return getattr(self._delegate, "supports_dep_edges", False)
+
+    async def dep_edges(self, graph_id: str) -> list[tuple[str, str]]:
+        """Forward the dep-edge capability to the delegate."""
+        return await self._delegate.dep_edges(graph_id)
+
+    async def remove_arch_diagnostics(
+        self, graph_id: str, rules: Sequence[str]
+    ) -> None:
+        """Forward generic stale-diagnostic deletion to the delegate.
+
+        A Lumen-wrapped Memory delegate (factory fallback with Lumen enabled)
+        runs the architecture pass via the forwarded ``dep_edges``; without this
+        forward its ``_delete_arch_diagnostics`` generic branch would find no
+        remover on the wrapper and leave stale findings, breaking re-index
+        idempotency. Delegates that lack the helper (SQLite uses SQL delete)
+        simply have nothing to forward.
+        """
+        remover = getattr(self._delegate, "remove_arch_diagnostics", None)
+        if remover is not None:
+            await remover(graph_id, rules)
+
     def _is_path_allowed(self, repo_path: str | Path) -> bool:
         """Return True when *repo_path* is under the configured workspace root."""
         if self.workspace_root is None:

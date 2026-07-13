@@ -18,6 +18,11 @@ class MemoryGraphStore:
     Suitable for tests and quick development checks.
     """
 
+    # Architecture-hygiene capability (bead code_hygiene_mcp-420): the edge scan
+    # below reproduces the SQL dep-edge SSOT, so architecture analysis is
+    # unit-testable over this backend without a SQLite fixture.
+    supports_dep_edges: bool = True
+
     def __init__(self) -> None:
         self._nodes: dict[tuple[str, str], CodeNode] = {}
         self._edges: list[CodeEdge] = []
@@ -27,6 +32,102 @@ class MemoryGraphStore:
     async def close(self) -> None:
         """No-op for the in-memory store."""
         return None
+
+    async def remove_arch_diagnostics(
+        self, graph_id: str, rules: Sequence[str]
+    ) -> None:
+        """Delete CodeDiagnostic nodes (+ their edges) for the given rules.
+
+        The generic-store counterpart to SQLite's SQL delete in
+        ``_delete_arch_diagnostics``: lets the architecture pass stay idempotent
+        over Memory (a stopped rule's stale finding is cleared, not just
+        overwritten by the deterministic id).
+        """
+        rule_set = set(rules)
+        removed_ids: set[str] = set()
+        for key, node in list(self._nodes.items()):
+            if (
+                key[0] == graph_id
+                and "CodeDiagnostic" in node.labels
+                and node.properties.get("rule") in rule_set
+            ):
+                removed_ids.add(node.id)
+                del self._nodes[key]
+        if removed_ids:
+            self._edges = [
+                e
+                for e in self._edges
+                if not (e.graph_id == graph_id and e.target in removed_ids)
+            ]
+
+    async def dep_edges(self, graph_id: str) -> list[tuple[str, str]]:
+        """Cross-file dependency edges — the Python mirror of ``_DEP_EDGE_SQL``.
+
+        Two branches, unioned with multiplicity preserved (one tuple per
+        contributing edge, matching the SQL's ``UNION ALL``):
+
+        1. SCIP branch — REFERENCES + scip-resolved Python CALLS, mapped from the
+           source/target nodes' owning files, cross-file only (``sf != tf``).
+        2. IMPORTS fallback — for a source file with NO cross-file SCIP dep edge,
+           an ``IMPORTS``/``IMPORTS_SYMBOL`` edge to a CodeImport node whose
+           ``resolved_source`` is an indexed CodeFile contributes that file->file
+           edge (import granularity). Gated per source file so a SCIP-covered
+           file is served entirely by branch 1 (no double count).
+        """
+        nodes = {
+            nid: node
+            for (gid, nid), node in self._nodes.items()
+            if gid == graph_id
+        }
+        edges = [e for e in self._edges if e.graph_id == graph_id]
+
+        def _file_of(node_id: str) -> str | None:
+            node = nodes.get(node_id)
+            return node.properties.get("file_path") if node else None
+
+        def _is_scip(edge: CodeEdge) -> bool:
+            if edge.rel_type == "REFERENCES":
+                return True
+            return (
+                edge.rel_type == "CALLS"
+                and edge.properties.get("resolved_by") == "scip-python"
+            )
+
+        indexed_files = {
+            node.properties["file_path"]
+            for node in nodes.values()
+            if "CodeFile" in node.labels and node.properties.get("file_path")
+        }
+
+        result: list[tuple[str, str]] = []
+        scip_covered: set[str] = set()
+
+        # Branch 1: SCIP edges (also seeds scip_covered for the fallback gate).
+        for edge in edges:
+            if not _is_scip(edge):
+                continue
+            sf, tf = _file_of(edge.source), _file_of(edge.target)
+            if sf and tf and sf != tf:
+                result.append((sf, tf))
+                scip_covered.add(sf)
+
+        # Branch 2: IMPORTS fallback for source files with no cross-file SCIP edge.
+        for edge in edges:
+            if edge.rel_type not in ("IMPORTS", "IMPORTS_SYMBOL"):
+                continue
+            sf = _file_of(edge.source)
+            target = nodes.get(edge.target)
+            tf = target.properties.get("resolved_source") if target else None
+            if (
+                sf
+                and tf
+                and sf != tf
+                and tf in indexed_files
+                and sf not in scip_covered
+            ):
+                result.append((sf, tf))
+
+        return result
 
     async def delete_graph(self, graph_id: str) -> None:
         keys_to_remove = [k for k in self._nodes if k[0] == graph_id]

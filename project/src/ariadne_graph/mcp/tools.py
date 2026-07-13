@@ -14,10 +14,10 @@ from typing import TYPE_CHECKING, Any, cast
 import xxhash
 
 from ariadne_graph.core.architecture import (
-    _DEP_EDGE_SQL,
-    _FILE_SQL,
     _dir_of,
+    _read_code_files,
     _rel,
+    _sql_connect,
     explain_edge,
     is_peripheral_path,
     persist_architecture_diagnostics,
@@ -44,7 +44,6 @@ from ariadne_graph.core.retrieval import GraphRetriever
 from ariadne_graph.core.search import HybridSearcher
 from ariadne_graph.core.snippets import SnippetExtractor
 from ariadne_graph.graphstores.base import GraphStore, SearchableGraphStore
-from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
 from ariadne_graph.languages.base import LanguageAdapter
 from ariadne_graph.mcp.fallbacks import GraphStoreFallbacks
 from ariadne_graph.mcp.schemas import (
@@ -700,8 +699,9 @@ class ToolRegistry:
         # Whole-graph architecture analysis — runs once, after every adapter has
         # synced and SCIP has resolved dep edges. Persists cycle/deep-import/
         # orphan/upward-import findings as CodeDiagnostic nodes. Requires the
-        # SQLite store (the dep-edge join is SQL); other stores skip it.
-        if isinstance(self.graph_store, SQLiteGraphStore):
+        # dep_edges capability (SQLite + Memory); backends without it (e.g.
+        # Neo4j today) skip, and their tool responses say so explicitly.
+        if getattr(self.graph_store, "supports_dep_edges", False):
             try:
                 written = await persist_architecture_diagnostics(
                     self.graph_store, graph_id, repo_path
@@ -709,6 +709,16 @@ class ToolRegistry:
                 logger.info("Architecture analysis wrote %d findings", written)
             except Exception as exc:
                 logger.warning("Architecture analysis failed: %s", exc)
+        else:
+            # Explicit, not silent: a backend without the dep_edges capability
+            # (Neo4j today) receives NO architecture hygiene — the bug this bead
+            # removed. Surface it at WARNING so a Neo4j deployment is not left
+            # quietly believing its graph is healthy.
+            logger.warning(
+                "Architecture analysis skipped: graph store %s does not "
+                "implement the dep_edges capability (no hygiene findings).",
+                type(self.graph_store).__name__,
+            )
 
         # Also compute embeddings for changed files if a provider is available
         if (
@@ -1553,8 +1563,8 @@ class ToolRegistry:
     ) -> DependencyMatrixOutput:
         """Get the file/directory/module-level dependency graph (nodes + edges).
 
-        SQLite-only, like the persisted architecture pass: the dep-edge join is
-        SQL (``_DEP_EDGE_SQL``), so other stores are not supported.
+        Requires the ``dep_edges`` capability (SQLite + Memory); a backend
+        without it returns an explicit unsupported message, never a silent skip.
         """
         repo_path = str(Path(input.repo_path).resolve())
         graph_id = self._get_graph_id(repo_path)
@@ -1563,9 +1573,13 @@ class ToolRegistry:
         if not exists:
             return DependencyMatrixOutput(message="Repository has not been indexed yet")
 
-        if not isinstance(self.graph_store, SQLiteGraphStore):
+        if not getattr(self.graph_store, "supports_dep_edges", False):
             return DependencyMatrixOutput(
-                message="Dependency matrix requires the SQLite graph store"
+                message=(
+                    "Dependency matrix is unsupported on this graph store "
+                    f"({type(self.graph_store).__name__}): it does not implement "
+                    "the dep_edges capability."
+                )
             )
 
         matrix = await read_dependency_matrix(
@@ -1636,26 +1650,32 @@ class ToolRegistry:
             return AuditPublicSurfacesOutput(
                 modules=[], message="Repository has not been indexed yet"
             )
-        if not isinstance(self.graph_store, SQLiteGraphStore):
+        # Needs the dep_edges capability AND the SQL ``from_module`` import query
+        # (``_IMPORT_FROM_MODULE_SQL``, not part of the capability). A store
+        # missing either is reported explicitly, never silently skipped.
+        connect = _sql_connect(self.graph_store)
+        if not getattr(self.graph_store, "supports_dep_edges", False) or connect is None:
             return AuditPublicSurfacesOutput(
                 modules=[],
-                message="Public-surfaces audit requires the SQLite store (dep-edge join is SQL).",
+                message=(
+                    "Public-surfaces audit is unsupported on this graph store "
+                    f"({type(self.graph_store).__name__}): it needs the dep_edges "
+                    "capability and the SQL from_module import query."
+                ),
             )
 
-        db = await self.graph_store._connect()
+        dep_rows = await self.graph_store.dep_edges(graph_id)
+        file_rows = await _read_code_files(self.graph_store, graph_id)
+        db = await connect()
         try:
-            file_cursor = await db.execute(_FILE_SQL, (graph_id,))
-            file_rows = await file_cursor.fetchall()
-            dep_cursor = await db.execute(_DEP_EDGE_SQL, (graph_id, graph_id, graph_id, graph_id))
-            dep_rows = await dep_cursor.fetchall()
             import_cursor = await db.execute(_IMPORT_FROM_MODULE_SQL, (graph_id,))
             import_rows = await import_cursor.fetchall()
         finally:
             await db.close()
 
-        files = [_rel(r["file_path"], repo_path) for r in file_rows]
+        files = [_rel(fp, repo_path) for _nid, fp in file_rows]
         file_set = set(files)
-        dep_edges = [(_rel(r["sf"], repo_path), _rel(r["tf"], repo_path)) for r in dep_rows]
+        dep_edges = [(_rel(sf, repo_path), _rel(tf, repo_path)) for sf, tf in dep_rows]
         # (importing file, import target) -- the literal module path the consumer
         # WROTE, the only signal that survives past symbol resolution to tell a
         # via-surface import from a deep one (see _audit_public_surfaces

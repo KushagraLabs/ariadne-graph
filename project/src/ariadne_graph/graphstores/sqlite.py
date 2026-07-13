@@ -174,6 +174,10 @@ class SQLiteGraphStore:
     brute-force Python fallback).
     """
 
+    # Architecture-hygiene capability (bead code_hygiene_mcp-420): the dep-edge
+    # SSOT is SQL here, so this backend serves it natively.
+    supports_dep_edges: bool = True
+
     def __init__(
         self,
         db_path: str = ".ariadne/graph.db",
@@ -252,6 +256,26 @@ class SQLiteGraphStore:
             if self._db is not None:
                 await self._db.close()
                 self._db = None
+
+    async def dep_edges(self, graph_id: str) -> list[tuple[str, str]]:
+        """Cross-file dependency edges via the ``_DEP_EDGE_SQL`` SSOT.
+
+        Local import keeps ``_DEP_EDGE_SQL`` a single definition in
+        ``core.architecture`` (avoiding a module-load cycle: architecture.py only
+        type-hints this store). The 4 ``?`` placeholders bind the graph_id for the
+        two CTEs + the two UNION-ALL branches.
+        """
+        from ariadne_graph.core.architecture import _DEP_EDGE_SQL
+
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                _DEP_EDGE_SQL, (graph_id, graph_id, graph_id, graph_id)
+            )
+            rows = await cursor.fetchall()
+        finally:
+            await db.close()
+        return [(r["sf"], r["tf"]) for r in rows]
 
     # ------------------------------------------------------------------
     # Schema

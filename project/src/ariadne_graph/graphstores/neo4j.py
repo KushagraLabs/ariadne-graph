@@ -73,6 +73,11 @@ class Neo4jGraphStore:
     Supports vector indexes and GDS community detection.
     """
 
+    # Architecture-hygiene capability (bead code_hygiene_mcp-420): the Cypher
+    # dep-edge query is follow-up work, so this backend reports UNSUPPORTED and
+    # callers surface an explicit message rather than silently skipping hygiene.
+    supports_dep_edges: bool = False
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -97,6 +102,19 @@ class Neo4jGraphStore:
         if self._driver is not None:
             await self._driver.close()
             self._driver = None
+
+    async def dep_edges(self, graph_id: str) -> list[tuple[str, str]]:
+        """Not yet implemented — see ``supports_dep_edges = False`` (follow-up).
+
+        The Cypher port of ``_DEP_EDGE_SQL`` is deferred; callers check
+        ``supports_dep_edges`` and report the analysis as unsupported instead of
+        calling this. Raising (not returning ``[]``) keeps a silent skip
+        impossible if a caller forgets the capability check.
+        """
+        raise NotImplementedError(
+            "Neo4jGraphStore does not implement dep_edges yet "
+            "(architecture hygiene). See bead code_hygiene_mcp-420."
+        )
 
     # ------------------------------------------------------------------
     # Session helper

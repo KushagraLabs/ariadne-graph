@@ -31,7 +31,7 @@ from ariadne_graph.core.diagnostics import CodeDiagnostic
 from ariadne_graph.core.models import CodeEdge, CodeNode
 
 if TYPE_CHECKING:
-    from ariadne_graph.graphstores.sqlite import SQLiteGraphStore
+    from ariadne_graph.graphstores.base import GraphStore
 
 # Peripheral organs (tests, scripts, and kin) are entry-point / glue code that
 # legitimately reaches into everything it exercises or wires together. Dep edges
@@ -755,6 +755,44 @@ WHERE graph_id = ? AND labels LIKE '%"CodeFile"%'
   AND json_extract(properties, '$.file_path') IS NOT NULL
 """
 
+
+def _sql_connect(store: GraphStore):
+    """Return the store's raw-SQL ``_connect`` coroutine fn, or ``None``.
+
+    A few architecture sub-features (resolution-coverage split, stale-diagnostic
+    delete, public-surface import query) are raw SQL with no capability of their
+    own. This locates the SQL connection: directly on a SQLite store, or on the
+    delegate of a Lumen wrapper — so a Lumen-wrapped SQLite stays fully hygienic
+    instead of silently degrading. ``None`` for a non-SQL backend (Memory), which
+    callers handle with an explicit unsupported path, never a silent skip.
+    """
+    connect = getattr(store, "_connect", None)
+    if connect is not None:
+        return connect
+    delegate = getattr(store, "_delegate", None)
+    if delegate is not None:
+        return getattr(delegate, "_connect", None)
+    return None
+
+
+async def _read_code_files(store: GraphStore, graph_id: str) -> list[tuple[str, str]]:
+    """Return ``(node_id, abs_file_path)`` for every indexed CodeFile.
+
+    Backend-agnostic (the generic ``nodes_by_label`` query, which every store
+    implements) so the architecture pass runs over any ``GraphStore`` — the SAME
+    (id, file_path) rows ``_FILE_SQL`` produced, just sourced through the
+    protocol instead of raw SQL.
+    """
+    rows = await store.query(graph_id, "nodes_by_label", {"label": "CodeFile"})
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        node = row.get("n", row)
+        node_id = node.get("id")
+        file_path = (node.get("properties") or {}).get("file_path")
+        if node_id and file_path:
+            out.append((node_id, file_path))
+    return out
+
 # Resolution-coverage provenance (bead 1u5): per source file, which dep-edge
 # branch of _DEP_EDGE_SQL served it. Reuses the SAME two CTEs as _DEP_EDGE_SQL, so
 # the counts describe exactly what the dep SSOT produced (no gate drift) and stay
@@ -793,7 +831,7 @@ _ARCH_RULES = (
 
 
 async def persist_architecture_diagnostics(
-    store: SQLiteGraphStore,
+    store: GraphStore,
     graph_id: str,
     repo_root: str,
 ) -> int:
@@ -808,17 +846,11 @@ async def persist_architecture_diagnostics(
 
     Returns the number of findings written.
     """
-    db = await store._connect()
-    try:
-        # Map abs file_path -> CodeFile node id (the diagnostic attaches here).
-        file_cursor = await db.execute(_FILE_SQL, (graph_id,))
-        file_rows = await file_cursor.fetchall()
-        abs_to_file_id: dict[str, str] = {r["file_path"]: r["id"] for r in file_rows}
-
-        dep_cursor = await db.execute(_DEP_EDGE_SQL, (graph_id, graph_id, graph_id, graph_id))
-        dep_rows = await dep_cursor.fetchall()
-    finally:
-        await db.close()
+    # Map abs file_path -> CodeFile node id (the diagnostic attaches here) and
+    # source the file->file dep edges through the store capability (SSOT).
+    file_rows = await _read_code_files(store, graph_id)
+    abs_to_file_id: dict[str, str] = {fp: nid for nid, fp in file_rows}
+    dep_rows = await store.dep_edges(graph_id)
 
     # Analysis speaks repo-relative paths; keep a rel->abs map to route findings
     # back to the CodeFile node ids.
@@ -826,7 +858,7 @@ async def persist_architecture_diagnostics(
         _rel(abs_path, repo_root): abs_path for abs_path in abs_to_file_id
     }
     files = list(rel_to_abs)
-    dep_edges = [(_rel(r["sf"], repo_root), _rel(r["tf"], repo_root)) for r in dep_rows]
+    dep_edges = [(_rel(sf, repo_root), _rel(tf, repo_root)) for sf, tf in dep_rows]
 
     arch_config = load_architecture_config(Path(repo_root))
     findings = analyze(files, dep_edges, arch_config=arch_config)
@@ -879,7 +911,7 @@ async def persist_architecture_diagnostics(
 
 
 async def read_dependency_matrix(
-    store: SQLiteGraphStore,
+    store: GraphStore,
     graph_id: str,
     repo_root: str,
     *,
@@ -887,27 +919,21 @@ async def read_dependency_matrix(
 ) -> DependencyMatrix:
     """Read-only counterpart to :func:`persist_architecture_diagnostics`.
 
-    Runs the same ``_FILE_SQL``/``_DEP_EDGE_SQL`` queries against ``store``,
+    Reads the CodeFile nodes + the ``dep_edges`` capability from ``store``,
     converts to repo-relative paths, and feeds the pure :func:`dependency_matrix`
     — no writes, no diagnostics persisted. Used by the
     ``code_graph_get_dependency_matrix`` MCP tool.
     """
-    db = await store._connect()
-    try:
-        file_cursor = await db.execute(_FILE_SQL, (graph_id,))
-        file_rows = await file_cursor.fetchall()
-        dep_cursor = await db.execute(_DEP_EDGE_SQL, (graph_id, graph_id, graph_id, graph_id))
-        dep_rows = await dep_cursor.fetchall()
-    finally:
-        await db.close()
+    file_rows = await _read_code_files(store, graph_id)
+    dep_rows = await store.dep_edges(graph_id)
 
-    files = [_rel(r["file_path"], repo_root) for r in file_rows]
-    dep_edges = [(_rel(r["sf"], repo_root), _rel(r["tf"], repo_root)) for r in dep_rows]
+    files = [_rel(fp, repo_root) for _nid, fp in file_rows]
+    dep_edges = [(_rel(sf, repo_root), _rel(tf, repo_root)) for sf, tf in dep_rows]
     return dependency_matrix(files, dep_edges, group_by=group_by)
 
 
 async def read_resolution_coverage(
-    store: SQLiteGraphStore,
+    store: GraphStore,
     graph_id: str,
 ) -> dict[str, object]:
     """Resolution provenance for the dep SSOT: how each source file was resolved.
@@ -926,8 +952,19 @@ async def read_resolution_coverage(
 
     Attached to analysis responses via the same envelope mechanism as the hh0
     freshness field (a mixin field on the output model), never a parallel channel.
+
+    The per-file SCIP-vs-imports split is SQL (``_RESOLUTION_COVERAGE_SQL``); a
+    store that cannot run it reports ``resolution = "unsupported"`` EXPLICITLY
+    rather than silently claiming ``none`` (which would read as a clean graph).
     """
-    db = await store._connect()
+    connect = _sql_connect(store)
+    if connect is None:
+        return {
+            "references_files": 0,
+            "imports_only_files": 0,
+            "resolution": "unsupported",
+        }
+    db = await connect()
     try:
         cursor = await db.execute(_RESOLUTION_COVERAGE_SQL, (graph_id, graph_id, graph_id))
         row = await cursor.fetchone()
@@ -951,9 +988,22 @@ async def read_resolution_coverage(
     }
 
 
-async def _delete_arch_diagnostics(store: SQLiteGraphStore, graph_id: str) -> None:
-    """Remove CodeDiagnostic nodes (and their edges) owned by this pass."""
-    db = await store._connect()
+async def _delete_arch_diagnostics(store: GraphStore, graph_id: str) -> None:
+    """Remove CodeDiagnostic nodes (and their edges) owned by this pass.
+
+    Idempotent on every backend that runs the pass. SQLite (incl. Lumen-wrapped)
+    deletes by SQL, byte-identical to before. A non-SQL store that runs the pass
+    (Memory) deletes generically via its ``remove_arch_diagnostics`` helper so a
+    stopped rule's stale finding is cleared, not just the deterministic-id
+    overwrite — the persist idempotency contract holds regardless of backend.
+    """
+    connect = _sql_connect(store)
+    if connect is None:
+        remover = getattr(store, "remove_arch_diagnostics", None)
+        if remover is not None:
+            await remover(graph_id, _ARCH_RULES)
+        return
+    db = await connect()
     try:
         placeholders = ",".join("?" for _ in _ARCH_RULES)
         cursor = await db.execute(
