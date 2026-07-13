@@ -1,4 +1,4 @@
-"""Pydantic input/output schemas for all 14 MCP tools."""
+"""Pydantic input/output schemas for all 21 MCP tools."""
 
 from __future__ import annotations
 
@@ -474,5 +474,82 @@ class ListDiagnosticsOutput(FreshnessMixin):
             "truncation): 'by_rule' (per-rule totals) and 'by_production' "
             "(production vs test split)"
         ),
+    )
+    message: str = Field(default="", description="Human-readable status message")
+
+
+class ChangeBriefingInput(BaseModel):
+    """Input for code_graph_change_briefing tool.
+
+    Accepts EITHER a ``symbol`` OR a ``file_path`` (decision (1): a symbol is
+    resolved to its owning file). Exactly one must be supplied.
+    """
+
+    repo_path: str = Field(description="Absolute or relative path to repository root")
+    symbol: str | None = Field(
+        default=None, description="Symbol/node ID to brief (resolved to its owning file)"
+    )
+    file_path: str | None = Field(
+        default=None, description="File path to brief (repo-relative or absolute)"
+    )
+    max_callers: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="Cap on callers listed per direction; truncation is reported explicitly",
+    )
+
+
+class ChangeBriefingOutput(FreshnessMixin):
+    """Output for code_graph_change_briefing tool.
+
+    A digested pre-edit briefing composed from existing internals (impact/trace,
+    diagnostics, public-surface audit, hotspots, freshness) — never raw graph
+    rows. ``summary`` is agent-facing markdown (facts + risk notes, no
+    prescriptions) and carries no bare node ids; the structured fields back it.
+    """
+
+    target_file: str = Field(default="", description="Repo-relative path of the briefed file")
+    target_symbol: str | None = Field(
+        default=None, description="The symbol briefed, when a symbol was supplied"
+    )
+    summary: str = Field(default="", description="Agent-facing markdown briefing (facts + risks)")
+    callers_by_module: dict[str, list[dict[str, Any]]] = Field(
+        default_factory=dict,
+        description=(
+            "Direct+transitive callers grouped by module: {module -> [{file, "
+            "depth, direct}]}. Names/paths only, never bare node ids."
+        ),
+    )
+    caller_files: list[str] = Field(
+        default_factory=list, description="Distinct caller file paths (deduped, sorted)"
+    )
+    cycle: dict[str, Any] | None = Field(
+        default=None,
+        description="Cycle membership: {scc_size, path} when the file is in an import cycle, else None",
+    )
+    layering: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Layering findings on this file: [{rule, message, from, to}]",
+    )
+    public_surface: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Public-surface status: {is_surface, module, deep_import_consumers, "
+            "via_surface_consumers} — empty when no architecture.yml declares surfaces"
+        ),
+    )
+    coupling_rank: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "File-level coupling rank of this file: {rank, ranked_within, "
+            "pool_capped, metric, score} or None when the file is outside the "
+            "ranked pool. 'ranked_within' is the file-pool size the rank is "
+            "relative to; 'pool_capped' flags the underlying symbol pool was capped"
+        ),
+    )
+    truncated: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Explicit truncation notes, e.g. {callers: {shown, total}} — no silent caps",
     )
     message: str = Field(default="", description="Human-readable status message")

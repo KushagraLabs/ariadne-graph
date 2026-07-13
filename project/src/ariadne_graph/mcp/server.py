@@ -27,6 +27,7 @@ from ariadne_graph.languages.base import LanguageAdapter
 from ariadne_graph.mcp.schemas import (
     AuditPublicSurfacesInput,
     CapabilitiesInput,
+    ChangeBriefingInput,
     DeleteProjectInput,
     DetectChangesInput,
     ExplainEdgeInput,
@@ -452,6 +453,48 @@ async def code_graph_list_communities(
     registry = _get_registry()
     input_data = ListCommunitiesInput(repo_path=repo_path, community_id=community_id)
     result = await registry.handle_list_communities(input_data)
+    return result.model_dump()
+
+
+@mcp.tool()
+async def code_graph_change_briefing(
+    repo_path: str,
+    symbol: str | None = None,
+    file_path: str | None = None,
+    max_callers: int = 20,
+) -> dict[str, Any]:
+    """Digested pre-edit briefing for a file or symbol — call BEFORE editing it.
+
+    Returns a short markdown ``summary`` (facts + risk notes, no prescriptions)
+    plus structured fields, composed from the existing analysis internals — never
+    raw graph rows and never bare node ids. Covers: direct+transitive callers
+    grouped by file and module, import-cycle membership (SCC size + ring path),
+    layering findings on the file (deep_import / layer_violation / upward_import),
+    public-surface status (is it a declared surface? who reaches it), coupling
+    hotspot rank, and an in-band freshness stamp.
+
+    Supply EXACTLY ONE of ``symbol`` (resolved to its owning file) or
+    ``file_path`` (repo-relative or absolute). ``max_callers`` caps the caller
+    list per direction; any truncation is reported explicitly in ``truncated``.
+
+    Args:
+        repo_path: Absolute or relative path to the repository root.
+        symbol: Symbol/node ID to brief. Mutually exclusive with file_path.
+        file_path: File to brief. Mutually exclusive with symbol.
+        max_callers: Cap on callers listed (1-200); truncation surfaced, not silent.
+
+    Returns:
+        Dict with target_file, summary (markdown), callers_by_module, cycle,
+        layering, public_surface, coupling_rank, truncated, and freshness.
+    """
+    registry = _get_registry()
+    input_data = ChangeBriefingInput(
+        repo_path=repo_path,
+        symbol=symbol,
+        file_path=file_path,
+        max_callers=max_callers,
+    )
+    result = await registry.handle_change_briefing(input_data)
     return result.model_dump()
 
 

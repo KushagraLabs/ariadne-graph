@@ -1,4 +1,4 @@
-"""ToolRegistry — all 14 MCP tool handlers."""
+"""ToolRegistry — all 21 MCP tool handlers."""
 
 from __future__ import annotations
 
@@ -53,6 +53,8 @@ from ariadne_graph.mcp.schemas import (
     AuditPublicSurfacesOutput,
     CapabilitiesInput,
     CapabilitiesOutput,
+    ChangeBriefingInput,
+    ChangeBriefingOutput,
     CommunitiesOutput,
     DeleteProjectInput,
     DeleteProjectOutput,
@@ -362,7 +364,7 @@ def _audit_public_surfaces(
 
 
 class ToolRegistry:
-    """Holds all 14 MCP tool handlers and their shared resources."""
+    """Holds all 21 MCP tool handlers and their shared resources."""
 
     def __init__(
         self,
@@ -1887,3 +1889,421 @@ class ToolRegistry:
             message=f"Found {len(matched)} diagnostics ({len(results)} returned)",
             freshness=await self._freshness_envelope(graph_id),
         )
+
+    # ==================================================================
+    # BRIEFING TOOL (1) — digested pre-edit guidance
+    # ==================================================================
+
+    async def handle_change_briefing(
+        self, input: ChangeBriefingInput
+    ) -> ChangeBriefingOutput:
+        """Digested pre-edit briefing for a file/symbol.
+
+        Composes existing internals only (no new analysis engine): the retriever's
+        symbol resolution + upstream trace for callers, the persisted architecture
+        diagnostics via :meth:`handle_list_diagnostics` for cycle/layering, the
+        public-surface audit, the hotspot ranker, and the shared freshness
+        envelope. Output is agent-facing markdown plus structured fields, with
+        names/paths only — never bare graph node ids in the prose.
+
+        Input accepts EITHER a symbol (resolved to its owning file) OR a file_path
+        (decision (1)). Caller lists are capped at ``max_callers`` per direction
+        with the truncation reported explicitly (decision (2): no silent caps).
+        """
+        repo_path = str(Path(input.repo_path).resolve())
+        graph_id = self._get_graph_id(repo_path)
+
+        if bool(input.symbol) == bool(input.file_path):
+            return ChangeBriefingOutput(
+                message="Supply exactly one of 'symbol' or 'file_path'."
+            )
+
+        exists = await self._graph_exists(graph_id)
+        if not exists:
+            return ChangeBriefingOutput(message="Repository has not been indexed yet")
+
+        # ---- resolve target to an owning file (abs + rel) --------------------
+        target_abs: str | None = None
+        start_node_ids: list[str] = []
+        if input.symbol:
+            if self.retriever is None:
+                return ChangeBriefingOutput(
+                    message="Change briefing requires a searchable graph store."
+                )
+            node = await self.retriever._resolve_symbol(graph_id, input.symbol)
+            if node is None:
+                return ChangeBriefingOutput(
+                    target_symbol=input.symbol,
+                    message=f"Symbol {input.symbol!r} not found in the graph.",
+                )
+            sid = node.get("id", "")
+            target_abs = node.get("properties", {}).get("file_path")
+            start_node_ids = [sid] if sid else []
+        else:
+            # A file_path input: normalise to abs and gather its graph nodes so
+            # callers trace works file-wide (decision (1): file or symbol input).
+            raw = input.file_path or ""
+            candidate = raw if Path(raw).is_absolute() else str(Path(repo_path) / raw)
+            target_abs = str(Path(candidate).resolve())
+            file_nodes = await self._get_nodes_for_file(graph_id, target_abs)
+            if not file_nodes:
+                return ChangeBriefingOutput(
+                    message=f"File {input.file_path!r} not found in the indexed graph.",
+                )
+            start_node_ids = [n.get("id", "") for n in file_nodes if n.get("id")]
+
+        if not target_abs:
+            return ChangeBriefingOutput(
+                target_symbol=input.symbol,
+                message="Could not resolve the target to a source file.",
+            )
+        target_rel = _rel(target_abs, repo_path)
+
+        arch_config = load_architecture_config(Path(repo_path))
+
+        def _module_of(rel: str) -> str:
+            """Module bucket for a repo-relative file: the declared module when a
+            config exists, else the top-level directory (its 'organ')."""
+            if arch_config is not None:
+                mod = arch_config.module_of(rel)
+                if mod:
+                    return mod
+            head = rel.split("/", 1)[0]
+            return head if "/" in rel else "(root)"
+
+        # ---- callers: upstream trace, grouped by module ----------------------
+        # Bounded BFS depth: an explicit horizon on transitive callers. Reported
+        # in `truncated.callers.max_depth` (never silent) so a consumer knows the
+        # frontier was walked this far and no further.
+        caller_max_depth = 5
+        callers_by_module: dict[str, list[dict[str, Any]]] = {}
+        caller_files: set[str] = set()
+        callers_truncated = False
+        depth_bounded = False
+        total_callers = 0
+        if start_node_ids and self.retriever is not None:
+            # depth 0 is a start node itself; depth 1 = direct callers, >1
+            # transitive. Union across every start node (a file has many symbols),
+            # keeping the SHALLOWEST depth seen for each caller file.
+            best_depth: dict[str, int] = {}
+            for sid in start_node_ids:
+                try:
+                    trace = await self.retriever.trace_dependencies(
+                        graph_id, sid, direction="up", max_depth=caller_max_depth
+                    )
+                except Exception as exc:
+                    logger.warning("Change-briefing caller trace failed: %s", exc)
+                    continue
+                for hit in trace:
+                    depth = hit.get("depth", 0)
+                    if depth == 0:
+                        continue
+                    if depth >= caller_max_depth:
+                        depth_bounded = True  # frontier hit the horizon
+                    fp = hit.get("node", {}).get("properties", {}).get("file_path")
+                    if not fp:
+                        continue
+                    rel = _rel(fp, repo_path)
+                    if rel == target_rel:
+                        continue
+                    prev = best_depth.get(rel)
+                    if prev is None or depth < prev:
+                        best_depth[rel] = depth
+            entries = sorted(best_depth.items(), key=lambda kv: (kv[1], kv[0]))
+            total_callers = len(entries)
+            shown = entries[: input.max_callers]
+            callers_truncated = len(entries) > len(shown)
+            for rel, depth in shown:
+                caller_files.add(rel)
+                callers_by_module.setdefault(_module_of(rel), []).append(
+                    {"file": rel, "depth": depth, "direct": depth == 1}
+                )
+
+        # ---- diagnostics on this file: cycle + layering ----------------------
+        diag_out = await self.handle_list_diagnostics(
+            ListDiagnosticsInput(repo_path=repo_path, file_path=target_abs, limit=1000)
+        )
+        cycle: dict[str, Any] | None = None
+        layering: list[dict[str, Any]] = []
+        layer_rules = {"deep_import", "layer_violation", "upward_import"}
+        for d in diag_out.diagnostics:
+            props = d.get("properties", {})
+            rule = props.get("rule")
+            if rule == "dependency_cycle" and cycle is None:
+                ring = props.get("cycle", [])
+                cycle = {"scc_size": len(ring), "path": ring}
+            elif rule in layer_rules:
+                layering.append(
+                    {
+                        "rule": rule,
+                        "message": d.get("message") or props.get("message"),
+                        "from": props.get("from"),
+                        "to": props.get("to"),
+                    }
+                )
+
+        # ---- public-surface status ------------------------------------------
+        public_surface = await self._briefing_public_surface(
+            graph_id, repo_path, target_rel, arch_config
+        )
+
+        # ---- hotspot / coupling rank ----------------------------------------
+        coupling_rank = await self._briefing_coupling_rank(graph_id, target_rel, repo_path)
+
+        freshness = await self._freshness_envelope(graph_id)
+
+        truncated: dict[str, Any] = {}
+        if callers_truncated or depth_bounded:
+            note: dict[str, Any] = {}
+            if callers_truncated:
+                note["shown"] = len(caller_files)
+                note["total"] = total_callers
+            if depth_bounded:
+                # The transitive frontier reached the BFS horizon; callers beyond
+                # caller_max_depth are not enumerated. Surfaced, not silent.
+                note["max_depth"] = caller_max_depth
+            truncated["callers"] = note
+
+        summary = self._render_briefing_markdown(
+            target_rel=target_rel,
+            callers_by_module=callers_by_module,
+            total_callers=total_callers,
+            cycle=cycle,
+            layering=layering,
+            public_surface=public_surface,
+            coupling_rank=coupling_rank,
+            freshness=freshness,
+            truncated=truncated,
+        )
+
+        return ChangeBriefingOutput(
+            target_file=target_rel,
+            target_symbol=input.symbol,
+            summary=summary,
+            callers_by_module=callers_by_module,
+            caller_files=sorted(caller_files),
+            cycle=cycle,
+            layering=layering,
+            public_surface=public_surface,
+            coupling_rank=coupling_rank,
+            truncated=truncated,
+            message=f"Briefing for {target_rel}",
+            freshness=freshness,
+        )
+
+    async def _briefing_public_surface(
+        self,
+        graph_id: str,
+        repo_path: str,
+        target_rel: str,
+        arch_config: ArchitectureConfig | None,
+    ) -> dict[str, Any]:
+        """Whether ``target_rel`` is a declared public surface and who reaches it.
+
+        Reuses :meth:`handle_audit_public_surfaces` verbatim so the surface/deep
+        classification is the one SSOT — filtering its per-module report down to
+        the target file. Empty when no module declares ``public_surfaces``.
+        """
+        if arch_config is None:
+            return {}
+        audit = await self.handle_audit_public_surfaces(
+            AuditPublicSurfacesInput(repo_path=repo_path)
+        )
+        target_mod = arch_config.module_of(target_rel)
+        for report in audit.modules:
+            if report.get("module") != target_mod:
+                continue
+            is_surface = target_rel in report.get("public_exports", [])
+            deep = [
+                c["consumer"]
+                for c in report.get("deep_import_consumers", [])
+                if c.get("internal") == target_rel
+            ]
+            via = [
+                c["consumer"]
+                for c in report.get("via_surface_consumers", [])
+                if c.get("surface") == target_rel
+            ]
+            return {
+                "is_surface": is_surface,
+                "module": target_mod,
+                "deep_import_consumers": sorted(deep),
+                "via_surface_consumers": sorted(via),
+            }
+        return {}
+
+    async def _briefing_coupling_rank(
+        self, graph_id: str, target_rel: str, repo_path: str
+    ) -> dict[str, Any] | None:
+        """File-level coupling rank of ``target_rel``, or None if not in the pool.
+
+        Reuses the same hotspot ranker :meth:`handle_find_hotspots` composes.
+        That ranker scores SYMBOL nodes, so a file with many symbols would occupy
+        many positions; here the symbol scores are PROJECTED to file level by
+        keeping each file's highest-scoring symbol, then files are ranked by that
+        projected score. This is a projection of existing scores (no new metric).
+        ``ranked_within`` is the size of the file pool the rank is relative to;
+        ``pool_capped`` flags that the underlying symbol pool was itself capped so
+        the file ranking may be incomplete. A file outside the pool is unranked
+        (``None``) rather than given a false rank.
+        """
+        if self.community_analyzer is None:
+            return None
+        pool_size = 1000
+        try:
+            # Fetch one past the pool so an EXACT pool_size result (no overflow)
+            # is not misreported as capped: capped iff more than pool_size came
+            # back.
+            hotspots = await self.community_analyzer.find_hotspots(
+                graph_id, top_n=pool_size + 1, metric="coupling"
+            )
+        except Exception as exc:
+            logger.warning("Change-briefing hotspot rank failed: %s", exc)
+            return None
+        pool_capped = len(hotspots) > pool_size
+
+        # Project symbol scores down to file level: each file keeps its single
+        # best (max) symbol score. Then rank files by that projected score. Only
+        # the declared pool (first pool_size) is projected — the extra probe entry
+        # exists solely to detect capping above and must NOT enter the ranking, or
+        # a file present only via the 1001st symbol would get a spurious rank.
+        best_by_file: dict[str, float] = {}
+        for h in hotspots[:pool_size]:
+            d = h.model_dump()
+            fp = d.get("file_path") or d.get("properties", {}).get("file_path", "")
+            if not fp:
+                continue
+            rel = _rel(fp, repo_path)
+            score = float(d.get("score", 0.0))
+            if rel not in best_by_file or score > best_by_file[rel]:
+                best_by_file[rel] = score
+        if target_rel not in best_by_file:
+            return None
+        ranked_files = sorted(best_by_file.items(), key=lambda kv: kv[1], reverse=True)
+        rank = next(i for i, (rel, _) in enumerate(ranked_files) if rel == target_rel) + 1
+        return {
+            "rank": rank,
+            "ranked_within": len(ranked_files),
+            "pool_capped": pool_capped,
+            "metric": "coupling",
+            "score": best_by_file[target_rel],
+        }
+
+    @staticmethod
+    def _render_briefing_markdown(
+        *,
+        target_rel: str,
+        callers_by_module: dict[str, list[dict[str, Any]]],
+        total_callers: int,
+        cycle: dict[str, Any] | None,
+        layering: list[dict[str, Any]],
+        public_surface: dict[str, Any],
+        coupling_rank: dict[str, Any] | None,
+        freshness: dict[str, Any] | None,
+        truncated: dict[str, Any],
+    ) -> str:
+        """Render the agent-facing markdown briefing.
+
+        Facts + risk notes, no prescriptions (decision (3)). Names/paths only:
+        callers are reported by FILE and MODULE, never by bare graph node id.
+        """
+        # The summary identifies the target by FILE only. The requested symbol is
+        # returned in the structured ``target_symbol`` field, deliberately kept out
+        # of the prose so no bare graph id (symbol or caller) ever appears here.
+        lines: list[str] = []
+        lines.append(f"# Change briefing: `{target_rel}`")
+
+        # Freshness first — a stale briefing is worth flagging up top.
+        if freshness is not None:
+            stale = freshness.get("stale")
+            dirty = freshness.get("dirty_file_count")
+            if stale is True:
+                lines.append(
+                    f"> Risk: index is STALE ({dirty} file(s) changed since last "
+                    "index). Findings below may not reflect the working tree."
+                )
+            elif stale is None:
+                lines.append("> Note: index freshness is unknown for this graph.")
+
+        # Callers. "found" rather than "total": the count is what the bounded
+        # upstream walk discovered, which may be short of the true total when the
+        # depth horizon was hit (see the depth note below).
+        if total_callers:
+            lines.append(f"\n## Callers ({total_callers} found)")
+            for module in sorted(callers_by_module):
+                group = callers_by_module[module]
+                direct = sum(1 for c in group if c["direct"])
+                lines.append(
+                    f"- Module `{module}`: {len(group)} caller(s), {direct} direct"
+                )
+                for c in sorted(group, key=lambda x: (not x["direct"], x["file"])):
+                    kind = "direct" if c["direct"] else f"transitive (depth {c['depth']})"
+                    lines.append(f"  - `{c['file']}` — {kind}")
+            t = truncated.get("callers")
+            if t:
+                if "total" in t:
+                    lines.append(
+                        f"- Note: caller list truncated to {t['shown']} of {t['total']}."
+                    )
+                if "max_depth" in t:
+                    lines.append(
+                        f"- Note: transitive callers walked to depth {t['max_depth']} "
+                        "only; deeper callers are not listed."
+                    )
+        else:
+            lines.append("\n## Callers\n- No callers found in the graph.")
+
+        # Cycle
+        if cycle is not None:
+            lines.append("\n## Cycle membership")
+            lines.append(
+                f"- This file is in an import cycle (SCC size {cycle['scc_size']}): "
+                + " -> ".join(f"`{p}`" for p in cycle["path"])
+            )
+            lines.append(
+                "- Risk: edits here can ripple across every file in the ring."
+            )
+
+        # Layering
+        if layering:
+            lines.append("\n## Layering findings")
+            for finding in layering:
+                edge = ""
+                if finding.get("from") and finding.get("to"):
+                    edge = f" (`{finding['from']}` -> `{finding['to']}`)"
+                lines.append(f"- `{finding['rule']}`{edge}: {finding.get('message', '')}")
+
+        # Public surface
+        if public_surface:
+            lines.append("\n## Public surface")
+            if public_surface.get("is_surface"):
+                via = public_surface.get("via_surface_consumers", [])
+                lines.append(
+                    f"- This file IS a declared public surface of module "
+                    f"`{public_surface.get('module')}` ({len(via)} consumer(s) via the surface)."
+                )
+            else:
+                deep = public_surface.get("deep_import_consumers", [])
+                if deep:
+                    lines.append(
+                        f"- Internal file of module `{public_surface.get('module')}` "
+                        f"deep-imported by {len(deep)} external consumer(s): "
+                        + ", ".join(f"`{c}`" for c in deep)
+                    )
+                else:
+                    lines.append(
+                        f"- Internal file of module `{public_surface.get('module')}` "
+                        "with no external deep-importers."
+                    )
+
+        # Coupling rank
+        if coupling_rank is not None:
+            lines.append("\n## Coupling")
+            pool = coupling_rank["ranked_within"]
+            qualifier = " (ranked pool capped)" if coupling_rank.get("pool_capped") else ""
+            lines.append(
+                f"- Coupling hotspot rank {coupling_rank['rank']} of "
+                f"{pool} ranked file(s){qualifier}."
+            )
+
+        return "\n".join(lines)
