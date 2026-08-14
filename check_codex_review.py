@@ -30,6 +30,16 @@ import sys
 # --code-suffixes to match the languages they actually ship.
 DEFAULT_SUFFIXES = "py,ts,tsx,js,jsx,mjs,cjs"
 
+# git diff --diff-filter status letters this gate enumerates: Added, Copied,
+# Modified, Renamed, Deleted. A DELETION or RENAME of a gated file must be
+# reviewed exactly like an addition/modification -- prose or source removed
+# from a repo is a change to what the repo asserts, not a no-op. (ACM alone
+# let a deletion-only or rename-only commit of a gated file through with no
+# approval -- see the repo issue that fixed this.) Every enumeration AND the
+# marker-recording command this script prints on failure must use this same
+# filter; the two diverging is the bug this constant exists to prevent.
+DIFF_FILTER = "ACMRD"
+
 
 def _git(*args: str, stdin: bytes | None = None) -> bytes:
     return subprocess.run(
@@ -51,14 +61,14 @@ def _normalize_suffixes(raw: str) -> tuple[str, ...]:
 
 
 def staged_source_files(suffixes: tuple[str, ...]) -> list[str]:
-    out = _git("diff", "--cached", "--name-only", "--diff-filter=ACM").decode()
+    out = _git("diff", "--cached", "--name-only", f"--diff-filter={DIFF_FILTER}").decode()
     files = [ln for ln in out.splitlines() if ln.strip()]
     return [f for f in files if f.endswith(suffixes)]
 
 
 def staged_code_hash(files: list[str]) -> str:
     """Hash the staged diff restricted to the source files (order-stable)."""
-    diff = _git("diff", "--cached", "--diff-filter=ACM", "--", *sorted(files))
+    diff = _git("diff", "--cached", f"--diff-filter={DIFF_FILTER}", "--", *sorted(files))
     return _git("hash-object", "--stdin", stdin=diff).decode().strip()
 
 
@@ -107,8 +117,8 @@ def main() -> int:
 
     suffix_alt = "|".join(s.lstrip(".") for s in suffixes)
     record_cmd = (
-        'echo "$(git diff --cached --diff-filter=ACM -- '
-        "$(git diff --cached --name-only --diff-filter=ACM | "
+        f'echo "$(git diff --cached --diff-filter={DIFF_FILTER} -- '
+        f"$(git diff --cached --name-only --diff-filter={DIFF_FILTER} | "
         f"grep -E '\\.({suffix_alt})$') | git hash-object --stdin)\" "
         '> "$(git rev-parse --git-dir)/codex-approved"'
     )
