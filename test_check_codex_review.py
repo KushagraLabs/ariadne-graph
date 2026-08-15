@@ -8,6 +8,12 @@ stage a real deletion-only and a real rename-only commit in a throwaway git
 repo and invoke the actual hook script as a subprocess, exactly the way
 pre-commit invokes it -- not a reimplementation of its enumeration logic.
 
+The hard case is the SUFFIX-ESCAPING rename (POLICY.md -> POLICY.txt): widening
+the filter to ACMRD alone does NOT catch it, because `--name-only` reports only
+the rename destination, which fails the suffix test. It needs --no-renames as
+well. A rename-only test that renames .md -> .md passes with the filter fix
+alone and would hide that second hole.
+
 Run: python3 test_check_codex_review.py
  or: pytest test_check_codex_review.py
 """
@@ -92,6 +98,44 @@ class CodexGateEnumeratesDeletesAndRenames(unittest.TestCase):
                 f"no approval; stderr={result.stderr!r}",
             )
 
+    def test_rename_that_escapes_the_gated_suffix_is_blocked(self) -> None:
+        # THE HARD CASE. Renaming a gated file to a non-gated suffix removes it
+        # from the gated set as surely as `git rm` does. With rename detection
+        # on (git's default), `--name-only` prints ONLY `docs/POLICY.txt`, which
+        # fails the .md/.py suffix test -- so ACMRD alone still exempts this
+        # commit. Only --no-renames (D(old) + A(new)) surfaces the .md path.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _init_repo_with_gated_file(repo)
+            _git(repo, "mv", "docs/POLICY.md", "docs/POLICY.txt")
+            result = _run_hook(repo)
+            self.assertNotEqual(
+                result.returncode,
+                0,
+                "rename of a gated file OUT of the gated suffix set passed "
+                f"the gate with no approval; stderr={result.stderr!r}",
+            )
+
+    def test_rename_that_escapes_the_suffix_is_blocked_with_renames_forced_on(
+        self,
+    ) -> None:
+        # Non-vacuity guard for the test above: with diff.renames explicitly
+        # forced ON in repo config, the D+A decomposition must still happen --
+        # i.e. the hook's own --no-renames flag is what does the work, not an
+        # accident of the throwaway repo's default config.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _init_repo_with_gated_file(repo)
+            _git(repo, "config", "diff.renames", "true")
+            _git(repo, "mv", "docs/POLICY.md", "docs/POLICY.txt")
+            result = _run_hook(repo)
+            self.assertNotEqual(
+                result.returncode,
+                0,
+                "suffix-escaping rename passed the gate with diff.renames=true; "
+                f"stderr={result.stderr!r}",
+            )
+
     def test_modification_only_commit_is_still_blocked(self) -> None:
         # Sanity: the case the gate already covered must keep working.
         with tempfile.TemporaryDirectory() as tmp:
@@ -148,17 +192,22 @@ class CodexGateEnumeratesDeletesAndRenames(unittest.TestCase):
 
 
 class PrintedRecordCommandStaysInSyncWithEnumeration(unittest.TestCase):
-    """The marker-recording command printed on failure must use the SAME
-    --diff-filter the hook enumerated with -- CLAUDE.md in consuming repos
+    """The marker-recording command printed on failure must use the SAME diff
+    flags the hook enumerated and hashed with -- CLAUDE.md in consuming repos
     documents that printed command as the SSOT consumers copy verbatim, so a
     silent divergence there is a second bug hiding behind the first fix.
 
-    This inspects the ACTUAL stderr text the script emits (a real subprocess
-    run), not the source, so a future edit that changes DIFF_FILTER (or the
-    enumeration call) without updating the printed command fails this test.
+    Two independent checks, because they fail for different reasons:
+      - textual: the printed command carries the same DIFF_FLAGS (cheap, and
+        pinpoints WHICH half drifted);
+      - behavioural: actually EXECUTING the printed command yields a marker the
+        hook then accepts, on the hardest case (the suffix-escaping rename).
+        This is the one that proves runtime equivalence rather than string
+        equality -- it would catch a drift in argument ORDER or in the pathspec
+        the two sides feed to `git diff`, which the textual check cannot see.
     """
 
-    def test_printed_command_diff_filter_matches_enumeration_filter(self) -> None:
+    def test_printed_command_diff_flags_match_enumeration_flags(self) -> None:
         module = _load_hook_module()
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,17 +216,52 @@ class PrintedRecordCommandStaysInSyncWithEnumeration(unittest.TestCase):
             _git(repo, "rm", "-q", "docs/POLICY.md")
             result = _run_hook(repo)
 
-        expected_flag = f"--diff-filter={module.DIFF_FILTER}"
-        occurrences = result.stderr.count(expected_flag)
-        # The record command invokes --diff-filter twice: once to list the
-        # gated filenames, once to hash their diff. Both occurrences must
-        # carry the filter the hook itself enumerated with.
+        expected_flags = " ".join(module.DIFF_FLAGS)
+        occurrences = result.stderr.count(expected_flags)
+        # The record command invokes git diff twice: once to list the gated
+        # filenames, once to hash their diff. Both must carry the flags the
+        # hook itself enumerated and hashed with.
         self.assertEqual(
             occurrences,
             2,
-            f"expected 2 occurrences of {expected_flag!r} in the printed "
+            f"expected 2 occurrences of {expected_flags!r} in the printed "
             f"record command, found {occurrences}; stderr={result.stderr!r}",
         )
+
+    def test_executing_the_printed_command_unblocks_a_suffix_escaping_rename(
+        self,
+    ) -> None:
+        # End-to-end: take the command the hook PRINTS, run it verbatim in a
+        # shell, and confirm the hook then passes. On the suffix-escaping
+        # rename -- the case where enumeration and the printed command are
+        # most likely to disagree about which paths are in scope.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _init_repo_with_gated_file(repo)
+            _git(repo, "mv", "docs/POLICY.md", "docs/POLICY.txt")
+
+            blocked = _run_hook(repo)
+            self.assertNotEqual(blocked.returncode, 0, "expected a block first")
+
+            printed = [
+                ln.strip()
+                for ln in blocked.stderr.splitlines()
+                if ln.strip().startswith("echo ")
+            ]
+            self.assertEqual(
+                len(printed), 1, f"could not find the record command in {blocked.stderr!r}"
+            )
+            subprocess.run(
+                printed[0], cwd=repo, shell=True, check=True, capture_output=True
+            )
+
+            after = _run_hook(repo)
+            self.assertEqual(
+                after.returncode,
+                0,
+                "the record command the hook printed did not produce a marker "
+                f"the hook accepts; stderr={after.stderr!r}",
+            )
 
 
 if __name__ == "__main__":
