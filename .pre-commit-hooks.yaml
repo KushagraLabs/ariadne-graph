@@ -7,10 +7,10 @@
 #         args: [--code-suffixes=py,ts,tsx,js,jsx,mjs,cjs]   # match repo's languages
 #
 # See check_codex_review.py for the gate's contract (per-worktree marker,
-# CODEX_REVIEW_OK=1 bypass, docs-only exemption).
+# CODEX_REVIEW_OK=1 bypass, exemption when no gated file is staged).
 - id: codex-review-gate
-  name: Codex review gate (fresh codex approval required for code)
-  description: Block commits touching source code unless the staged diff carries a fresh codex approval.
+  name: Codex review gate (fresh codex approval required for gated files)
+  description: Block commits that add, modify, delete or rename a gated file (--code-suffixes) unless the staged diff carries a fresh codex approval.
   entry: check_codex_review.py
   language: script
   pass_filenames: false
