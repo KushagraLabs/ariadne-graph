@@ -10,9 +10,15 @@
 # CODEX_REVIEW_OK=1 bypass, exemption when no gated file is staged).
 - id: codex-review-gate
   name: Codex review gate (fresh codex approval required for gated files)
-  description: Block commits that add, modify, delete or rename a gated file (--code-suffixes) unless the staged diff carries a fresh codex approval.
+  description: Block commits that add, modify, delete or rename a gated file (--code-suffixes) unless the staged diff carries a fresh codex approval, or a guardian approval naming its reviewer.
   entry: check_codex_review.py
   language: script
+  # REQUIRED, not cosmetic: the guardian-approval path is accepted on an EXIT-0
+  # path and announces itself on stderr. pre-commit hides a PASSING hook's output,
+  # so without this the guardian notice never reaches the operator and a
+  # guardian-approved commit prints byte-identically to a codex-approved one --
+  # which destroys the only property that path has.
+  verbose: true
   pass_filenames: false
   always_run: true
   stages: [pre-commit]

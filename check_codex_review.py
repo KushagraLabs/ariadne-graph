@@ -10,6 +10,13 @@ hash to ``<git-dir>/codex-approved`` on SHIP (per-worktree, so parallel agents
 in linked worktrees don't clobber each other's approval); this recomputes the
 staged diff hash and requires a match.
 
+A SECOND approval path exists for when codex is unavailable:
+``<git-dir>/guardian-approved`` carries the same hash on line 1 and the
+reviewer's identity on line 2, and is accepted with a loud stderr notice
+naming that reviewer. A bare hash there is refused. Neither marker is a
+security boundary -- anything that can write one can write the other; the
+pair makes the review PATH legible, it does not authenticate a reviewer.
+
 Commits with no staged gated files (config/beads-only, and docs only in repos
 that don't gate them) are exempt.
 Emergency bypass for a trivial change: ``CODEX_REVIEW_OK=1 git commit ...``.
@@ -91,15 +98,33 @@ def staged_code_hash(files: list[str]) -> str:
     return _git("hash-object", "--stdin", stdin=diff).decode().strip()
 
 
-def approved_marker_path() -> str:
+# Two markers are accepted, in this order. Both hold the SAME staged-diff hash;
+# they differ only in who vouched for it, and the gate reports which one let the
+# commit through so an unreviewed-by-codex commit is never silently indistinct.
+#
+# NOT A SECURITY BOUNDARY. Anything that can write one marker can write the other
+# — the pair makes the review PATH legible, it does not authenticate the reviewer.
+# That is why `guardian-approved` must additionally name its reviewer: a bare hash
+# is refused, so the file cannot be produced by the same one-liner as the codex
+# marker without someone stating who reviewed.
+CODEX_MARKER = "codex-approved"
+GUARDIAN_MARKER = "guardian-approved"
+
+
+def marker_paths() -> list[tuple[str, str]]:
+    """(marker name, path) for each accepted approval, codex first."""
     # --git-dir is the *per-worktree* admin dir: `.git` in the main checkout,
-    # but `.git/worktrees/<name>` in a linked worktree. This isolates the marker
-    # per worktree so parallel agents don't clobber one shared approval (they
-    # each stage a different diff). --git-common-dir would collapse them all to
-    # the shared parent .git — a last-writer-wins race. The marker is auto-
-    # cleaned when its worktree is pruned via `git worktree remove`.
+    # but `.git/worktrees/<name>` in a linked worktree. This isolates the
+    # marker per worktree so parallel agents don't clobber one shared
+    # approval (they each stage a different diff). --git-common-dir would
+    # collapse them to the shared parent .git -- a last-writer-wins race.
+    # Either marker is auto-cleaned when its worktree is pruned via
+    # `git worktree remove`.
     git_dir = _git("rev-parse", "--git-dir").decode().strip()
-    return os.path.join(git_dir, "codex-approved")
+    return [
+        (name, os.path.join(git_dir, name))
+        for name in (CODEX_MARKER, GUARDIAN_MARKER)
+    ]
 
 
 def main() -> int:
@@ -124,14 +149,46 @@ def main() -> int:
         return 0
 
     expected = staged_code_hash(source)
-    marker = approved_marker_path()
-    try:
-        with open(marker, encoding="utf-8") as fh:
-            approved = fh.read().strip()
-    except FileNotFoundError:
-        approved = ""
-
-    if expected == approved:
+    for name, path in marker_paths():
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = [ln.strip() for ln in fh.read().splitlines() if ln.strip()]
+        except FileNotFoundError:
+            continue
+        if not lines or lines[0] != expected:
+            continue
+        if name == CODEX_MARKER:
+            # EXACTLY one line. Before two markers existed, this file was
+            # compared as whole content, so a guardian-shaped file could never
+            # satisfy it. Matching on lines[0] alone would let
+            # `cp guardian-approved codex-approved` launder a LOUD guardian
+            # approval into a SILENT codex one -- not an attack, just what a
+            # confused agent does with a file that has the right hash in it.
+            if len(lines) == 1:
+                return 0
+            continue
+        # Guardian path: the marker must say WHO reviewed. A bare hash is not a
+        # review, and accepting one would make this indistinguishable from the
+        # codex marker while carrying none of its meaning.
+        if len(lines) < 2:
+            sys.stderr.write(
+                f"\u2717 Codex review gate: {GUARDIAN_MARKER} carries a matching hash "
+                "but names no reviewer.\n"
+                "  A guardian approval must record who reviewed, on line 2:\n"
+                f'      printf "%s\\n%s\\n" "<staged-diff-hash>" "<reviewer>" '
+                f'> "$(git rev-parse --git-dir)/{GUARDIAN_MARKER}"\n'
+            )
+            return 1
+        # Sanitized: the whole value of this path is that the printed line is
+        # readable. A name carrying control characters could erase or rewrite
+        # the very warning it appears on.
+        reviewer = "".join(c for c in lines[1] if c.isprintable())[:80] or "unnamed"
+        sys.stderr.write(
+            f"\u26a0 Codex review gate: approved by GUARDIAN review "
+            f"({reviewer}), not by codex.\n"
+            "  Disclose the reviewer and why codex was unavailable in the commit "
+            "message.\n"
+        )
         return 0
 
     suffix_alt = "|".join(s.lstrip(".") for s in suffixes)
